@@ -1,0 +1,17 @@
+{
+  "name": "arb-test-retirer",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "f3adabb2e83104cf7b9c244077547991",
+  "workers_dev": true,
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "arb"
+    }
+  ],
+  "limits": {
+    "cpu_ms": 30000
+  }
+}

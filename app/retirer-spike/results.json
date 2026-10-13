@@ -1,0 +1,110 @@
+{
+  "worker": "https://arb-test-retirer.lautitomasalejo.workers.dev",
+  "trunk": "arb-test-retirer-trunk",
+  "fork": "arb-test-retirer-fork",
+  "runs": [
+    {
+      "i": 1,
+      "commit": "c475e7bcdfb4d0087ffdb8da245c5bc23d0944b2",
+      "status": 200,
+      "wallMs": 1159,
+      "head": "c475e7bcdfb4d0087ffdb8da245c5bc23d0944b2",
+      "previousHead": "033f8442c944040c576f06a3e5b557a2d11917f5",
+      "fsBytes": 4050,
+      "ms": {
+        "setup": 529,
+        "fetch": 201,
+        "verify": 74,
+        "push": 268,
+        "total": 1072
+      }
+    },
+    {
+      "i": 2,
+      "commit": "913c162cc2ecafc50ae3ce82579fff401b185bb0",
+      "status": 200,
+      "wallMs": 1437,
+      "head": "913c162cc2ecafc50ae3ce82579fff401b185bb0",
+      "previousHead": "c475e7bcdfb4d0087ffdb8da245c5bc23d0944b2",
+      "fsBytes": 4050,
+      "ms": {
+        "setup": 586,
+        "fetch": 168,
+        "verify": 66,
+        "push": 424,
+        "total": 1244
+      }
+    },
+    {
+      "i": 3,
+      "commit": "5a62363bb2fe5c03ae730efe12199d09d2497011",
+      "status": 200,
+      "wallMs": 932,
+      "head": "5a62363bb2fe5c03ae730efe12199d09d2497011",
+      "previousHead": "913c162cc2ecafc50ae3ce82579fff401b185bb0",
+      "fsBytes": 4050,
+      "ms": {
+        "setup": 289,
+        "fetch": 253,
+        "verify": 86,
+        "push": 213,
+        "total": 841
+      }
+    },
+    {
+      "i": 4,
+      "commit": "818f27e65bc890810b6ddef45b35c7a9497ab8f7",
+      "status": 200,
+      "wallMs": 1022,
+      "head": "818f27e65bc890810b6ddef45b35c7a9497ab8f7",
+      "previousHead": "5a62363bb2fe5c03ae730efe12199d09d2497011",
+      "fsBytes": 4050,
+      "ms": {
+        "setup": 174,
+        "fetch": 354,
+        "verify": 99,
+        "push": 295,
+        "total": 922
+      }
+    },
+    {
+      "i": 5,
+      "commit": "28d1cd88e876d2e02c9e3d33eeb4424eb587a99c",
+      "status": 200,
+      "wallMs": 820,
+      "head": "28d1cd88e876d2e02c9e3d33eeb4424eb587a99c",
+      "previousHead": "818f27e65bc890810b6ddef45b35c7a9497ab8f7",
+      "fsBytes": 4050,
+      "ms": {
+        "setup": 222,
+        "fetch": 244,
+        "verify": 75,
+        "push": 201,
+        "total": 742
+      }
+    }
+  ],
+  "checks": {
+    "nonFastForward": {
+      "status": 409,
+      "code": "NOT_FAST_FORWARD"
+    },
+    "headViaWorker": {
+      "repo": "arb-test-retirer-trunk",
+      "branch": "main",
+      "head": "28d1cd88e876d2e02c9e3d33eeb4424eb587a99c"
+    },
+    "lsRemote": "28d1cd88e876d2e02c9e3d33eeb4424eb587a99c\trefs/heads/main",
+    "trunkHeadOk": true
+  },
+  "trunkRemote": "https://f3adabb2e83104cf7b9c244077547991.artifacts.cloudflare.net/git/arb/arb-test-retirer-trunk.git",
+  "forkRemote": "https://f3adabb2e83104cf7b9c244077547991.artifacts.cloudflare.net/git/arb/arb-test-retirer-fork.git",
+  "base": "033f8442c944040c576f06a3e5b557a2d11917f5",
+  "commits": [
+    "c475e7bcdfb4d0087ffdb8da245c5bc23d0944b2",
+    "913c162cc2ecafc50ae3ce82579fff401b185bb0",
+    "5a62363bb2fe5c03ae730efe12199d09d2497011",
+    "818f27e65bc890810b6ddef45b35c7a9497ab8f7",
+    "28d1cd88e876d2e02c9e3d33eeb4424eb587a99c"
+  ]
+}

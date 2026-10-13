@@ -1,0 +1,17 @@
+{
+  "name": "arb-retirer-spike",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail --format json"
+  },
+  "dependencies": {
+    "isomorphic-git": "^1.44.2"
+  },
+  "devDependencies": {
+    "wrangler": "^4.149.0"
+  }
+}
