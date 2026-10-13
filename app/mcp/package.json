@@ -1,0 +1,15 @@
+{
+  "name": "arb-mcp",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "MCP server that lets any MCP-capable agent join the Agent Reorder Buffer as a buffer entry",
+  "scripts": {
+    "start": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/index.ts",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "zod": "4.6.7"
+  }
+}
