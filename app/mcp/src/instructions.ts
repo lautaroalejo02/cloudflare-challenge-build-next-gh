@@ -3,6 +3,9 @@ import type { Diagnosis, DiagnosisReason, Entry } from "./types.ts";
 // Human-readable-but-LLM-first explanation of why an entry was squashed,
 // rendered per Diagnosis.reason. Returned by arb_status/arb_sync so the agent
 // knows what changed and what to do next without reading the wire protocol.
+// All server-supplied text is treated as untrusted: single-line fields get
+// CR/LF collapsed, signatures are truncated and fenced wider than their own
+// backtick runs, and missing values render as "(unknown)".
 
 const REASON_TEXT: Record<DiagnosisReason, string> = {
   "interface-changed":
@@ -19,19 +22,37 @@ const REASON_TEXT: Record<DiagnosisReason, string> = {
     "The producer kept its signatures identical but changed behavior, and the TypeSafe Jev semantic judge decided your usage relies on the old behavior.",
 };
 
+const MAX_FIELD = 500;
+
+/** Flatten to one line, truncate, and map missing/blank to `(unknown)`. */
+function clean(v: unknown): string {
+  const s = typeof v === "string" && v.length ? v : "(unknown)";
+  return s.replace(/[\r\n]+/g, " ").slice(0, MAX_FIELD);
+}
+
+/** Inline code fenced with one more backtick than the longest run inside the
+ * text, so a signature containing backticks cannot break the code span. */
+function code(v: unknown): string {
+  const s = clean(v);
+  let longest = 0;
+  for (const m of s.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const fence = "`".repeat(longest + 1);
+  return `${fence}${s}${fence}`;
+}
+
 function symbolBlock(c: Diagnosis["changed"][number], reason: DiagnosisReason): string {
   if (reason === "behavior-changed") {
     // For behavior-changed oldHash/newHash are bodyHashes and the signatures
     // are equal by construction (the interface did not change).
     return [
-      `- ${c.symbol}: signature unchanged (\`${c.newSignature}\`) but its body changed`,
-      `  (body hash ${c.oldHash} -> ${c.newHash}).`,
+      `- ${clean(c.symbol)}: signature unchanged (${code(c.newSignature)}) but its body changed`,
+      `  (body hash ${clean(c.oldHash)} -> ${clean(c.newHash)}).`,
     ].join("\n");
   }
   return [
-    `- ${c.symbol}:`,
-    `    old: \`${c.oldSignature}\``,
-    `    new: \`${c.newSignature}\``,
+    `- ${clean(c.symbol)}:`,
+    `    old: ${code(c.oldSignature)}`,
+    `    new: ${code(c.newSignature)}`,
   ].join("\n");
 }
 
@@ -39,36 +60,46 @@ export function renderSquashInstructions(entry: Entry): string {
   const d = entry.diagnosis;
   if (!d) {
     return [
-      `SQUASHED: entry ${entry.id} was re-forked but the control plane did not provide a diagnosis.`,
+      `SQUASHED: entry ${clean(entry.id)} was re-forked but the control plane did not provide a diagnosis.`,
       `Next steps:`,
-      `1. Call arb_sync with entryId "${entry.id}" to replace your workspace with a fresh clone of the new fork.`,
+      `1. Call arb_sync with entryId "${clean(entry.id)}" to replace your workspace with a fresh clone of the new fork.`,
       `2. Redo your changes against the new base, then arb_push and arb_ready as usual.`,
     ].join("\n");
   }
   const lines: string[] = [
-    `SQUASHED: entry ${entry.id} (lane "${entry.lane}") was re-forked onto producer commit ${d.producerCommit || "unknown"}.`,
+    `SQUASHED: entry ${clean(entry.id)} (lane "${clean(entry.lane)}") was re-forked onto producer commit ${clean(d.producerCommit)}.`,
     ``,
-    `Why (${d.reason}):`,
-    REASON_TEXT[d.reason] ?? `Reason: ${d.reason}.`,
+    `Why (${clean(d.reason)}):`,
+    REASON_TEXT[d.reason] ?? `Reason: ${clean(d.reason)}.`,
   ];
   if (d.changed.length) {
     lines.push(``, `Consumed symbols that changed:`);
     for (const c of d.changed) lines.push(symbolBlock(c, d.reason));
   }
   if (d.reason === "behavior-changed" && d.judgment) {
+    const prob =
+      typeof d.judgment.probability === "number" && Number.isFinite(d.judgment.probability)
+        ? d.judgment.probability.toFixed(2)
+        : "(unknown)";
     lines.push(
       ``,
-      `Semantic judgment: probability ${d.judgment.probability.toFixed(2)} (model ${d.judgment.model})`,
+      `Semantic judgment: probability ${prob} (model ${clean(d.judgment.model)})`,
       `that your code relied on the behavior that changed (before body hash -> after body hash`,
       `listed per symbol above).`,
     );
   }
+  // For behavior-changed the signatures are identical — there is nothing new
+  // "shown above"; the agent must read the new code after syncing instead.
+  const redo =
+    d.reason === "behavior-changed"
+      ? `2. Redo your work against the new base: read the new code in the synced workspace and`
+      : `2. Redo your work in the synced workspace against the NEW producer code shown above —`;
   lines.push(
     ``,
     `What to do next:`,
-    `1. Call arb_sync with entryId "${entry.id}". It waits for the re-fork to land and replaces`,
+    `1. Call arb_sync with entryId "${clean(entry.id)}". It waits for the re-fork to land and replaces`,
     `   your workspace with a fresh clone of the new producer head.`,
-    `2. Redo your work in the synced workspace against the NEW producer code shown above —`,
+    redo,
     `   do not re-apply your previous diff blindly.`,
     `3. Push with arb_push, then mark done with arb_ready.`,
     ``,

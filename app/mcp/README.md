@@ -11,9 +11,9 @@ Tools:
 |---|---|
 | `arb_register` | `POST /api/entries`, then clone your fork into `<ARB_WORKDIR>/<entryId>` |
 | `arb_status` | `GET /api/entries/:id` — status, generation, base/head, checks; plus `instructions` when squashed |
-| `arb_sync` | After a squash: wait for the re-fork, replace the workspace with a fresh clone |
+| `arb_sync` | After a squash (or a failed register clone): wait for the re-fork, replace the workspace with a fresh clone. Won't silently discard uncommitted/unpushed work — pass `force: true` |
 | `arb_push` | Commit all workspace changes and push with a fresh per-push token |
-| `arb_ready` | `POST /api/entries/:id/ready` with the workspace HEAD commit |
+| `arb_ready` | `POST /api/entries/:id/ready` with the workspace HEAD commit — refused while the tree is dirty or unpushed |
 | `arb_state` | Compact `GET /api/state` summary: entries, trunk, stats |
 
 ## Configuration (env)
@@ -22,7 +22,7 @@ Tools:
 |---|---|---|
 | `ARB_BASE_URL` | `https://arb-control-plane.lautitomasalejo.workers.dev` | control-plane base URL |
 | `ARB_ADMIN_KEY` | `app/control-plane/.secret-admin-key` (via `resolveAdminKey`) | admin key for protected endpoints |
-| `ARB_WORKDIR` | `<cwd>/.arb-workspaces` | where entry workspaces are cloned |
+| `ARB_WORKDIR` | `<os.tmpdir()>/arb-workspaces` | where entry workspaces are cloned — deliberately outside your project so buffers and tools never trip over them |
 | `ARB_POLL_MS` | `1000` | poll cadence while waiting for forks |
 | `ARB_SYNC_TIMEOUT_MS` | `120000` | default deadline for `arb_sync` |
 
@@ -86,14 +86,22 @@ devin mcp add arb -e ARB_BASE_URL=https://arb-control-plane.lautitomasalejo.work
 
 ## Security
 
-- Fork write tokens are fetched per push (`GET /api/entries/:id`) and passed
-  inline to `git push <auth-url> HEAD:main`. Right after cloning, `origin` is
-  rewritten to the credential-free remote, so tokens never land in
-  `.git/config`, tool results, logs or files.
+- Fork write tokens are fetched per push (`GET /api/entries/:id`) and handed to
+  git only through environment-scoped config — `GIT_CONFIG_*` env vars carrying
+  `http.extraHeader: Authorization: Basic base64("x:<token-secret>")`. The
+  token never appears in argv (hooks, `ps` and error text can't see it), in the
+  remote URL, or in `.git/config`.
+- Every git child runs with `-c core.hooksPath=<empty dir>` and
+  `-c core.fsmonitor=false`, so no hook or fsmonitor daemon — global, template
+  or repo — executes against the workspace. The child env is scrubbed of
+  `ARB_ADMIN_KEY`, `TYPESAFE_*` and ambient `GIT_CONFIG_*`.
 - Every error string and serialized tool result goes through
   `redactCredentials` before it leaves the process.
 - The admin key is read from `ARB_ADMIN_KEY` or the gitignored key file and is
   never printed (the startup line only says `adminKey=set|none`).
+- Entry ids are validated (`^e\d+$`) at the schema boundary and percent-encoded
+  into API paths; resolved workspace paths are asserted to stay inside
+  `ARB_WORKDIR`.
 
 ## Development
 

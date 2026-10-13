@@ -4,12 +4,17 @@ import { redactCredentials } from "../../demo/src/lib/git.ts";
 import type { ArbService } from "./service.ts";
 
 // Tool input schemas (zod v4; the SDK validates before the handler runs).
+// Entry ids always look like "e<digits>" — the regex keeps workspace paths and
+// API URLs safe against traversal even before the handlers' own assertion.
+const entryId = z
+  .string()
+  .regex(/^e\d+$/, "entry ids look like \"e3\"")
+  .describe("Buffer entry id returned by arb_register (e.g. \"e3\")");
+
 const registerSchema = z.object({
   agent: z.string().min(1).describe("Agent display name recorded on the buffer entry"),
   lane: z.string().min(1).describe("Display lane, e.g. \"api\", \"ui\", \"tests\""),
-  producerId: z
-    .string()
-    .min(1)
+  producerId: entryId
     .optional()
     .describe("Entry id this one consumes from (forks the producer's unfinished fork). Omit to fork trunk."),
   consumes: z
@@ -22,9 +27,7 @@ const registerSchema = z.object({
     .describe("Value prediction: path -> TypeScript source declaring your intended exported signatures."),
 });
 
-const entryIdSchema = z.object({
-  entryId: z.string().min(1).describe("Buffer entry id returned by arb_register (e.g. \"e3\")"),
-});
+const entryIdSchema = z.object({ entryId });
 
 const syncSchema = entryIdSchema.extend({
   timeoutMs: z
@@ -34,6 +37,10 @@ const syncSchema = entryIdSchema.extend({
     .max(600_000)
     .optional()
     .describe("Max milliseconds to wait for the re-fork to land (default 120000)."),
+  force: z
+    .boolean()
+    .optional()
+    .describe("Discard uncommitted changes and unpushed commits in the workspace. Only needed when the entry was NOT squashed — a squash already invalidates that work."),
 });
 
 const pushSchema = entryIdSchema.extend({
@@ -96,8 +103,10 @@ export function createArbServer(service: ArbService): McpServer {
     "arb_sync",
     {
       description:
-        "After a squash: wait for the entry's re-fork to land, then replace the workspace with a fresh clone of " +
-        "the new producer head. Returns the new base commit and the same squash instructions as arb_status.",
+        "After a squash — or to retry after a failed register clone: wait for the entry's re-fork to land, then " +
+        "replace the workspace with a fresh clone of the new producer head. Refuses to discard uncommitted " +
+        "changes or unpushed commits on a non-squashed entry unless force is passed. Returns the new base " +
+        "commit and the same squash instructions as arb_status.",
       inputSchema: syncSchema,
     },
     wrap((a: z.infer<typeof syncSchema>) => service.sync(a)),
@@ -119,7 +128,8 @@ export function createArbServer(service: ArbService): McpServer {
     {
       description:
         "Declare the entry's work done: posts the workspace HEAD commit to the control plane, which runs checks " +
-        "and retires the entry in buffer order once they pass.",
+        "and retires the entry in buffer order once they pass. Refused while the workspace has uncommitted " +
+        "changes or unpushed commits — arb_push first.",
       inputSchema: entryIdSchema,
     },
     wrap((a: z.infer<typeof entryIdSchema>) => service.ready(a)),

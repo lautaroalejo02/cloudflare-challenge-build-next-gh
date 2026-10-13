@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { ApiClient } from "../../demo/src/lib/http.ts";
-import { authUrl, cloneRepo, commitAll, git, head } from "../../demo/src/lib/git.ts";
+import { ApiClient } from "./api.ts";
+import { ArbGit, type GitExec } from "./git.ts";
+import { redactCredentials } from "../../demo/src/lib/git.ts";
 import { resolveAdminKey } from "../../demo/src/lib/admin-key.ts";
 import { renderSquashInstructions } from "./instructions.ts";
 import type { BufferState, CheckResult, Entry } from "./types.ts";
@@ -16,6 +18,8 @@ export interface ArbServiceConfig {
   pollMs?: number;
   /** Default deadline for arb_register's first-fork wait and arb_sync. */
   syncTimeoutMs?: number;
+  /** Injectable execFile for tests; production uses child_process.execFile. */
+  exec?: GitExec;
 }
 
 export interface ResolvedArbServiceConfig {
@@ -26,11 +30,13 @@ export interface ResolvedArbServiceConfig {
   syncTimeoutMs: number;
 }
 
+export const DEFAULT_WORKDIR = path.join(os.tmpdir(), "arb-workspaces");
+
 export function resolveConfig(env: Record<string, string | undefined> = process.env): ResolvedArbServiceConfig {
   return {
     baseUrl: env.ARB_BASE_URL || DEFAULT_BASE_URL,
     adminKey: resolveAdminKey(env),
-    workdir: path.resolve(env.ARB_WORKDIR || path.join(process.cwd(), ".arb-workspaces")),
+    workdir: path.resolve(env.ARB_WORKDIR || DEFAULT_WORKDIR),
     pollMs: env.ARB_POLL_MS ? Number(env.ARB_POLL_MS) : 1000,
     syncTimeoutMs: env.ARB_SYNC_TIMEOUT_MS ? Number(env.ARB_SYNC_TIMEOUT_MS) : 120_000,
   };
@@ -47,6 +53,8 @@ interface EntryState {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const ENTRY_ID_RE = /^e\d+$/;
 
 /** file:// remotes (the local mock) take no auth; https remotes need a token. */
 export function remoteNeedsAuth(remote: string): boolean {
@@ -68,6 +76,7 @@ function summarizeChecks(c: CheckResult | null): unknown {
 export class ArbService {
   readonly api: ApiClient;
   readonly workdir: string;
+  readonly git: ArbGit;
   private readonly pollMs: number;
   private readonly syncTimeoutMs: number;
   private readonly stateDir: string;
@@ -75,20 +84,45 @@ export class ArbService {
   constructor(cfg: ResolvedArbServiceConfig | ArbServiceConfig = {}) {
     const base = cfg.baseUrl || DEFAULT_BASE_URL;
     this.api = new ApiClient(base, cfg.adminKey);
-    this.workdir = path.resolve(cfg.workdir || path.join(process.cwd(), ".arb-workspaces"));
+    this.workdir = path.resolve(cfg.workdir || DEFAULT_WORKDIR);
     this.pollMs = cfg.pollMs ?? 1000;
     this.syncTimeoutMs = cfg.syncTimeoutMs ?? 120_000;
     this.stateDir = path.join(this.workdir, ".mcp-state");
+    // Guaranteed-empty hooks dir: every git child runs with
+    // `core.hooksPath` pointing here so nothing user- or repo-installed runs.
+    const hooksDir = path.join(this.workdir, ".arb-empty-hooks");
     fs.mkdirSync(this.stateDir, { recursive: true });
+    fs.mkdirSync(hooksDir, { recursive: true });
+    this.git = new ArbGit(cfg.exec, hooksDir);
+  }
+
+  private assertEntryId(entryId: string): void {
+    if (!ENTRY_ID_RE.test(entryId)) {
+      throw new Error(`invalid entryId ${JSON.stringify(entryId)}: expected "e<digits>"`);
+    }
+  }
+
+  /** Resolve `p` and prove it stays inside `base` (defense in depth on top of
+   * the entryId regex — also guards a hostile `entry.id` from the server). */
+  private static inside(base: string, p: string): string {
+    const r = path.resolve(p);
+    if (r !== base && !r.startsWith(base + path.sep)) {
+      throw new Error(`resolved path escapes ${base}: ${p}`);
+    }
+    return r;
   }
 
   private workspaceFor(entryId: string): string {
-    return path.join(this.workdir, entryId);
+    return ArbService.inside(this.workdir, path.join(this.workdir, entryId));
+  }
+
+  private statePath(entryId: string): string {
+    return ArbService.inside(this.stateDir, path.join(this.stateDir, `${entryId}.json`));
   }
 
   private loadState(entryId: string): EntryState | undefined {
     try {
-      return JSON.parse(fs.readFileSync(path.join(this.stateDir, `${entryId}.json`), "utf8"));
+      return JSON.parse(fs.readFileSync(this.statePath(entryId), "utf8"));
     } catch {
       return undefined;
     }
@@ -96,7 +130,7 @@ export class ArbService {
 
   private saveState(st: EntryState): void {
     fs.mkdirSync(this.stateDir, { recursive: true });
-    fs.writeFileSync(path.join(this.stateDir, `${st.entryId}.json`), JSON.stringify(st, null, 2));
+    fs.writeFileSync(this.statePath(st.entryId), JSON.stringify(st, null, 2));
   }
 
   /** Poll GET /api/entries/:id until the (re-)fork has landed: the repo moved
@@ -125,14 +159,14 @@ export class ArbService {
     }
   }
 
-  /** Clone `entry.remote` into the workspace and strip credentials from
-   * `.git/config`: the token is only ever passed per git invocation, never
-   * stored on the remote URL. */
+  /** Clone `entry.remote` into the workspace. The token is passed to git only
+   * via environment-scoped config (GIT_CONFIG_* http.extraHeader) — never in
+   * argv and never on the stored origin URL, so `.git/config` stays clean. */
   private async cloneInto(entry: Entry, token: string | undefined): Promise<string> {
     const ws = this.workspaceFor(entry.id);
     fs.rmSync(ws, { recursive: true, force: true });
-    await cloneRepo(entry.remote, token ?? "", ws);
-    await git(["-C", ws, "remote", "set-url", "origin", entry.remote]);
+    await this.git.clone(entry.remote, remoteNeedsAuth(entry.remote) ? token : undefined, ws);
+    await this.git.setOrigin(ws, entry.remote);
     this.saveState({ entryId: entry.id, workspace: ws, repo: entry.repo, generation: entry.generation });
     return ws;
   }
@@ -144,6 +178,7 @@ export class ArbService {
     consumes?: string[];
     stub?: Record<string, string>;
   }) {
+    if (input.producerId !== undefined) this.assertEntryId(input.producerId);
     const created = await this.api.createEntry({
       agent: input.agent,
       lane: input.lane,
@@ -153,13 +188,23 @@ export class ArbService {
     });
     let entry = created.entry as Entry;
     let token: string | undefined = created.token;
-    if (!entry.remote) {
-      // The real control plane forks asynchronously; wait for it to land.
-      const got = await this.waitForFork(entry.id, null, this.syncTimeoutMs);
-      entry = got.entry;
-      token = got.token ?? token;
+    let workspace: string;
+    try {
+      if (!entry.remote) {
+        // The real control plane forks asynchronously; wait for it to land.
+        const got = await this.waitForFork(entry.id, null, this.syncTimeoutMs);
+        entry = got.entry;
+        token = got.token ?? token;
+      }
+      workspace = await this.cloneInto(entry, token);
+    } catch (err) {
+      // The entry exists server-side even though the workspace was never
+      // established — say so and route the agent at arb_sync to retry.
+      throw new Error(
+        `entry ${entry.id} was created but cloning its fork into the workspace failed: ` +
+          `${redactCredentials((err as Error).message)} — call arb_sync with entryId "${entry.id}" to retry the clone`,
+      );
     }
-    const workspace = await this.cloneInto(entry, token);
     return {
       entryId: entry.id,
       seq: entry.seq,
@@ -178,6 +223,7 @@ export class ArbService {
   }
 
   async status(input: { entryId: string }) {
+    this.assertEntryId(input.entryId);
     const { entry } = (await this.api.getEntry(input.entryId)) as { entry: Entry; token?: string };
     const out: Record<string, unknown> = {
       entryId: entry.id,
@@ -202,23 +248,56 @@ export class ArbService {
     return out;
   }
 
-  async sync(input: { entryId: string; timeoutMs?: number }) {
+  async sync(input: { entryId: string; timeoutMs?: number; force?: boolean }) {
+    this.assertEntryId(input.entryId);
     const st = this.loadState(input.entryId);
     const { entry: cur } = (await this.api.getEntry(input.entryId)) as { entry: Entry };
-    if (st && cur.repo === st.repo && cur.status !== "squashed") {
+    const ws = this.workspaceFor(input.entryId);
+    const hasWs = fs.existsSync(path.join(ws, ".git"));
+
+    // Double sync: the workspace already sits on the server's current fork —
+    // matching on repo+generation (status may still read "squashed" until the
+    // next push) means there is nothing to do and nothing to wait for.
+    if (st && hasWs && st.repo === cur.repo && st.generation === cur.generation) {
       return {
         entryId: cur.id,
         synced: false,
+        reason: "already synced",
         workspace: st.workspace,
         status: cur.status,
         generation: cur.generation,
         baseCommit: cur.baseCommit,
         headCommit: cur.headCommit,
-        message: `Entry ${cur.id} is "${cur.status}" on the same fork the workspace was cloned from; nothing to sync.`,
+        message: `Workspace for ${cur.id} already matches the current fork (${cur.repo}, generation ${cur.generation}); nothing to sync.`,
       };
     }
+
+    // Re-cloning discards whatever is in the workspace. A squash means that
+    // work is invalidated anyway — proceed and report it; otherwise refuse
+    // unless the agent explicitly passed force.
+    let dirty = false;
+    let unpushed = false;
+    if (hasWs) {
+      dirty = await this.git.hasChanges(ws);
+      unpushed = await this.git.hasUnpushedCommits(ws);
+    }
+    const squashed = cur.status === "squashed";
+    const discarded = dirty || unpushed;
+    if (discarded && !squashed && !input.force) {
+      const what = [dirty ? "uncommitted changes" : "", unpushed ? "unpushed commits" : ""]
+        .filter(Boolean)
+        .join(" and ");
+      throw new Error(
+        `workspace for ${input.entryId} has ${what} which arb_sync would discard — ` +
+          `call arb_push to keep them, or call arb_sync with force: true to discard them`,
+      );
+    }
+
     const timeout = input.timeoutMs ?? this.syncTimeoutMs;
-    const { entry, token } = await this.waitForFork(cur.id, st?.repo ?? null, timeout);
+    // No usable local state (missing state file or missing workspace) means a
+    // plain clone of the current fork — e.g. retry after a failed register.
+    const prevRepo = st && hasWs ? st.repo : null;
+    const { entry, token } = await this.waitForFork(cur.id, prevRepo, timeout);
     const workspace = await this.cloneInto(entry, token);
     const out: Record<string, unknown> = {
       entryId: entry.id,
@@ -231,6 +310,7 @@ export class ArbService {
       message:
         "Workspace replaced with a fresh clone of the new fork. Redo your work here, then arb_push and arb_ready.",
     };
+    if (discarded) out.discarded = true;
     if (entry.status === "squashed" || entry.diagnosis) {
       out.diagnosis = entry.diagnosis;
       out.instructions = renderSquashInstructions(entry);
@@ -239,6 +319,7 @@ export class ArbService {
   }
 
   async push(input: { entryId: string; message: string }) {
+    this.assertEntryId(input.entryId);
     const ws = this.workspaceFor(input.entryId);
     if (!fs.existsSync(path.join(ws, ".git"))) {
       throw new Error(
@@ -249,30 +330,30 @@ export class ArbService {
     const { entry, token } = (await this.api.getEntry(input.entryId)) as { entry: Entry; token?: string };
     const drifted = !st || st.repo !== entry.repo || st.generation !== entry.generation;
     if (drifted) {
+      // The fork moved under us (squash/re-fork) or local state was lost.
+      // Adopt the entry's current repo/generation only when the workspace's
+      // credential-free origin proves it is already a clone of that fork;
+      // pushing a workspace cloned from a different fork is never safe.
       let adopted = false;
-      if (entry.status !== "squashed" && !st) {
-        // No local state (e.g. server restarted). The workspace's origin is the
-        // credential-free remote we cloned from — if it still matches the
-        // entry's remote, the workspace corresponds to the current fork.
+      if (entry.status !== "squashed") {
         try {
-          const origin = await git(["-C", ws, "remote", "get-url", "origin"]);
-          if (origin === entry.remote) {
-            this.saveState({ entryId: entry.id, workspace: ws, repo: entry.repo, generation: entry.generation });
+          if ((await this.git.originUrl(ws)) === entry.remote) {
+            this.saveState({
+              entryId: entry.id,
+              workspace: ws,
+              repo: entry.repo,
+              generation: entry.generation,
+            });
             adopted = true;
           }
         } catch {
-          /* fall through to refusal */
+          /* unreadable origin -> refusal below */
         }
-      } else if (entry.status !== "squashed") {
-        // Non-squash repo/generation drift: adopt it into local state so the
-        // workspace identity check stays honest on the next call.
-        this.saveState({ ...st!, repo: entry.repo, generation: entry.generation });
-        adopted = true;
       }
       if (!adopted) {
         throw new Error(
           `entry ${input.entryId} was squashed (${entry.diagnosis?.reason ?? "no diagnosis"}) or re-forked and ` +
-            `the workspace still holds the old fork — call arb_sync first, redo your work, then push again`,
+            `the workspace still holds a different fork — call arb_sync first, redo your work, then push again`,
         );
       }
     }
@@ -281,11 +362,9 @@ export class ArbService {
         `control plane returned no push token for ${input.entryId} — a re-fork may be in flight; retry shortly`,
       );
     }
-    const committed = await commitAll(ws, input.message, entry.agent || "arb-mcp");
-    // Push with the credential-bearing URL inline; `origin` stays clean and
-    // the token never touches .git/config.
-    await git(["-C", ws, "push", "-q", authUrl(entry.remote, token ?? ""), "HEAD:main"]);
-    const commit = await head(ws);
+    const committed = await this.git.commitAll(ws, input.message, entry.agent || "arb-mcp");
+    await this.git.push(ws, remoteNeedsAuth(entry.remote) ? token : undefined);
+    const commit = await this.git.head(ws);
     return {
       entryId: input.entryId,
       commit,
@@ -298,11 +377,23 @@ export class ArbService {
   }
 
   async ready(input: { entryId: string }) {
+    this.assertEntryId(input.entryId);
     const ws = this.workspaceFor(input.entryId);
     if (!fs.existsSync(path.join(ws, ".git"))) {
       throw new Error(`no workspace for ${input.entryId} at ${ws} — call arb_register first`);
     }
-    const commit = await head(ws);
+    if (await this.git.hasChanges(ws)) {
+      throw new Error(
+        `workspace for ${input.entryId} has uncommitted changes — call arb_push first so the ` +
+          `commit that gets checked is actually on the entry's fork`,
+      );
+    }
+    const commit = await this.git.head(ws);
+    if (await this.git.hasUnpushedCommits(ws)) {
+      throw new Error(
+        `workspace HEAD ${commit.slice(0, 12)} is not on the entry's fork — call arb_push first`,
+      );
+    }
     const { entry } = (await this.api.ready(input.entryId, commit)) as { entry: Entry };
     return {
       entryId: input.entryId,
