@@ -1,6 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { componentName, mergeEvents, mergeStates, repoToEntryId } from "../src/shard.ts";
+import {
+	COMPONENT_EPOCH,
+	componentFromInstance,
+	componentInstance,
+	componentName,
+	emptyRouterState,
+	mergeEvents,
+	mergeStates,
+	repoToEntryId,
+	resetRouterState,
+} from "../src/shard.ts";
 import { initialState, publicState } from "../src/rob.ts";
 
 test("componentName derives the DO name from the root entry id", () => {
@@ -53,4 +63,31 @@ test("mergeEvents unions event logs ordered by ts and caps at 200", () => {
 	const bigger = Array.from({ length: 150 }, (_, i) => mk(1000 + i));
 	assert.equal(mergeEvents([big, bigger]).length, 200);
 	assert.equal(mergeEvents([big, bigger])[199].ts, 1149);
+});
+
+// --- T19 review F1/F10: router reset + DO instance naming ----------------------
+
+test("resetRouterState keeps nextSeq monotonic and the trunk, restores robSize, clears routing (F1/F10)", () => {
+	const before = {
+		...emptyRouterState(),
+		nextSeq: 7,
+		entryComp: { e7: "comp-e7" },
+		repoComp: { "arb-e7-api-0": "comp-e7" },
+		components: ["comp-e7"],
+		trunk: { repo: "arb-trunk", remote: "https://x/arb-trunk", commit: "t1" },
+		robSize: 3,
+	};
+	const after = resetRouterState(before);
+	assert.equal(after.nextSeq, 7, "seq continues after reset: fresh repo names, no -xN collisions");
+	assert.deepEqual(after.trunk, before.trunk);
+	assert.equal(after.robSize, emptyRouterState().robSize);
+	assert.deepEqual([after.entryComp, after.repoComp, after.components], [{}, {}, []]);
+});
+
+test("component DO instance names are epoch-scoped and round-trip to the public name (F10)", () => {
+	const inst = componentInstance("comp-e3");
+	assert.notEqual(inst, "comp-e3");
+	assert.ok(inst.includes(COMPONENT_EPOCH));
+	assert.equal(componentFromInstance(inst), "comp-e3");
+	assert.equal(componentFromInstance("comp-e3"), "comp-e3");
 });

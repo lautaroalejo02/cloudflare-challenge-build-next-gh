@@ -60,7 +60,8 @@ interface Diagnosis {
   producerCommit: string;
 }
 
-interface CheckResult { commit: string; passed: number; failed: number; durationMs: number; results: Array<{ name: string; ok: boolean; error?: string }>; }
+interface CheckResult { commit: string; passed: number; failed: number; durationMs: number; results: Array<{ name: string; ok: boolean; error?: string }>;
+                        infra?: boolean; } // true = the checker could not run (platform failure), NOT a test verdict
 
 interface BufferState {
   trunk: { repo: string; commit: string | null; retiredCount: number };
@@ -73,6 +74,8 @@ interface BufferState {
 
 ## HTTP API (control-plane Worker, base `/api`)
 All JSON. Errors: `{ "error": string }` with a 4xx/5xx status.
+
+**Auth (T19).** Every non-GET `/api/*` request and `GET /api/entries/:id` require header `x-arb-key` equal to the `ARB_ADMIN_KEY` Worker secret; otherwise `403 { "error": "forbidden: ..." }`. `GET /api/state`, `GET /api/events` and `GET /api/ws` are public.
 - `POST /api/trunk/init` `{ fromDir?: never }` → `{ repo, remote, token }`. Creates `arb-trunk` if missing. The demo then pushes the fixture to it.
 - `POST /api/entries` `{ agent, lane, producerId?: string, consumes?: string[], stub?: Record<path, string> }` → `{ entry: Entry, token: string }`.
   - Forks from the producer's fork at its current head (forwarding), or from trunk if there is no producer.
@@ -80,12 +83,12 @@ All JSON. Errors: `{ "error": string }` with a 4xx/5xx status.
   - `stub` (value prediction) is TypeScript source declaring the entry's *intended* exported signatures. The control plane hashes it with the real hasher; `entry.exports` starts as these predicted hashes and `entry.predicted` lists the predicted symbols until the entry's first real push resolves them. Consumers registering while `producer.predicted` is non-empty forward against the predicted hashes, and get a `prediction.hit` (no squash) or `prediction.miss` (squash with reason `prediction-miss`) verdict per consumed symbol on that first push.
   - `token` is a write token for `entry.repo`, valid 1 hour.
   - Rejected with 409 when non-retired entries are already `>= robSize`.
-- `GET /api/entries/:id` → `{ entry: Entry, token?: string }`. Includes a fresh write `token` when the entry was re-forked since the agent last fetched it, so the agent can clone the new fork.
+- `GET /api/entries/:id` → `{ entry: Entry, token?: string }`. Includes a write `token` for `entry.repo` on every (authenticated) call, omitted only while a (re-)fork is in flight. Tokens are reused for up to 30 min, so each is valid for at least 30 more minutes.
 - `POST /api/entries/:id/ready` `{ commit: string }` → `{ entry }`. The agent declares its work done at `commit`. Rejected with 409 while squashed, except once the re-fork has landed (`headCommit === baseCommit`) — readying the fork base is then accepted and retires as a no-op when the base already contains the entry's intent.
 - `POST /api/entries/:id/veto` → `{ entry, squashed: string[] }`. Head entry only (409 otherwise).
 - `POST /api/config` `{ robSize: number }` → `{ robSize }`.
 - `GET /api/state` → `BufferState`.
-- `POST /api/reset` → clears buffer state. Does not delete repos.
+- `POST /api/reset` → clears buffer state and restores `robSize` to its default (8). Does not delete repos. Entry ids/seqs keep increasing across resets.
 - `GET /api/events` → `{ events: ArbEvent[] }`, the internal event log (debug/measurement aid; not part of the public contract surface).
 - `GET /api/ws` → WebSocket upgrade. The server sends `ArbEvent` JSON messages; the client sends nothing.
 
@@ -94,7 +97,7 @@ All JSON. Errors: `{ "error": string }` with a 4xx/5xx status.
 interface ArbEvent {
   type: "entry.created" | "push" | "hash.unchanged" | "hash.changed" | "squash" | "refork" | "ready"
       | "check.started" | "check.passed" | "check.failed" | "prediction.hit" | "prediction.miss"
-      | "retired" | "veto" | "config" | "reset";
+      | "retired" | "veto" | "config" | "reset" | "retire.retry" | "retire.failed" | "recover";
   ts: number;          // Date.now() on the server
   entryId?: string;
   data?: unknown;      // type-specific; include enough for the UI (e.g. symbol, oldHash, newHash, commit, durationMs)
@@ -157,3 +160,9 @@ interface RetirerPort {
 - 2026-10-13 (T11): `ArbEvent` gains `"prediction.hit"` (`data: { producerId, symbol, hash, commit }`) and `"prediction.miss"` (`data: { producerId, symbol, predictedHash, actualHash, predictedSignature, actualSignature, commit }`); `entryId` is the consumer.
 - 2026-10-13 (T14): Sharded control plane — the buffer is served by one `ReorderBuffer` DO per connected component behind an `ArbRouter` DO; retirement is serialized by an `ArbTrunk` DO. Public API unchanged except: `GET /api/state` entries gain an optional `component` field (owning component name, `comp-<rootEntryId>`), and global `robSize` is enforced across all components.
 - 2026-10-13 (T17): `ArbEvent` gains `"retire.retry"` (`data: {attempt, reason}`) and `"retire.failed"` (`data: {reason, strike, exhausted}`). Retirement is now one atomic cycle inside `ArbTrunk` (`retireAtomic`): the splice candidate is checked and landed inside a single serialized slot with bounded rebuilds on rejection, so candidate check/retry events replay after the fact rather than streaming live.
+- 2026-10-13 (T19): Admin-key auth: non-GET `/api/*` and `GET /api/entries/:id` require `x-arb-key` == `ARB_ADMIN_KEY` (Worker secret), else 403. `GET /api/state|events|ws` stay public.
+- 2026-10-13 (T19): `CheckResult.infra?: boolean` — the checker could not run (Artifacts/loader/network failure). Infra results are never stored as `entry.checks`; the entry stays `checking` and is re-checked. `check.failed` events for them carry `data.infra: true`.
+- 2026-10-13 (T19): `ArbEvent` gains `"recover"` (`data: { kind, ... }`, kinds `refork` | `recheck` | `reretire` | `fork-failed` | `<effect>-failed`): a stale in-flight marker was swept and the work re-issued, or an effect failed and was reported instead of wedging the component.
+- 2026-10-13 (T19): `GET /api/entries/:id` returns a write token on every authenticated call (was: once per repo change, to whoever asked first).
+- 2026-10-13 (T19): `POST /api/reset` restores the default `robSize`; entry ids/seqs keep increasing across resets (fresh fork names, no `-xN` collisions).
+- 2026-10-13 (T19): Splice overlap also counts file/dir prefix conflicts (`src/a` vs `src/a/b.ts`), mode-only changes, and keeps gitlinks.

@@ -33,6 +33,11 @@ export interface CheckResult {
 	failed: number;
 	durationMs: number;
 	results: Array<{ name: string; ok: boolean; error?: string }>;
+	/** True when the checker could not run at all (Artifacts/loader/network
+	 * failure) — an infra error, NOT a test verdict. Infra results are never
+	 * stored on `entry.checks` and never flip the entry to failed/ready; the
+	 * check is retried by the stale-marker sweep. */
+	infra?: boolean;
 }
 
 export interface Entry {
@@ -94,7 +99,11 @@ export interface ArbEvent {
 		| "retired"
 		| "veto"
 		| "config"
-		| "reset";
+		| "reset"
+		/** Recovery narration (T19): a stale in-flight marker was swept and the
+		 * work re-issued, or an effect threw and was reported instead of
+		 * wedging the queue. `data` carries {kind, entryId?, detail?}. */
+		| "recover";
 	ts: number;
 	entryId?: string;
 	data?: unknown;
@@ -134,8 +143,23 @@ export interface RobInternal {
 	sigs: Record<string, SymbolSignatures>;
 	/** entryId -> repo name of a fork currently in flight. */
 	pending: Record<string, string>;
+	/** entryId -> ts when the fork effect was emitted (stale-marker sweep). */
+	pendingStart: Record<string, number>;
+	/** entryId -> source repo of the in-flight fork, so the sweep can
+	 * re-issue exactly the same fork (T19). */
+	pendingFrom: Record<string, string>;
+	/** entryId -> consecutive failed fork attempts for the current planned
+	 * fork (T19 recovery; cleared when a fork lands). */
+	forkFails: Record<string, number>;
+	/** entryId -> earliest ts the sweep may re-issue a failed fork (backoff). */
+	forkRetryAt: Record<string, number>;
 	/** entryId -> commit a check is running against. */
 	checking: Record<string, string>;
+	/** entryId -> ts when the check effect was emitted. */
+	checkStart: Record<string, number>;
+	/** entryId -> earliest ts the sweep re-issues a check whose last run was
+	 * an infra failure (T19; faster than the STALE_MARKER_MS fallback). */
+	checkRetryAt: Record<string, number>;
 	/** entryId -> a retire effect is in flight. */
 	retiring: Record<string, true>;
 	/** entryId -> consecutive exhausted atomic-retire cycles for the current
@@ -181,7 +205,13 @@ export function initialState(): RobState {
 		_internal: {
 			sigs: {},
 			pending: {},
+			pendingStart: {},
+			pendingFrom: {},
+			forkFails: {},
+			forkRetryAt: {},
 			checking: {},
+			checkStart: {},
+			checkRetryAt: {},
 			retiring: {},
 			retireStrikes: {},
 			retireStart: {},
@@ -226,7 +256,17 @@ export type Cmd =
 			baseCommit: string;
 			exports: SymbolHashes;
 			sigs?: SymbolSignatures;
+			/** Planned name the fork effect targeted (`Effect.fork.toRepo`). A
+			 * fork.done whose planned name no longer matches the entry's
+			 * pending fork was superseded by a newer re-fork and is dropped. */
+			planned?: string;
 	  }
+	/** The fork effect threw (T19): keep `pending` (the agent still has no
+	 * fork), record the failure and let the sweep re-issue it with backoff. */
+	| { type: "fork.failed"; entryId: string; planned?: string; reason: string }
+	/** A non-fork effect threw (token, broadcast, ...): narrate it as a
+	 * `recover` event; the effect queue continues (T19). */
+	| { type: "effect.failed"; entryId?: string; effect: string; reason: string }
 	| { type: "push"; repo: string; commit: string; exports?: SymbolHashes; sigs?: SymbolSignatures }
 	| { type: "entry.ready"; entryId: string; commit: string }
 	| { type: "check.done"; entryId: string; result: CheckResult }
@@ -252,6 +292,11 @@ export type Cmd =
 	  }
 	| { type: "entry.veto"; entryId: string }
 	| { type: "config.set"; robSize: number }
+	/** Stale-marker sweep (T19): in-flight fork/check/retire markers older
+	 * than STALE_MARKER_MS are presumed lost (effect threw, DO restarted
+	 * mid-effect, or the RPC silently died). Clears them so the trailing
+	 * cascade re-issues the work; emits `recover` events. */
+	| { type: "sweep" }
 	| { type: "reset" };
 
 export type Effect =
@@ -349,8 +394,10 @@ function children(state: RobState, producerId: string): Entry[] {
 	return out;
 }
 
-function setPending(state: RobState, id: string, repo: string): void {
+function setPending(state: RobState, id: string, repo: string, now: number, fromRepo: string): void {
 	state._internal.pending[id] = repo;
+	state._internal.pendingStart[id] = now;
+	state._internal.pendingFrom[id] = fromRepo;
 	idx(state).pendingRepo[repo] = id;
 }
 
@@ -358,6 +405,8 @@ function clearPending(state: RobState, id: string): void {
 	const repo = state._internal.pending[id];
 	if (repo !== undefined) delete idx(state).pendingRepo[repo];
 	delete state._internal.pending[id];
+	delete state._internal.pendingStart[id];
+	delete state._internal.pendingFrom[id];
 }
 
 function live(e: Entry): boolean {
@@ -380,9 +429,9 @@ function emit(state: RobState, effects: Effect[], now: number, ev: Omit<ArbEvent
 	if (state._internal.eventLog.length > 200) state._internal.eventLog.shift();
 }
 
-function forkEffect(state: RobState, effects: Effect[], e: Entry, fromRepo: string): string {
+function forkEffect(state: RobState, effects: Effect[], e: Entry, fromRepo: string, now: number): string {
 	const toRepo = `arb-e${e.seq}-${e.lane}-${e.generation}`;
-	setPending(state, e.id, toRepo);
+	setPending(state, e.id, toRepo, now, fromRepo);
 	effects.push({ type: "fork", entryId: e.id, fromRepo, toRepo });
 	return toRepo;
 }
@@ -444,6 +493,18 @@ function squashTree(
 	producerCommit: string,
 	reparentTo: string | null | undefined,
 ): void {
+	// Diagnose dependents against their DIRECT producer (T19, review F11):
+	// after its re-fork, `producer` exposes the new base content plus its own
+	// still-declared stub symbols. A vetoed producer's declarations die with it.
+	if (reason !== "producer-vetoed" && producer.predicted.length) {
+		const ownSigs = state._internal.sigs[producer.id] ?? {};
+		baseExports = { ...baseExports };
+		baseSigs = { ...baseSigs };
+		for (const sym of producer.predicted) {
+			baseExports[sym] = producer.exports[sym] ?? "";
+			baseSigs[sym] = ownSigs[sym] ?? "";
+		}
+	}
 	for (const c of children(state, producer.id).filter(live)) {
 		// Rebase target for THIS dependent.
 		let fromRepo = baseRepo;
@@ -452,6 +513,12 @@ function squashTree(
 		if (reason === "producer-squashed") {
 			// Refork from the parent's new (in-flight) fork.
 			fromRepo = state._internal.pending[producer.id] ?? producer.repo;
+		}
+		if (reason === "producer-vetoed") {
+			// The vetoed producer will never resolve its declared-stub
+			// predictions: release this consumer's pins so its re-fork (onto
+			// the vetoed entry's base) fills consumes from real content.
+			delete state._internal.predConsumed[c.id];
 		}
 		const oldSigs = state._internal.sigs[c.id] ?? {};
 		const changed = consumedDiff(c.consumes, newExports, oldSigs, newSigs);
@@ -463,25 +530,14 @@ function squashTree(
 			c.producerId = reparentTo;
 		}
 		state.stats.squashes += 1;
-		const newRepo = forkEffect(state, effects, c, fromRepo);
+		const newRepo = forkEffect(state, effects, c, fromRepo, now);
 		emit(state, effects, now, {
 			type: "squash",
 			entryId: c.id,
 			data: { reason, changed, generation: c.generation, repo: newRepo },
 		});
 		// Its own dependents collapse onto its new fork.
-		squashTree(
-			state,
-			effects,
-			now,
-			c,
-			"producer-squashed",
-			newRepo,
-			newExports,
-			newSigs,
-			producerCommit,
-			undefined,
-		);
+		squashTree(state, effects, now, c, "producer-squashed", newRepo, newExports, newSigs, producerCommit, undefined);
 	}
 }
 
@@ -491,6 +547,17 @@ function squashTree(
  * strike count. */
 export const MAX_RETIRE_CYCLES = 3;
 
+/** In-flight fork/check/retire markers older than this are presumed lost and
+ * re-issued by the sweep (T19). */
+export const STALE_MARKER_MS = 60_000;
+
+/** First retry delay for a failed fork; doubles per consecutive failure,
+ * capped at STALE_MARKER_MS (T19). */
+export const FORK_RETRY_BASE_MS = 2_000;
+
+/** Re-check delay after an infra (non-verdict) check failure (T19). */
+export const INFRA_RECHECK_MS = 10_000;
+
 /** Advance the retirement pipeline: the head entry checks, then retires. */
 function cascade(state: RobState, effects: Effect[], now: number): void {
 	const h = head(state);
@@ -499,6 +566,8 @@ function cascade(state: RobState, effects: Effect[], now: number): void {
 		if (!h.checks || h.checks.commit !== h.headCommit) {
 			h.status = "checking";
 			state._internal.checking[h.id] = h.headCommit!;
+			state._internal.checkStart[h.id] = now;
+			delete state._internal.checkRetryAt[h.id];
 			effects.push({ type: "check", entryId: h.id, repo: h.repo, commit: h.headCommit! });
 			emit(state, effects, now, { type: "check.started", entryId: h.id, data: { commit: h.headCommit } });
 			return;
@@ -601,7 +670,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			if (pinned.length) state._internal.predConsumed[id] = pinned;
 			if (cmd.stub) state._internal.sigs[id] = { ...cmd.stub.sigs };
 			const fromRepo = producer ? producer.repo : state.trunk.repo;
-			const repo = forkEffect(state, effects, entry, fromRepo);
+			const repo = forkEffect(state, effects, entry, fromRepo, now);
 			entry.repo = repo;
 			ix.byRepo[repo] = id;
 			emit(state, effects, now, {
@@ -624,6 +693,10 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 		case "fork.done": {
 			const e = find(state, cmd.entryId);
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
+			// Superseded or orphaned fork (T19): a newer re-fork replaced this
+			// one, or a veto cleared the pending marker. Adopting it would point
+			// the entry at a fork nobody is waiting for.
+			if (cmd.planned !== undefined && state._internal.pending[e.id] !== cmd.planned) break;
 			const wasSquash = e.status === "squashed";
 			const oldRepo = e.repo;
 			e.repo = cmd.repo;
@@ -662,6 +735,52 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			if (planned && planned !== cmd.repo) state._internal.repoAlias[planned] = cmd.repo;
 			clearPending(state, e.id);
 			delete state._internal.retireStrikes[e.id];
+			delete state._internal.forkFails[e.id];
+			delete state._internal.forkRetryAt[e.id];
+			// Producer drifted while this fork was in flight (T19, review F4): a
+			// producer push that lands during the fork only refreshes the
+			// diagnosis (the pending dedupe), so the base this fork captured may
+			// predate the producer's current head. When the fork's base is not
+			// the producer's current head, re-diff every unpinned consumed
+			// symbol against the producer's CURRENT exports; any mismatch means
+			// the new fork is already stale — squash and re-fork immediately
+			// instead of handing out its token. Pinned stub symbols are skipped:
+			// they resolve on the producer's first push (prediction verdicts).
+			const producer = e.producerId ? find(state, e.producerId) : undefined;
+			if (
+				producer &&
+				live(producer) &&
+				live(e) &&
+				!state._internal.pending[producer.id] &&
+				producer.headCommit &&
+				producer.headCommit !== cmd.baseCommit
+			) {
+				const prodSigs = state._internal.sigs[producer.id] ?? {};
+				const eSigs = state._internal.sigs[e.id] ?? {};
+				const unpinned: SymbolHashes = {};
+				for (const sym of Object.keys(e.consumes)) if (!pinned.has(sym)) unpinned[sym] = e.consumes[sym];
+				const changed = consumedDiff(unpinned, producer.exports, eSigs, prodSigs);
+				if (changed.length) {
+					const producerCommit = producer.headCommit;
+					emit(state, effects, now, {
+						type: "hash.changed",
+						entryId: e.id,
+						data: { producerId: producer.id, commit: producerCommit, changed, drift: true },
+					});
+					e.generation += 1;
+					e.status = "squashed";
+					e.diagnosis = { reason: "interface-changed", changed, producerCommit };
+					state.stats.squashes += 1;
+					const newRepo = forkEffect(state, effects, e, producer.repo, now);
+					emit(state, effects, now, {
+						type: "squash",
+						entryId: e.id,
+						data: { reason: "interface-changed", changed, generation: e.generation, repo: newRepo, drift: true },
+					});
+					squashTree(state, effects, now, e, "producer-squashed", newRepo, producer.exports, prodSigs, producerCommit, undefined);
+					break; // fork already stale: no token, no refork announce
+				}
+			}
 			effects.push({ type: "token", entryId: e.id, repo: e.repo });
 			if (wasSquash) {
 				emit(state, effects, now, {
@@ -790,7 +909,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 						c.status = "squashed";
 						c.diagnosis = { reason: "prediction-miss", changed: diagChanged, producerCommit: cmd.commit };
 						state.stats.squashes += 1;
-						const newRepo = forkEffect(state, effects, c, target.repo);
+						const newRepo = forkEffect(state, effects, c, target.repo, now);
 						emit(state, effects, now, {
 							type: "squash",
 							entryId: c.id,
@@ -827,7 +946,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				c.status = "squashed";
 				c.diagnosis = { reason: "interface-changed", changed, producerCommit: cmd.commit };
 				state.stats.squashes += 1;
-				const newRepo = forkEffect(state, effects, c, target.repo);
+				const newRepo = forkEffect(state, effects, c, target.repo, now);
 				emit(state, effects, now, {
 					type: "squash",
 					entryId: c.id,
@@ -851,6 +970,10 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			}
 			if (cmd.commit !== e.headCommit) return err(409, `commit ${cmd.commit} is not head ${e.headCommit}`);
 			delete state._internal.retireStrikes[e.id];
+			// A re-ready on the same head must re-check: clear a FAILED verdict
+			// (the cascade's `checks.commit === headCommit` guard would
+			// otherwise trust it forever and wedge the entry at ready).
+			if (e.checks && e.checks.failed > 0) e.checks = null;
 			e.status = "ready";
 			emit(state, effects, now, { type: "ready", entryId: e.id, data: { commit: cmd.commit } });
 			break;
@@ -859,14 +982,34 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 		case "check.done": {
 			const e = find(state, cmd.entryId);
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
-			delete state._internal.checking[e.id];
 			state.stats.checksRun += 1;
 			// Checks are issued from "ready"/"checking" (head). Any other status
 			// means the check is stale — applying it could resurrect a
 			// retired/squashed entry (observed: a head check completing after
 			// retirement flipped e3 back to ready and triggered a phantom
 			// trunk-overlap loop).
-			if (e.status !== "ready" && e.status !== "checking") break;
+			if (e.status !== "ready" && e.status !== "checking") {
+				delete state._internal.checking[e.id];
+				delete state._internal.checkStart[e.id];
+				break;
+			}
+			// Infra failures (T19, review F2): the checker never ran the tests —
+			// do NOT store a verdict. Keep the `checking` marker and let the
+			// sweep re-issue the check after INFRA_RECHECK_MS.
+			if (cmd.result.infra) {
+				state._internal.checking[e.id] = e.headCommit ?? cmd.result.commit;
+				state._internal.checkStart[e.id] = now;
+				state._internal.checkRetryAt[e.id] = now + INFRA_RECHECK_MS;
+				e.status = "checking";
+				emit(state, effects, now, {
+					type: "check.failed",
+					entryId: e.id,
+					data: { commit: cmd.result.commit, infra: true, error: cmd.result.results[0]?.error ?? "infra" },
+				});
+				break;
+			}
+			delete state._internal.checking[e.id];
+			delete state._internal.checkStart[e.id];
 			if (cmd.result.commit !== e.headCommit) break; // stale check; a push moved head
 			// Record only head checks: a splice-candidate result must not
 			// clobber entry.checks (its commit never equals the fork head, which
@@ -912,6 +1055,16 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				entryId: e.id,
 				data: { commit: cmd.candidate, splice: true },
 			});
+			if (cmd.result.infra) {
+				// The checker could not run (T19): narration only. The atomic
+				// cycle treated it as a retryable attempt, not a verdict.
+				emit(state, effects, now, {
+					type: "check.failed",
+					entryId: e.id,
+					data: { commit: cmd.result.commit, infra: true, splice: true, error: cmd.result.results[0]?.error ?? "infra" },
+				});
+				break;
+			}
 			if (cmd.result.failed === 0) {
 				emit(state, effects, now, {
 					type: "check.passed",
@@ -962,6 +1115,9 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 		case "retire.overlap": {
 			const e = find(state, cmd.entryId);
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
+			// Stale overlap (T19): a push/veto moved the entry past this cycle —
+			// the atomic attempt's verdict no longer applies.
+			if (!state._internal.retiring[e.id] || e.status !== "ready") break;
 			delete state._internal.retiring[e.id];
 			delete state._internal.retireStrikes[e.id];
 			delete state._internal.retireStart[e.id];
@@ -977,7 +1133,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			e.status = "squashed";
 			e.diagnosis = { reason: "trunk-overlap", changed: [], producerCommit: state.trunk.commit ?? e.baseCommit };
 			state.stats.squashes += 1;
-			const newRepo = forkEffect(state, effects, e, fromRepo);
+			const newRepo = forkEffect(state, effects, e, fromRepo, now);
 			emit(state, effects, now, {
 				type: "squash",
 				entryId: e.id,
@@ -989,7 +1145,27 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 		case "retire.done": {
 			const e = find(state, cmd.entryId);
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
-			if (cmd.entryCommit && e.headCommit !== cmd.entryCommit) break; // stale: head moved mid-retire
+			if (e.status === "retired") break; // duplicate land (e.g. a swept, re-issued cycle)
+			// Stale land (T19, review F6): a push mid-cycle cleared `retiring`
+			// and moved the entry on (or a veto/sweep did), but the atomic cycle
+			// still landed `cmd.commit` on trunk. Dropping it would desync
+			// state.trunk.commit from reality, and the entry would diff its next
+			// retirement against a base that predates already-landed work — so
+			// record the landing without retiring the entry: trunk advances and
+			// a live entry's base advances to the retired entry commit.
+			const current =
+				state._internal.retiring[e.id] &&
+				e.status === "ready" &&
+				(!cmd.entryCommit || e.headCommit === cmd.entryCommit);
+			if (!current) {
+				if (cmd.entryCommit && live(e)) e.baseCommit = cmd.entryCommit;
+				state.trunk.commit = cmd.commit;
+				emit(state, effects, now, {
+					type: "push",
+					data: { repo: state.trunk.repo, commit: cmd.commit, trunk: true, staleRetire: e.id },
+				});
+				break;
+			}
 			const startedAt = state._internal.retireStart[e.id];
 			const durationMs = startedAt === undefined ? undefined : now - startedAt;
 			delete state._internal.retiring[e.id];
@@ -1013,9 +1189,17 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
 			const h = head(state);
 			if (!h || h.id !== e.id) return err(409, "only the head entry can be vetoed");
+			// A retire cycle is in flight for this entry (T19): its outcome
+			// arrives asynchronously and would override the veto — reject now.
+			if (state._internal.retiring[e.id]) {
+				return err(409, `entry ${e.id} is retiring; retry after the cycle lands`);
+			}
 			e.status = "vetoed";
 			clearPending(state, e.id);
+			delete state._internal.forkFails[e.id];
+			delete state._internal.forkRetryAt[e.id];
 			delete state._internal.checking[e.id];
+			delete state._internal.checkStart[e.id];
 			delete state._internal.retiring[e.id];
 			delete state._internal.retireStrikes[e.id];
 			delete state._internal.retireStart[e.id];
@@ -1036,15 +1220,106 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			break;
 		}
 
+		case "fork.failed": {
+			const e = find(state, cmd.entryId);
+			if (!e) return err(404, `entry ${cmd.entryId} not found`);
+			const planned = state._internal.pending[e.id];
+			// Stale failure: the fork was superseded, landed, or vetoed away.
+			if (!planned || (cmd.planned !== undefined && planned !== cmd.planned)) break;
+			const attempt = (state._internal.forkFails[e.id] ?? 0) + 1;
+			const retryInMs = Math.min(STALE_MARKER_MS, FORK_RETRY_BASE_MS * 2 ** (attempt - 1));
+			state._internal.forkFails[e.id] = attempt;
+			state._internal.forkRetryAt[e.id] = now + retryInMs;
+			emit(state, effects, now, {
+				type: "recover",
+				entryId: e.id,
+				data: { kind: "fork-failed", repo: planned, attempt, retryInMs, reason: cmd.reason },
+			});
+			break;
+		}
+
+		case "effect.failed": {
+			emit(state, effects, now, {
+				type: "recover",
+				...(cmd.entryId ? { entryId: cmd.entryId } : {}),
+				data: { kind: `${cmd.effect}-failed`, reason: cmd.reason },
+			});
+			break;
+		}
+
+		case "sweep": {
+			// Alarm-driven recovery (T19, review F3): re-issue in-flight work
+			// whose marker outlived STALE_MARKER_MS (the effect threw, the DO
+			// restarted mid-effect, or an RPC silently died), and failed forks
+			// whose backoff elapsed. The trailing cascade re-issues checks and
+			// retirements once their markers are cleared.
+			const ii = state._internal;
+			for (const e of state.entries) {
+				if (!live(e)) continue;
+				const planned = ii.pending[e.id];
+				if (planned) {
+					const pendAt = ii.pendingStart[e.id];
+					const retryAt = ii.forkRetryAt[e.id];
+					const failedDue = retryAt !== undefined && now >= retryAt;
+					const stale = pendAt !== undefined && now - pendAt > STALE_MARKER_MS;
+					if (failedDue || stale) {
+						const from =
+							ii.pendingFrom[e.id] ??
+							(e.producerId ? (find(state, e.producerId)?.repo ?? state.trunk.repo) : state.trunk.repo);
+						clearPending(state, e.id);
+						delete ii.forkRetryAt[e.id];
+						const toRepo = forkEffect(state, effects, e, from, now);
+						emit(state, effects, now, {
+							type: "recover",
+							entryId: e.id,
+							data: {
+								kind: "refork",
+								repo: toRepo,
+								attempt: (ii.forkFails[e.id] ?? 0) + 1,
+								ageMs: pendAt === undefined ? null : now - pendAt,
+							},
+						});
+					}
+					continue;
+				}
+				const checkAt = ii.checkStart[e.id];
+				const checkRetryAt = ii.checkRetryAt[e.id];
+				const checkDue =
+					(checkRetryAt !== undefined && now >= checkRetryAt) ||
+					(checkAt !== undefined && now - checkAt > STALE_MARKER_MS);
+				if (ii.checking[e.id] && checkAt !== undefined && checkDue) {
+					delete ii.checking[e.id];
+					delete ii.checkStart[e.id];
+					delete ii.checkRetryAt[e.id];
+					if (e.status === "checking") e.status = "ready";
+					emit(state, effects, now, {
+						type: "recover",
+						entryId: e.id,
+						data: { kind: "recheck", commit: e.headCommit, ageMs: now - checkAt },
+					});
+				}
+				const retAt = ii.retireStart[e.id];
+				if (ii.retiring[e.id] && retAt !== undefined && now - retAt > STALE_MARKER_MS) {
+					delete ii.retiring[e.id];
+					delete ii.retireStart[e.id];
+					emit(state, effects, now, {
+						type: "recover",
+						entryId: e.id,
+						data: { kind: "reretire", ageMs: now - retAt },
+					});
+				}
+			}
+			break;
+		}
+
 		case "reset": {
 			const trunk = state.trunk;
-			const robSize = state.robSize;
 			const fresh = initialState();
 			state.entries = fresh.entries;
 			state.stats = fresh.stats;
 			state._internal = fresh._internal;
 			state.trunk = { repo: trunk.repo, commit: trunk.commit, retiredCount: 0 };
-			state.robSize = robSize;
+			state.robSize = fresh.robSize;
 			emit(state, effects, now, { type: "reset", data: {} });
 			break;
 		}

@@ -18,6 +18,10 @@ import * as git from "isomorphic-git";
 import http from "isomorphic-git/http/web";
 import { buildTree, decideSplice, overlayPaths, type FlatBlob, type TreeNode } from "./splice.ts";
 import type { RetirerPort, RetireArgs, RetireOutcome } from "./ports.ts";
+// Transient Artifacts/git read failures (5xx, network) retry with ~0.5/1/2 s
+// backoff (T19, review F2). Pushes are not retried here: a rejected push is a
+// race the atomic cycle (src/atomic.ts) rebuilds from.
+import { withRetry } from "../../checker/src/retry.ts";
 
 // ---------------------------------------------------------------------------
 // In-memory fs implementing the isomorphic-git `fs.promises` contract.
@@ -272,7 +276,11 @@ async function trunkHead(httpAuth: ReturnType<typeof authFor>, toUrl: string, br
 	return refs.find((r) => r.ref === `refs/heads/${branch}`)?.oid ?? null;
 }
 
-/** Leaf paths whose blob oid differs between `a` and `b` (a -> b). */
+/** Leaf paths that differ between `a` and `b` (a -> b): blob oid OR mode
+ * changed (T19, review F7: a chmod is a change), added or removed. On a
+ * blob<->tree type change both sides are reported — the leaf path itself and
+ * every leaf under the directory — so P/Q intersection and the overlay see
+ * the full conflict. Gitlinks (submodule entries) are leaves. */
 export async function diffPaths(fs: MemFs, a: string, b: string): Promise<Set<string>> {
 	const changed = new Set<string>();
 	await git.walk({
@@ -284,16 +292,23 @@ export async function diffPaths(fs: MemFs, a: string, b: string): Promise<Set<st
 			if (filepath === ".") return;
 			const aoid = ea ? await ea.oid() : null;
 			const boid = eb ? await eb.oid() : null;
-			if (aoid === boid) return null; // equal subtree: prune / equal blob: skip
-			const type = await (eb ?? ea)!.type();
-			if (type === "tree") return; // differing tree: descend
-			changed.add(filepath);
+			const amode = ea ? await ea.mode() : null;
+			const bmode = eb ? await eb.mode() : null;
+			if (aoid === boid && amode === bmode) return null; // equal subtree: prune / equal leaf: skip
+			const aTree = ea ? (await ea.type()) === "tree" : false;
+			const bTree = eb ? (await eb.type()) === "tree" : false;
+			if (aTree && bTree) return; // differing trees: descend
+			// A leaf on either side at this path is a change; a tree side is
+			// descended so its leaves are reported too.
+			if ((ea && !aTree) || (eb && !bTree)) changed.add(filepath);
+			return;
 		},
 	});
 	return changed;
 }
 
-/** path -> {mode, oid} for every blob under `ref`. */
+/** path -> {mode, oid} for every leaf under `ref`: blobs, plus gitlinks
+ * (`type: "commit"`, mode 160000) so a splice never drops a submodule. */
 export async function flattenTree(fs: MemFs, ref: string): Promise<Map<string, FlatBlob>> {
 	const flat = new Map<string, FlatBlob>();
 	await git.walk({
@@ -304,9 +319,10 @@ export async function flattenTree(fs: MemFs, ref: string): Promise<Map<string, F
 		map: async (filepath, [entry]) => {
 			if (filepath === ".") return;
 			const type = await entry!.type();
-			if (type !== "blob") return; // trees are descended into
-			const mode = await entry!.mode();
-			flat.set(filepath, { mode: mode.toString(8).padStart(6, "0"), oid: await entry!.oid() });
+			if (type !== "blob" && type !== "commit") return; // trees are descended into
+			const mode = (await entry!.mode()).toString(8).padStart(6, "0");
+			const oid = await entry!.oid();
+			flat.set(filepath, type === "commit" ? { mode, oid, type: "commit" } : { mode, oid });
 		},
 	});
 	return flat;
@@ -318,7 +334,7 @@ export async function writeTreeNode(fs: MemFs, node: TreeNode): Promise<string> 
 		entries.push({ mode: "040000", path: name, oid: await writeTreeNode(fs, sub), type: "tree" });
 	}
 	for (const [name, blob] of node.blobs) {
-		entries.push({ mode: blob.mode, path: name, oid: blob.oid, type: "blob" });
+		entries.push({ mode: blob.mode, path: name, oid: blob.oid, type: blob.type ?? "blob" });
 	}
 	return git.writeTree({ fs, dir: DIR, gitdir: GITDIR, tree: entries });
 }
@@ -347,15 +363,12 @@ export function realRetirer(artifacts: ArtifactsBinding): RetirerPort {
 				ms[k] = Date.now() - t;
 			};
 
-			const from = await artifacts.get(args.fromRepo);
-			const to = await artifacts.get(args.toRepo);
+			const from = await withRetry(() => artifacts.get(args.fromRepo));
+			const to = await withRetry(() => artifacts.get(args.toRepo));
 			try {
-				const [fromInfo, fromTok, toInfo, toTok] = await Promise.all([
-					from.info(),
-					from.createToken("read", ttl),
-					to.info(),
-					to.createToken("write", ttl),
-				]);
+				const [fromInfo, fromTok, toInfo, toTok] = await withRetry(() =>
+					Promise.all([from.info(), from.createToken("read", ttl), to.info(), to.createToken("write", ttl)]),
+				);
 				stamp("setup", t0);
 				const fromUrl = withCreds(fromInfo.remote, fromTok.plaintext);
 				const toUrl = withCreds(toInfo.remote, toTok.plaintext);
@@ -375,19 +388,23 @@ export function realRetirer(artifacts: ArtifactsBinding): RetirerPort {
 				// Pull both histories into one object store: the entry head (with
 				// baseCommit as an ancestor) and the live trunk head.
 				const tFetch = Date.now();
-				await git.fetch({
-					fs, http, dir: DIR, gitdir: GITDIR,
-					remote: "origin", ref: `arb-retire/${args.fromRepo}`, remoteRef: branch,
-					singleBranch: true, tags: false, onAuth: fromAuth,
-				});
-				await git.fetch({
-					fs, http, dir: DIR, gitdir: GITDIR,
-					remote: "trunk", ref: `arb-retire/${args.toRepo}`, remoteRef: branch,
-					singleBranch: true, tags: false, onAuth: toAuth,
-				});
+				await withRetry(() =>
+					git.fetch({
+						fs, http, dir: DIR, gitdir: GITDIR,
+						remote: "origin", ref: `arb-retire/${args.fromRepo}`, remoteRef: branch,
+						singleBranch: true, tags: false, onAuth: fromAuth,
+					}),
+				);
+				await withRetry(() =>
+					git.fetch({
+						fs, http, dir: DIR, gitdir: GITDIR,
+						remote: "trunk", ref: `arb-retire/${args.toRepo}`, remoteRef: branch,
+						singleBranch: true, tags: false, onAuth: toAuth,
+					}),
+				);
 				stamp("fetch", tFetch);
 
-				const head = await trunkHead(toAuth, toUrl, branch);
+				const head = await withRetry(() => trunkHead(toAuth, toUrl, branch));
 				if (head === null) {
 					// Unborn branch: land the entry head directly.
 					const tPush = Date.now();
@@ -462,18 +479,20 @@ export function realRetirer(artifacts: ArtifactsBinding): RetirerPort {
 		/** Fast-forward `toRepo`:`branch` to `commit` (a previously pushed
 		 * candidate whose parent is the current branch head). */
 		async moveBranch({ toRepo, branch, commit }): Promise<void> {
-			const to = await artifacts.get(toRepo);
+			const to = await withRetry(() => artifacts.get(toRepo));
 			try {
-				const [info, tok] = await Promise.all([to.info(), to.createToken("write", 600)]);
+				const [info, tok] = await withRetry(() => Promise.all([to.info(), to.createToken("write", 600)]));
 				const toUrl = withCreds(info.remote, tok.plaintext);
 				const toAuth = authFor(tok.plaintext);
 				const fs = await newStore("origin", toUrl);
 				// Pull the candidate's objects locally so push can negotiate.
-				await git.fetch({
-					fs, http, dir: DIR, gitdir: GITDIR,
-					remote: "origin", ref: "arb-candidate", remoteRef: "arb-candidate",
-					singleBranch: true, tags: false, onAuth: toAuth,
-				});
+				await withRetry(() =>
+					git.fetch({
+						fs, http, dir: DIR, gitdir: GITDIR,
+						remote: "origin", ref: "arb-candidate", remoteRef: "arb-candidate",
+						singleBranch: true, tags: false, onAuth: toAuth,
+					}),
+				);
 				await git.writeRef({ fs, dir: DIR, gitdir: GITDIR, ref: "refs/heads/arb-candidate", value: commit, force: true });
 				const res = await git.push({
 					fs, http, dir: DIR, gitdir: GITDIR, url: toUrl,

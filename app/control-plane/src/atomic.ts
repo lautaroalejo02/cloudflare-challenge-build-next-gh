@@ -24,6 +24,12 @@ import type {
 /** Bounded rebuilds per atomic cycle (read head -> candidate -> check -> move). */
 export const MAX_ATOMIC_ATTEMPTS = 3;
 
+/** Backoff before attempt n+1 (T19, review F2): ~0.5 s, 1 s, 2 s. Rebuilding
+ * immediately after a transient Artifacts/git failure just repeats it. */
+export const ATOMIC_BACKOFF_MS = [500, 1000, 2000];
+
+const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 /** Failure text for events: scrub credentials embedded in git remote URLs. */
 export function sanitizeReason(e: unknown): string {
 	const msg = String(e instanceof Error ? e.message : e);
@@ -32,14 +38,16 @@ export function sanitizeReason(e: unknown): string {
 
 export async function retireAtomic(
 	args: RetireArgs,
-	deps: { retirer: RetirerPort; checker: CheckerPort },
+	deps: { retirer: RetirerPort; checker: CheckerPort; sleep?: (ms: number) => Promise<void> },
 	maxAttempts: number = MAX_ATOMIC_ATTEMPTS,
 ): Promise<AtomicRetireResult> {
+	const sleep = deps.sleep ?? realSleep;
 	const t0 = Date.now();
 	const ms = (): Record<string, number> => ({ total: Date.now() - t0 });
 	const attempts: AtomicAttempt[] = [];
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		if (attempt > 1) await sleep(ATOMIC_BACKOFF_MS[Math.min(attempt - 2, ATOMIC_BACKOFF_MS.length - 1)]);
 		const rec: AtomicAttempt = { attempt };
 		attempts.push(rec);
 		try {
@@ -58,6 +66,12 @@ export async function retireAtomic(
 			// still inside the same serialized queue slot.
 			rec.candidate = res.candidate;
 			rec.check = await deps.checker.runChecks(args.toRepo, res.candidate);
+			if (rec.check.infra) {
+				// The checker could not run (Artifacts/loader outage): not a
+				// verdict on the candidate — retry the attempt after backoff.
+				rec.reason = sanitizeReason(`infra: ${rec.check.results[0]?.error ?? "checker unavailable"}`);
+				continue;
+			}
 			if (rec.check.failed > 0) {
 				// A verdict, not a race: rebuilding the same paths can only
 				// reproduce the same failures.

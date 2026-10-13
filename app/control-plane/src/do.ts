@@ -16,28 +16,24 @@ import {
 	type Effect,
 	type RobState,
 } from "./rob.ts";
+import { realArtifacts, realChecker, realHasher, type Ports, type TrunkRetirerPort } from "./ports.ts";
 import {
+	execEffects,
 	interfaceToMaps,
-	realArtifacts,
-	realChecker,
-	realHasher,
-	type ArtifactsPort,
-	type Ports,
-	type TrunkRetirerPort,
-} from "./ports.ts";
+	pushCommand,
+	tokenCache,
+	TOKEN_TTL_S,
+	type EffectHost,
+	type EffectResults,
+	type TokenCache,
+} from "./effects.ts";
+import { errorText } from "../../checker/src/retry.ts";
 import { ROUTER_NAME } from "./router.ts";
+import { componentFromInstance } from "./shard.ts";
 import { TRUNK_NAME, type ArbTrunk } from "./trunk.ts";
 import type { ArbRouter } from "./router.ts";
 
-function isAlreadyExists(e: unknown): boolean {
-	const code = (e as { code?: string })?.code;
-	const msg = String((e as Error)?.message ?? e);
-	return code === "ALREADY_EXISTS" || /ALREADY_EXISTS|already exists/i.test(msg);
-}
-
 const STATE_KEY = "state";
-const SEEN_REPO_KEY = "seenRepo";
-const TOKEN_TTL_S = 3600;
 
 export interface Env {
 	ARTIFACTS: unknown;
@@ -48,6 +44,9 @@ export interface Env {
 	ASSETS?: Fetcher;
 	POLL_FALLBACK?: string;
 	POLL_INTERVAL_MS?: string;
+	/** Admin key for destructive / token-minting endpoints (T19, review F1).
+	 * Worker secret; checked in src/index.ts before any routing. */
+	ARB_ADMIN_KEY?: string;
 }
 
 /** The component DO's "retirer" is the shared ArbTrunk DO: every component
@@ -63,18 +62,12 @@ function stubRetirer(env: Env): TrunkRetirerPort {
 	};
 }
 
-interface EffectResults {
-	tokens: Record<string, string>;
-}
-
 export class ReorderBuffer extends DurableObject<Env> {
 	private ports: Ports;
 	private state!: RobState;
-	/** entryId -> repo the last minted token was scoped to. A fresh token is
-	 * handed out whenever the repo changes (create, re-fork): Artifacts tokens
-	 * are per-repo, so keying on generation instead would mint stale-repo
-	 * tokens in the squash->refork gap. */
-	private seenRepo: Record<string, string> = {};
+	/** Per-repo write tokens (review F8): every authenticated
+	 * GET /api/entries/:id gets one; minted tokens are reused for 30 min. */
+	private tokens: TokenCache;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -84,11 +77,11 @@ export class ReorderBuffer extends DurableObject<Env> {
 			checker: realChecker({ ARTIFACTS: env.ARTIFACTS, LOADER: env.LOADER }),
 			retirer: stubRetirer(env),
 		};
+		this.tokens = tokenCache((repo) => this.ports.artifacts.token(repo, TOKEN_TTL_S));
 		ctx.blockConcurrencyWhile(async () => {
 			this.state = (await ctx.storage.get<RobState>(STATE_KEY)) ?? initialState();
 			// Forward-fill internal fields added after the state was persisted.
 			this.state._internal = { ...initialState()._internal, ...(this.state._internal ?? {}) };
-			this.seenRepo = (await ctx.storage.get<Record<string, string>>(SEEN_REPO_KEY)) ?? {};
 		});
 	}
 
@@ -105,7 +98,6 @@ export class ReorderBuffer extends DurableObject<Env> {
 
 	private async persist(): Promise<void> {
 		await this.ctx.storage.put(STATE_KEY, this.state);
-		await this.ctx.storage.put(SEEN_REPO_KEY, this.seenRepo);
 		await this.ensureAlarm();
 	}
 
@@ -148,7 +140,7 @@ export class ReorderBuffer extends DurableObject<Env> {
 				body: JSON.stringify(ev),
 			});
 		} catch (e) {
-			console.error("emit to router failed", e);
+			console.error("emit to router failed", errorText(e));
 		}
 	}
 
@@ -159,11 +151,11 @@ export class ReorderBuffer extends DurableObject<Env> {
 			await stub.fetch("https://router/internal/registerRepo", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ repo, component: this.ctx.id.name }),
+				body: JSON.stringify({ repo, component: componentFromInstance(this.ctx.id.name ?? "") }),
 			});
 		} catch (e) {
 			// Non-fatal: the alarm poll still detects pushes (at poll cadence).
-			console.error("registerRepo failed", e);
+			console.error("registerRepo failed", errorText(e));
 		}
 	}
 
@@ -174,177 +166,29 @@ export class ReorderBuffer extends DurableObject<Env> {
 		return { ok: true, effects: r.effects };
 	}
 
-	/** Execute an effect list (and any follow-up effects) through the ports. */
-	private async execEffects(initial: Effect[], out: EffectResults = { tokens: {} }): Promise<Effect[]> {
-		const all: Effect[] = [];
-		const queue = [...initial];
-		while (queue.length) {
-			const eff = queue.shift()!;
-			all.push(eff);
-			switch (eff.type) {
-				case "broadcast":
-					this.broadcast(eff.event);
-					break;
-				case "token": {
-					out.tokens[eff.entryId] = await this.ports.artifacts.token(eff.repo, TOKEN_TTL_S);
-					break;
-				}
-				case "fork": {
-					// A transitive refork may target a planned name that later got a
-					// suffix; resolve to the actual repo. Repos left over from
-					// before a reset make planned names collide — suffix until
-					// free (reset does not delete repos; contract naming gap).
-					const fromRepo = this.state._internal.repoAlias?.[eff.fromRepo] ?? eff.fromRepo;
-					let created: Awaited<ReturnType<ArtifactsPort["fork"]>> | null = null;
-					let toRepo = eff.toRepo;
-					for (let attempt = 0; attempt < 30 && !created; attempt++) {
-						try {
-							created = await this.ports.artifacts.fork(fromRepo, toRepo);
-						} catch (e) {
-							if (isAlreadyExists(e)) {
-								// Repos accumulate across runs (reset doesn't delete
-								// them): after the deterministic -xN space, fall back
-								// to random suffixes.
-								toRepo =
-									attempt < 19
-										? `${eff.toRepo}-x${attempt + 1}`
-										: `${eff.toRepo}-${Math.random().toString(36).slice(2, 8)}`;
-							} else if (attempt < 1) {
-								continue; // one retry for transient platform errors
-							} else {
-								throw e;
-							}
-						}
-					}
-					if (!created) throw new Error(`fork ${eff.toRepo} failed after retries`);
-					const head = (await this.ports.artifacts.log(created.name, 1))[0]?.hash ?? "";
-					const files = head ? await this.ports.artifacts.readTree(created.name, head) : {};
-					const ih = await this.ports.hasher.hashInterface(files);
-					const { exports, sigs } = interfaceToMaps(ih);
-					const r = this.applyCmd({
-						type: "fork.done",
-						entryId: eff.entryId,
-						repo: created.name,
-						remote: created.remote,
-						baseCommit: head,
-						exports,
-						sigs,
-					});
-					if (r.ok) {
-						this.ctx.waitUntil(this.registerRepo(created.name));
-						queue.push(...r.effects);
-					}
-					break;
-				}
-				case "check": {
-					// A thrown checker call must not wedge the entry at
-					// "checking": report it as a failed run — the same visible,
-					// recoverable path as a red test.
-					let result;
-					try {
-						result = await this.ports.checker.runChecks(eff.repo, eff.commit);
-					} catch (e) {
-						result = {
-							commit: eff.commit,
-							passed: 0,
-							failed: 1,
-							durationMs: 0,
-							results: [{ name: "checker", ok: false, error: String(e instanceof Error ? e.message : e) }],
-						};
-					}
-					const r = this.applyCmd({ type: "check.done", entryId: eff.entryId, result });
-					if (r.ok) queue.push(...r.effects);
-					break;
-				}
-				case "retire": {
-					// T17: ArbTrunk runs the whole cycle (head -> splice -> check
-					// -> move) inside one serialized slot with bounded rebuilds.
-					// The returned `attempts` are replayed as check/retry events
-					// in order, then the final outcome is applied. Any thrown
-					// error still reaches `retire.failed` — `retiring` is always
-					// cleared, so the component can never wedge.
-					try {
-						const res = await this.ports.retirer.retireAtomic({
-							fromRepo: eff.fromRepo,
-							commit: eff.commit,
-							baseCommit: eff.baseCommit,
-							toRepo: eff.toRepo,
-							branch: eff.branch,
-						});
-						for (const a of res.attempts) {
-							if (a.candidate && a.check) {
-								const rc = this.applyCmd({
-									type: "retire.checked",
-									entryId: eff.entryId,
-									candidate: a.candidate,
-									result: a.check,
-								});
-								if (rc.ok) queue.push(...rc.effects);
-							}
-							if (a.reason) {
-								const rr = this.applyCmd({
-									type: "retire.retry",
-									entryId: eff.entryId,
-									attempt: a.attempt,
-									reason: a.reason,
-								});
-								if (rr.ok) queue.push(...rr.effects);
-							}
-						}
-						let r;
-						if (res.outcome === "fast-forward" || res.outcome === "splice") {
-							r = this.applyCmd({
-								type: "retire.done",
-								entryId: eff.entryId,
-								commit: res.commit,
-								entryCommit: eff.commit,
-								mode: res.outcome,
-							});
-						} else if (res.outcome === "overlap") {
-							r = this.applyCmd({ type: "retire.overlap", entryId: eff.entryId, overlap: res.overlap });
-						} else if (res.outcome === "retry-exhausted") {
-							r = this.applyCmd({ type: "retire.failed", entryId: eff.entryId, reason: res.reason });
-						}
-						// "check-failed": the replayed retire.checked already moved
-						// the entry to `failed` and cleared `retiring`.
-						if (r?.ok) queue.push(...r.effects);
-					} catch (e) {
-						const r = this.applyCmd({
-							type: "retire.failed",
-							entryId: eff.entryId,
-							reason: String(e instanceof Error ? e.message : e),
-						});
-						if (r.ok) queue.push(...r.effects);
-					}
-					break;
-				}
-			}
-		}
-		return all;
+	/** The effect runtime's view of this object (src/effects.ts). */
+	private host(): EffectHost {
+		return {
+			ports: this.ports,
+			state: () => this.state,
+			apply: (cmd) => this.applyCmd(cmd),
+			broadcast: (ev) => this.broadcast(ev),
+			registerRepo: (repo) => this.ctx.waitUntil(this.registerRepo(repo)),
+			tokens: this.tokens,
+		};
 	}
 
-	/** Hash the .ts surface of a repo at a commit. */
-	private async interfaceAt(repo: string, commit: string) {
-		const files = await this.ports.artifacts.readTree(repo, commit);
-		return interfaceToMaps(await this.ports.hasher.hashInterface(files));
+	/** Execute an effect list (and any follow-up effects) through the ports.
+	 * Per-effect failure isolation lives in effects.ts (review F3). */
+	private execEffects(initial: Effect[], out: EffectResults = { tokens: {} }): Promise<Effect[]> {
+		return execEffects(this.host(), initial, out);
 	}
 
-	/** Shared push path for queue events and the alarm fallback. */
+	/** Shared push path for queue events and the alarm fallback. Hashing and
+	 * the out-of-order guard (review F9) live in effects.ts. */
 	private async processPush(repo: string, commit: string): Promise<void> {
-		const st = this.state;
-		if (st._internal.seenPushes.includes(`${repo}:${commit}`)) return;
-		let cmd: Cmd;
-		if (repo === st.trunk.repo) {
-			if (st.trunk.commit === commit) return;
-			cmd = { type: "push", repo, commit };
-		} else {
-			const entry = st.entries.find(
-				(e) => e.repo === repo || st._internal.pending[e.id] === repo,
-			);
-			if (!entry || entry.headCommit === commit) return;
-			const { exports, sigs } = await this.interfaceAt(repo, commit);
-			cmd = { type: "push", repo, commit, exports, sigs };
-		}
+		const cmd = await pushCommand(this.host(), repo, commit);
+		if (!cmd) return;
 		const r = this.applyCmd(cmd);
 		if (r.ok) await this.execEffects(r.effects);
 		await this.persist();
@@ -361,6 +205,14 @@ export class ReorderBuffer extends DurableObject<Env> {
 	 * belongs to ArbTrunk, not this object). */
 	async alarm(): Promise<void> {
 		try {
+			// Recovery sweep first (review F3): re-issue forks/checks/retires
+			// whose in-flight markers outlived their deadline. Each recovery
+			// emits a `recover` event.
+			const sw = this.applyCmd({ type: "sweep" });
+			if (sw.ok && sw.effects.length) {
+				await this.execEffects(sw.effects);
+				await this.persist();
+			}
 			const targets: Array<{ repo: string; known: string | null }> = [];
 			for (const e of this.state.entries) {
 				if (e.repo && !this.state._internal.pending[e.id] && e.status !== "retired" && e.status !== "vetoed") {
@@ -403,7 +255,6 @@ export class ReorderBuffer extends DurableObject<Env> {
 			if (request.method === "POST" && pathname === "/internal/reset") {
 				const r = this.applyCmd({ type: "reset" });
 				if (!r.ok) return json({ error: r.error }, r.status);
-				this.seenRepo = {};
 				await this.execEffects(r.effects);
 				await this.persist();
 				return json({ ok: true });
@@ -467,7 +318,6 @@ export class ReorderBuffer extends DurableObject<Env> {
 				const out: EffectResults = { tokens: {} };
 				await this.execEffects(r.effects, out);
 				const entry = this.state.entries.find((e) => e.id === createdEv?.event.entryId)!;
-				this.seenRepo[entry.id] = entry.repo;
 				await this.persist();
 				return json({ entry, token: out.tokens[entry.id] ?? null });
 			}
@@ -477,13 +327,14 @@ export class ReorderBuffer extends DurableObject<Env> {
 				const entry = this.state.entries.find((e) => e.id === id);
 				if (!entry) return json({ error: `entry ${id} not found` }, 404);
 				if (request.method === "GET" && !mEntry[2]) {
-					let token: string | undefined;
-					if (entry.repo && entry.repo !== this.seenRepo[id]) {
-						token = await this.ports.artifacts.token(entry.repo, TOKEN_TTL_S);
-						this.seenRepo[id] = entry.repo;
-						await this.persist();
-					}
-					return json(token ? { entry, token } : { entry });
+					// The Worker only lets admin-key requests reach this route
+					// (src/auth.ts), so every caller is authorized: hand each one
+					// a write token for the CURRENT repo (review F8). While a
+					// re-fork is in flight the entry has no usable repo yet, so
+					// the token is withheld until the fork lands.
+					if (!entry.repo || this.state._internal.pending[id]) return json({ entry });
+					const token = await this.tokens.get(entry.repo);
+					return json({ entry, token });
 				}
 				if (request.method === "POST" && mEntry[2] === "/ready") {
 					const body = (await request.json()) as { commit?: string };
@@ -508,7 +359,7 @@ export class ReorderBuffer extends DurableObject<Env> {
 			}
 			return json({ error: "not found" }, 404);
 		} catch (e) {
-			return json({ error: String(e instanceof Error ? e.message : e) }, 500);
+			return json({ error: errorText(e) }, 500);
 		}
 	}
 

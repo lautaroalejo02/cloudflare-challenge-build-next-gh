@@ -55,3 +55,22 @@ test("buildTree: flat paths -> nested nodes", () => {
 	assert.equal(root.subtrees.get("src")!.subtrees.get("api")!.blobs.get("order.ts")!.oid, "2");
 	assert.equal(root.subtrees.get("src")!.subtrees.get("ui")!.blobs.get("checkout.ts")!.oid, "3");
 });
+
+// --- T19 review F7: file/dir conflicts --------------------------------------------
+
+test("decideSplice: a file vs a directory at the same prefix overlaps (F7)", () => {
+	// Entry turned `src/a` into a file; trunk added `src/a/b.ts` under a dir.
+	assert.deepEqual(decideSplice(["src/a"], ["src/a/b.ts"]), { kind: "squash", overlap: ["src/a", "src/a/b.ts"] });
+	assert.deepEqual(decideSplice(["src/a/b.ts"], ["src/a"]), { kind: "squash", overlap: ["src/a", "src/a/b.ts"] });
+});
+
+test("decideSplice: a shared string prefix that is not a directory boundary stays disjoint (F7)", () => {
+	assert.deepEqual(decideSplice(["src/ab.ts"], ["src/a"]), { kind: "splice" });
+	assert.deepEqual(decideSplice(["src/a.ts"], ["src/a/b.ts"]), { kind: "splice" });
+});
+
+test("buildTree: gitlink entries survive with their commit type (F7)", () => {
+	const flat = new Map<string, FlatBlob>([["vendor/lib", { mode: "160000", oid: "c".repeat(40), type: "commit" }]]);
+	const root = buildTree(flat);
+	assert.deepEqual(root.subtrees.get("vendor")!.blobs.get("lib"), { mode: "160000", oid: "c".repeat(40), type: "commit" });
+});

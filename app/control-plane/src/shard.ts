@@ -4,9 +4,55 @@
 
 import type { ArbEvent, BufferState } from "./rob.ts";
 
-/** DO name for the component rooted at `rootEntryId`. */
+/** Public component name for the component rooted at `rootEntryId`
+ * (exposed as `entry.component` in GET /api/state). */
 export function componentName(rootEntryId: string): string {
 	return `comp-${rootEntryId}`;
+}
+
+/** Deploy epoch for component DO instances (T19, review F10). Durable Objects
+ * with a warm alarm can stay pinned to the previous deployment, and component
+ * names restart at `comp-e1` with a fresh router — so the DO *instance* name
+ * carries an epoch that is bumped on deploys that change persisted state or
+ * RPC shape. The public `component` field stays `comp-<root>`. */
+export const COMPONENT_EPOCH = "t19";
+
+/** idFromName() key for a component DO. */
+export function componentInstance(component: string): string {
+	return `${COMPONENT_EPOCH}:${component}`;
+}
+
+/** Public component name from a DO instance name (inverse of componentInstance;
+ * tolerant of un-prefixed names). */
+export function componentFromInstance(instance: string): string {
+	const i = instance.indexOf(":");
+	return i >= 0 ? instance.slice(i + 1) : instance;
+}
+
+/** ArbRouter persisted state (pure, so reset semantics are unit-testable). */
+export interface RouterState {
+	nextSeq: number;
+	/** entryId -> component name. */
+	entryComp: Record<string, string>;
+	/** repo name -> component name (registered by components on fork.done). */
+	repoComp: Record<string, string>;
+	/** Live component names (for aggregation + fan-out). */
+	components: string[];
+	/** Trunk info learned at /api/trunk/init (components get it on create). */
+	trunk: { repo: string; remote: string; commit: string | null } | null;
+	robSize: number;
+}
+
+export function emptyRouterState(): RouterState {
+	return { nextSeq: 0, entryComp: {}, repoComp: {}, components: [], trunk: null, robSize: 8 };
+}
+
+/** POST /api/reset on the router: forget every entry and component, keep the
+ * trunk, restore the default robSize (review F1), and keep `nextSeq`
+ * monotonic (review F10) so post-reset entries get fresh ids, fresh fork
+ * names and fresh component DOs instead of colliding with leftovers. */
+export function resetRouterState(st: RouterState): RouterState {
+	return { ...emptyRouterState(), trunk: st.trunk, nextSeq: st.nextSeq };
 }
 
 /** "e7" from a fork repo name like "arb-e7-ui-0" or "arb-e7-ui-0-x12"

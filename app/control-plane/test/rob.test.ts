@@ -640,7 +640,7 @@ test("stale retire.* commands are dropped when the entry is not retiring", () =>
 	assert.equal(s._internal.retireStrikes["e1"], undefined);
 });
 
-test("mid-atomic push: stale retire.done is dropped and the new head re-retires", () => {
+test("mid-atomic push: stale retire.done does not retire but records the landing (T19 F6)", () => {
 	let s = trunked("t0");
 	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
 	s = retiring(s, "e1", "c1").state;
@@ -648,10 +648,14 @@ test("mid-atomic push: stale retire.done is dropped and the new head re-retires"
 	// entry back to speculating at c2.
 	s = run(s, { type: "push", repo: "arb-e1-api-0", commit: "c2", exports: {} });
 	assert.equal(s._internal.retiring["e1"], undefined);
-	// The late-arriving atomic result is stale and must not retire the entry.
+	// The late-arriving atomic result is stale and must not retire the entry,
+	// but its land is real: trunk advances and the entry's base moves to the
+	// landed entry commit, so the next retirement diffs only the new work.
 	const r = runEff(s, { type: "retire.done", entryId: "e1", commit: "cand1", entryCommit: "c1", mode: "splice" });
 	s = r.state;
 	assert.equal(entry(s, "e1").status, "speculating");
+	assert.equal(entry(s, "e1").baseCommit, "c1");
+	assert.equal(s.trunk.commit, "cand1");
 	assert.equal(s.trunk.retiredCount, 0);
 	assert.equal(broadcasts(r.effects, "retired").length, 0);
 });
@@ -685,6 +689,8 @@ test("retire.done: entryCommit staleness ignored when head moved", () => {
 	const r = runEff(s, { type: "retire.done", entryId: "e1", commit: "c1", entryCommit: "c1", mode: "fast-forward" });
 	s = r.state;
 	assert.equal(entry(s, "e1").status, "speculating"); // not retired
+	assert.equal(entry(s, "e1").baseCommit, "c1"); // T19 F6: base advances to the landed commit
+	assert.equal(s.trunk.commit, "c1");
 	assert.equal(s.trunk.retiredCount, 0);
 	assert.equal(broadcasts(r.effects, "retired").length, 0);
 });

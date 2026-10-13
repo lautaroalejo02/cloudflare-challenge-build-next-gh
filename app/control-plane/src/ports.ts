@@ -231,12 +231,8 @@ export function realArtifacts(artifacts: ArtifactsBinding): ArtifactsPort {
 	};
 }
 
-export function interfaceToMaps(ih: InterfaceHash): { exports: SymbolHashes; sigs: SymbolSignatures } {
-	return {
-		exports: Object.fromEntries(ih.symbols.map((s) => [s.name, s.hash])),
-		sigs: Object.fromEntries(ih.symbols.map((s) => [s.name, s.signature])),
-	};
-}
+// Moved to src/effects.ts (T19) so the effect runtime is Node-testable.
+export { interfaceToMaps } from "./effects.ts";
 
 // --- Real hasher / checker (T8) ------------------------------------------------
 // app/hasher: web-tree-sitter, lazy-init (dynamic-imports its .wasm as

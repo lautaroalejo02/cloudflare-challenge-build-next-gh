@@ -136,3 +136,55 @@ test("splice: an entry-deleted path disappears from the spliced tree", async () 
 	assert.equal(tree.get("keep.ts")!.oid, (await flattenTree(fs, trunk)).get("keep.ts")!.oid);
 	assert.ok(tree.has("dir/nested.ts"));
 });
+
+// --- T19 review F7: type changes, modes and gitlinks ---------------------------
+
+async function treeCommit(fs: MemFs, entries: git.TreeEntry[], parent: string[], message: string): Promise<string> {
+	const tree = await git.writeTree({ fs, dir: "/", gitdir: GITDIR, tree: entries });
+	return git.writeCommit({
+		fs, dir: "/", gitdir: GITDIR,
+		commit: {
+			message, tree, parent,
+			author: { ...AUTHOR, timestamp: 1, timezoneOffset: 0 },
+			committer: { ...AUTHOR, timestamp: 1, timezoneOffset: 0 },
+		},
+	});
+}
+
+async function blob(fs: MemFs, text: string): Promise<string> {
+	return git.writeBlob({ fs, dir: "/", gitdir: GITDIR, blob: enc(text) });
+}
+
+test("diffPaths: a blob<->tree type change records both sides (F7)", async () => {
+	const fs = new MemFs();
+	await git.init({ fs, dir: "/", gitdir: GITDIR, defaultBranch: "main" });
+	const fileLib = await treeCommit(fs, [{ mode: "100644", path: "lib", oid: await blob(fs, "x\n"), type: "blob" }], [], "lib is a file");
+	const sub = await git.writeTree({ fs, dir: "/", gitdir: GITDIR, tree: [{ mode: "100644", path: "x.ts", oid: await blob(fs, "y\n"), type: "blob" }] });
+	const dirLib = await treeCommit(fs, [{ mode: "040000", path: "lib", oid: sub, type: "tree" }], [fileLib], "lib is a dir");
+	assert.deepEqual([...(await diffPaths(fs, fileLib, dirLib))].sort(), ["lib", "lib/x.ts"]);
+	assert.deepEqual([...(await diffPaths(fs, dirLib, fileLib))].sort(), ["lib", "lib/x.ts"]);
+});
+
+test("diffPaths: a mode-only change (chmod +x) is a change (F7)", async () => {
+	const fs = new MemFs();
+	await git.init({ fs, dir: "/", gitdir: GITDIR, defaultBranch: "main" });
+	const oid = await blob(fs, "#!/bin/sh\n");
+	const a = await treeCommit(fs, [{ mode: "100644", path: "run.sh", oid, type: "blob" }], [], "plain");
+	const b = await treeCommit(fs, [{ mode: "100755", path: "run.sh", oid, type: "blob" }], [a], "exec");
+	assert.deepEqual([...(await diffPaths(fs, a, b))], ["run.sh"]);
+});
+
+test("flattenTree + writeTreeNode keep gitlinks (submodule entries) (F7)", async () => {
+	const fs = new MemFs();
+	await git.init({ fs, dir: "/", gitdir: GITDIR, defaultBranch: "main" });
+	const link = "a".repeat(40);
+	const c = await treeCommit(fs, [
+		{ mode: "100644", path: "a.ts", oid: await blob(fs, "a\n"), type: "blob" },
+		{ mode: "160000", path: "vendor", oid: link, type: "commit" },
+	], [], "with submodule");
+	const flat = await flattenTree(fs, c);
+	assert.deepEqual(flat.get("vendor"), { mode: "160000", oid: link, type: "commit" });
+	const rebuilt = await writeTreeNode(fs, buildTree(flat));
+	const orig = (await git.readCommit({ fs, dir: "/", gitdir: GITDIR, oid: c })).commit.tree;
+	assert.equal(rebuilt, orig);
+});

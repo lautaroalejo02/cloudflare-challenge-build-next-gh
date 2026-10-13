@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { retireAtomic, sanitizeReason } from "../src/atomic.ts";
+import { ATOMIC_BACKOFF_MS, retireAtomic, sanitizeReason } from "../src/atomic.ts";
 import type { CheckResult } from "../src/rob.ts";
 import type {
 	CheckerPort,
@@ -219,4 +219,33 @@ test("sanitizeReason strips credentials embedded in remote URLs", () => {
 	assert.ok(!reason.includes("secret-token"), reason);
 	assert.ok(reason.includes("https://***@artifacts.example.com"), reason);
 	assert.equal(sanitizeReason("plain string"), "plain string");
+});
+
+// --- T19 review F2: backoff + infra candidate checks -----------------------------
+
+test("backoff: rebuild attempts wait ~0.5 s then ~1 s (F2)", async () => {
+	const { retirer, checker } = fakePorts({
+		moveImpl: async () => {
+			throw new Error("non-fast-forward");
+		},
+	});
+	const slept: number[] = [];
+	const res = await retireAtomic(ARGS, { retirer, checker, sleep: async (ms) => void slept.push(ms) });
+	assert.equal(res.outcome, "retry-exhausted");
+	assert.deepEqual(slept, [500, 1000]);
+	assert.deepEqual(ATOMIC_BACKOFF_MS, [500, 1000, 2000]);
+});
+
+test("infra candidate check is a retryable attempt, not a check-failed verdict (F2)", async () => {
+	let n = 0;
+	const { retirer, checker } = fakePorts({
+		checkImpl: (commit) => {
+			n += 1;
+			return n === 1 ? { ...failCheck(commit), infra: true } : okCheck(commit);
+		},
+	});
+	const res = await retireAtomic(ARGS, { retirer, checker, sleep: async () => {} });
+	assert.equal(res.outcome, "splice");
+	assert.equal(res.attempts.length, 2);
+	assert.match(res.attempts[0].reason ?? "", /infra/);
 });

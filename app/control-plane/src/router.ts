@@ -18,35 +18,34 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { ArbEvent, BufferState } from "./rob.ts";
-import { componentName, mergeEvents, mergeStates, repoToEntryId } from "./shard.ts";
+import {
+	componentInstance,
+	componentName,
+	emptyRouterState,
+	mergeEvents,
+	mergeStates,
+	repoToEntryId,
+	resetRouterState,
+	type RouterState,
+} from "./shard.ts";
+import { errorText } from "../../checker/src/retry.ts";
 import type { ArbTrunk, TrunkInfo } from "./trunk.ts";
 import type { ReorderBuffer } from "./do.ts";
 import type { Env } from "./do.ts";
 import { TRUNK_NAME } from "./trunk.ts";
 
-export const ROUTER_NAME = "router-t14";
+// Name bump at T19 (review F10): fresh instance on the new code, and a
+// fresh routing table whose seq continues across resets from here on.
+export const ROUTER_NAME = "router-t19";
 const STATE_KEY = "router";
 const TRUNK_REPO = "arb-trunk";
 
-interface RouterState {
-	nextSeq: number;
-	/** entryId -> component DO name. */
-	entryComp: Record<string, string>;
-	/** repo name -> component DO name (registered by components on fork.done). */
-	repoComp: Record<string, string>;
-	/** Live component DO names (for aggregation + fan-out). */
-	components: string[];
-	/** Trunk info learned at /api/trunk/init (components get it on create). */
-	trunk: TrunkInfo | null;
-	robSize: number;
-}
-
-function emptyRouterState(): RouterState {
-	return { nextSeq: 0, entryComp: {}, repoComp: {}, components: [], trunk: null, robSize: 8 };
-}
-
 export class ArbRouter extends DurableObject<Env> {
 	private st: RouterState = emptyRouterState();
+	/** Serializes POST /api/entries end to end (review F11): the handler awaits
+	 * component fetches, and DO handlers interleave on await, so two creates
+	 * could both pass the robSize count without this. */
+	private createQueue: Promise<unknown> = Promise.resolve();
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -61,7 +60,7 @@ export class ArbRouter extends DurableObject<Env> {
 	}
 
 	private comp(name: string): DurableObjectStub<ReorderBuffer> {
-		return this.env.ROB.get(this.env.ROB.idFromName(name));
+		return this.env.ROB.get(this.env.ROB.idFromName(componentInstance(name)));
 	}
 
 	private trunk(): DurableObjectStub<ArbTrunk> {
@@ -192,7 +191,10 @@ export class ArbRouter extends DurableObject<Env> {
 				return json({ ok: true });
 			}
 			if (request.method === "POST" && pathname === "/api/entries") {
-				return await this.createEntry((await request.json()) as Parameters<ArbRouter["createEntry"]>[0]);
+				const body = (await request.json()) as Parameters<ArbRouter["createEntry"]>[0];
+				const p = this.createQueue.then(() => this.createEntry(body));
+				this.createQueue = p.catch(() => undefined);
+				return await p;
 			}
 			const mEntry = pathname.match(/^\/api\/entries\/(e\d+)(\/ready|\/veto)?$/);
 			if (mEntry) {
@@ -236,15 +238,14 @@ export class ArbRouter extends DurableObject<Env> {
 					),
 				);
 				await this.trunk().fetch("https://trunk/internal/reset", { method: "POST" });
-				const { trunk, robSize } = this.st;
-				this.st = { ...emptyRouterState(), trunk, robSize };
+				this.st = resetRouterState(this.st);
 				await this.persist();
 				this.broadcast({ type: "reset", ts: Date.now() });
 				return json({ ok: true });
 			}
 			return json({ error: "not found" }, 404);
 		} catch (e) {
-			return json({ error: String(e instanceof Error ? e.message : e) }, 500);
+			return json({ error: errorText(e) }, 500);
 		}
 	}
 

@@ -33,9 +33,17 @@ import type { Env } from "./do.ts";
 // Name bump at T17: the old "trunk-t14" instance stays warm on its 3s alarm
 // and kept serving the pre-T17 class (RPC "retireAtomic not implemented").
 // A fresh idFromName boots the new code; trunkInit re-derives head state.
-export const TRUNK_NAME = "trunk-t17";
+// Bumped again at T19 (review F10); from T19 on the alarm also stops when the
+// trunk is idle, so later deploys should not need a bump to escape pinning.
+export const TRUNK_NAME = "trunk-t19";
+
+/** Stop polling `arb-trunk` after this long without trunk activity
+ * (init, retire, push event, observed head change) — review F10. Any later
+ * activity re-arms the alarm. */
+export const TRUNK_IDLE_MS = 5 * 60_000;
 const TRUNK_REPO = "arb-trunk";
 const TRUNK_KEY = "trunk";
+const ACTIVITY_KEY = "lastActivity";
 const TOKEN_TTL_S = 3600;
 
 export interface TrunkInfo {
@@ -52,6 +60,8 @@ export class ArbTrunk extends DurableObject<Env> {
 	/** Serializes trunk mutations (retire + moveBranch + retireAtomic) across
 	 * interleaved async handlers. */
 	private queue: Promise<unknown> = Promise.resolve();
+	/** ts of the last trunk activity; the alarm goes dormant TRUNK_IDLE_MS later. */
+	private lastActivity = 0;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -60,11 +70,19 @@ export class ArbTrunk extends DurableObject<Env> {
 		this.checker = realChecker({ ARTIFACTS: env.ARTIFACTS, LOADER: env.LOADER });
 		ctx.blockConcurrencyWhile(async () => {
 			this.trunk = (await ctx.storage.get<TrunkInfo>(TRUNK_KEY)) ?? this.trunk;
+			this.lastActivity = (await ctx.storage.get<number>(ACTIVITY_KEY)) ?? 0;
 		});
 	}
 
 	private persist(): Promise<void> {
 		return this.ctx.storage.put(TRUNK_KEY, this.trunk);
+	}
+
+	/** Record trunk activity and make sure the poll alarm is armed. */
+	private async touch(): Promise<void> {
+		this.lastActivity = Date.now();
+		await this.ctx.storage.put(ACTIVITY_KEY, this.lastActivity);
+		await this.ensureAlarm();
 	}
 
 	private enqueue<T>(fn: () => Promise<T>): Promise<T> {
@@ -95,7 +113,7 @@ export class ArbTrunk extends DurableObject<Env> {
 		}
 		this.trunk = { repo: TRUNK_REPO, remote, commit };
 		await this.persist();
-		await this.ensureAlarm();
+		await this.touch();
 		const token = await this.artifacts.token(TRUNK_REPO, TOKEN_TTL_S);
 		return { repo: TRUNK_REPO, remote, token };
 	}
@@ -138,6 +156,7 @@ export class ArbTrunk extends DurableObject<Env> {
 				this.trunk.commit = res.commit;
 				await this.persist();
 			}
+			await this.touch();
 			return res;
 		});
 	}
@@ -151,6 +170,7 @@ export class ArbTrunk extends DurableObject<Env> {
 			this.trunk.commit = head;
 			await this.persist();
 		}
+		await this.touch();
 	}
 
 	async getTrunk(): Promise<TrunkInfo> {
@@ -181,11 +201,16 @@ export class ArbTrunk extends DurableObject<Env> {
 				const head = (await this.artifacts.log(this.trunk.repo, 1))[0]?.hash;
 				if (head && head !== this.trunk.commit) {
 					this.trunk.commit = head;
+					this.lastActivity = Date.now();
+					await this.ctx.storage.put(ACTIVITY_KEY, this.lastActivity);
 					await this.persist();
 				}
 			}
 		} finally {
-			if (this.pollEnabled() && this.trunk.repo) {
+			// Go dormant when idle (review F10): a forever-warm alarm pins the
+			// object to an old deployment. Activity re-arms it via touch().
+			const idle = Date.now() - this.lastActivity > TRUNK_IDLE_MS;
+			if (this.pollEnabled() && this.trunk.repo && !idle) {
 				await this.ctx.storage.setAlarm(Date.now() + this.pollIntervalMs());
 			}
 		}
@@ -215,7 +240,7 @@ export class ArbTrunk extends DurableObject<Env> {
 			}
 			return json({ error: "not found" }, 404);
 		} catch (e) {
-			return json({ error: String(e instanceof Error ? e.message : e) }, 500);
+			return json({ error: String(e instanceof Error ? e.message : e).split("\n")[0].slice(0, 300) }, 500);
 		}
 	}
 }

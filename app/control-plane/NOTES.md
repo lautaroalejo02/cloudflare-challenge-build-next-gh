@@ -12,7 +12,7 @@ Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
   the DO. Internal bookkeeping (`_internal`: signature texts, in-flight
   forks, check/retire dedupe, push dedupe, event log) is persisted but
   stripped from `GET /api/state` via `publicState()`.
-- `test/` — 54 node:test cases (run with `node --experimental-strip-types`,
+- `test/` — 92 node:test cases (54 before T19; see "Review fixes (T19)") (run with `node --experimental-strip-types`,
   Node 22.15): `rob.test.ts` state machine (forwarding, early cutoff, squash
   + diagnosis, transitive squash, in-order retirement, failing check +
   retry, robSize 409, veto + transitive dependents, veto non-head 409,
@@ -76,7 +76,7 @@ Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
 
 ```sh
 npm install
-npm test                 # 54 unit tests (state machine + splice + git + atomic), no CF needed
+npm test                 # 92 unit tests (state machine + splice + git + atomic + effects + auth), no CF needed
 npx tsc --noEmit         # typecheck (also compiles app/hasher + app/checker sources)
 npx wrangler types       # regenerate worker-configuration.d.ts
 scripts/setup.sh         # queue + subscription + deploy (Wrangler >= 4.149)
@@ -403,6 +403,87 @@ writers). Runs #1 and #5's event feeds confirm 3 splice candidate checks
 each, all on commits that became trunk head, and zero `retire.failed`.
 `--delay-ready` is retired (see `app/dashboard/NOTES.md`).
 
+## Review fixes (T19)
+
+Fixes for the independent review (R1). Every confirmed finding got a
+regression test written first; the rob.ts tests were run against the HEAD
+`rob.ts` (constants appended so imports resolve) and 15 of 16 failed there
+(the 16th, "fork.done from the producer's current head never re-squashes", is
+a no-regression guard and passes on both). F7 tests: 4 failed before the fix.
+F2 atomic tests failed on the missing backoff export; the checker, demo and
+dashboard tests failed on missing modules/behaviour before their fixes.
+
+| # | finding | fix | test(s) | status |
+|---|---|---|---|---|
+| F1 | unauthenticated destructive + token endpoints; robSize survives reset | `src/auth.ts` + `index.ts`: non-GET `/api/*` and `GET /api/entries/:id` need `x-arb-key` == `ARB_ADMIN_KEY` (constant-time compare; unset secret = closed). Reset restores robSize (rob + router). Demo CLI sends the key; dashboard shows VETO/robSize only with `?key=` | `auth.test.ts` (5), `review-fixes` "F1 reset restores robSize", `shard.test` "resetRouterState …", demo `admin-events.test` (2), dashboard `adminKeyFromSearch`/`adminHeaders` | fixed, live-verified (403/200) |
+| F2 | infra failures treated as permanent check failures; no backoff | `CheckResult.infra`; checker retries Artifacts reads (0.5/1/2 s) and flags platform failures; rob keeps the entry `checking` (no verdict) and re-checks after 10 s; `entry.ready` clears a failed verdict; atomic retire waits 0.5 s / 1 s between attempts and retries infra candidate checks; retirer git/Artifacts reads retry 5xx | `review-fixes` F2 ×3, `atomic.test` "backoff …", "infra candidate check …", checker `infra.test` (7) | fixed |
+| F3 | a failed effect wedges the component | `src/effects.ts`: per-effect try/catch; fork throw → `fork.failed` (backoff 2 s doubling, cap 60 s); other throws → `effect.failed`; checker throw → infra result. Alarm runs a `sweep` that re-issues forks/checks/retires whose markers are > 60 s old (or whose retry is due). Every recovery emits a `recover` event | `review-fixes` F3 ×4, `effects.test` "F3 …" ×3 | fixed |
+| F4 | squash lost when the producer pushes during the consumer's in-flight fork | `fork.done` re-diffs unpinned consumes against the producer's current exports when the fork base ≠ producer head; mismatch → squash + re-fork, no token. `fork.done` carries the planned name; superseded/orphaned forks are dropped | `review-fixes` "F4 …" ×3 | fixed |
+| F5 | veto during an in-flight retire is overridden | veto → 409 while `retiring`; `retire.overlap` and `retire.done` require `retiring` + status `ready` | `review-fixes` "F5 …" ×2 | fixed |
+| F6 | push during retire desyncs trunk and buffer | a stale `retire.done` sets `trunk.commit = commit` and (live entry) `baseCommit = entryCommit`; duplicate lands on a retired entry are ignored | `review-fixes` "F6 …", updated `rob.test` "mid-atomic push …" and "retire.done: entryCommit staleness …" | fixed |
+| F7 | splice disjointness misses file/dir conflicts, loses info | overlap = equal OR directory prefix (both sides reported); `diffPaths` compares mode too and reports both sides of a blob↔tree change; gitlinks kept through flatten/overlay/writeTree | `splice.test` ×3, `retire.test` ×3 | fixed |
+| F8 | re-fork token handed out once to whoever asks first | every authenticated `GET /api/entries/:id` returns a token for the current repo (withheld only while a fork is pending); per-repo cache reuses a token for 30 min | `effects.test` "F8 …" | fixed |
+| F9 | out-of-order push can regress head | `pushCommand` re-reads `log(repo,1)` after hashing and drops the event if the commit is no longer head | `effects.test` "F9 …" | fixed |
+| F10 | ops: alarm pinning, `-xN` collisions | names bumped: `router-t19`, `trunk-t19`, component DO instances `t19:comp-e<n>` (public `component` stays `comp-e<n>`); ArbTrunk alarm stops after 5 min idle; router `nextSeq` survives reset; first name collision jumps to a random suffix | `shard.test` ×2, `effects.test` "F10 …" | fixed, live: ids continued e4… across resets, one collision → one suffixed fork |
+| F11 | low: router create race, pins on veto, grandchild diagnosis, error sanitizing | router serializes creates with a promise queue; veto releases consumers' `predConsumed`; `squashTree` diffs dependents against their direct producer (incl. its declared stub); error strings are single-line, credential-scrubbed (`errorText`), never stacks | `review-fixes` "F11 …" ×2, `effects.test` "F3 a throwing effect …" (no stack) | fixed (router queue: DO I/O, no unit test) |
+
+**Not unit-testable (DO I/O), covered by the closest pure test + live runs:**
+the router create queue (F11), `ArbTrunk` idle alarm (F10), and the
+`ReorderBuffer` alarm wiring of `sweep` (the sweep itself is pure and tested).
+
+**Admin key — how to set and use it (value never committed or logged):**
+
+```sh
+# once per environment (app/control-plane):
+node -e "require('fs').writeFileSync('.secret-admin-key', require('crypto').randomBytes(32).toString('base64url'))"
+npx wrangler secret put ARB_ADMIN_KEY < .secret-admin-key
+```
+
+- `.secret-admin-key` is gitignored by the root `.secret*` rule.
+- Demo CLI: reads `ARB_ADMIN_KEY` from the environment, else
+  `app/control-plane/.secret-admin-key`; the local mock ignores it.
+- curl: `-H "x-arb-key: $(cat app/control-plane/.secret-admin-key)"`.
+- Dashboard: `https://…/?key=<key>` shows VETO and the robSize slider and
+  sends the header; without `?key=` the page is read-only. The key is then in
+  the browser history — use only on a trusted machine.
+
+**Decisions:**
+- Infra re-check after 10 s (`INFRA_RECHECK_MS`), stale markers after 60 s
+  (`STALE_MARKER_MS`), failed forks back off from 2 s doubling to 60 s.
+- `MAX_ATOMIC_ATTEMPTS` stays 3, so only the 0.5 s and 1 s steps of the
+  0.5/1/2 s schedule are used inside one atomic cycle (the slot is held
+  across retries; longer waits would block other components).
+- The F4 drift check skips when the fork base equals the producer head, when
+  the producer itself is re-forking, and for pinned stub symbols. A fork that
+  captured a commit newer than the DO has processed can cause one extra
+  squash; it self-corrects on the next fork.
+- Retry helper lives in `app/checker/src/retry.ts` and is reused by the
+  control plane (it already imports the checker by relative path).
+- `runChecks` dropped the `using` declaration for try/finally disposal so it
+  loads in Node 22 for unit tests.
+
+**Live verification** (deployed `9a6c1738-47f0-481e-b0cb-268d8330b4af`,
+2026-10-13, admin key from `.secret-admin-key`; all exit 0):
+
+| run | wall | squashes | earlyCutoffs | retired | checksRun | pushesSeen | hits/miss | recover / retire.failed |
+|---|---|---|---|---|---|---|---|---|
+| main | 60 s | 3 | 2 | 3 | 4 | 8 | 2/1 | 0 / 0 |
+| failing-check | 66 s | 3 | 2 | 3 | 5 | 9 | 2/1 | 0 / 0 |
+| multi #1 | 81 s | 4 | 3 | 5 | 8 | 12 | 2/1 | 0 / 0 |
+| multi #2 | 65 s | 4 | 3 | 5 | 9 | 12 | 2/1 | 0 / 0 |
+| multi #3 | 69 s | 4 | 3 | 5 | 8 | 12 | 2/1 | 0 / 0 |
+
+Auth (curl, after deploy): `POST /api/reset` no key 403, wrong key 403, with
+key 200 (robSize back to 8); `GET /api/state` 200 and `GET /api/events` 200
+without a key; `GET /api/entries/e1`, `POST /api/trunk/init`, `POST
+/api/config` without a key 403. Before the deploy, `GET /api/entries/e1`
+without a key returned 200.
+
+Local: `--scenario multi` against the mock (`npm run mock -- --port <p>
+--root <dir outside app/demo/tmp>`) exits 0 now that the mock serves
+`GET /api/events` (the scenario wipes `app/demo/tmp`, so the mock root must
+live elsewhere).
+
 ## Cloudflare resources created
 
 - Worker `arb-control-plane` (DOs `ReorderBuffer` + `ArbRouter` + `ArbTrunk`,
@@ -436,8 +517,10 @@ each, all on commits that became trunk head, and zero `retire.failed`.
   retries" = push + ready again.
 - **robSize counts non-retired entries** (contract literal): vetoed entries
   keep occupying a slot until `reset`.
-- **Token on `GET /api/entries/:id`**: DO keeps `seenRepo[id]`; a fresh 1h
-  token is returned iff `entry.repo !== seenRepo[id]`. Repo-keyed, not
+- **Token on `GET /api/entries/:id`** (superseded in T19: every
+  authenticated GET now gets a token for the current repo; history kept
+  below): DO kept `seenRepo[id]`; a fresh 1h
+  token was returned iff `entry.repo !== seenRepo[id]`. Repo-keyed, not
   generation-keyed: Artifacts tokens are scoped to the *repo*, and the
   generation bumps before the async refork lands — minting on the gen
   bump produced old-repo tokens that 403'd the new-repo clone (observed
@@ -511,14 +594,13 @@ each, all on commits that became trunk head, and zero `retire.failed`.
   bundled Worker → crash. `app/hasher` shims `process.type = "renderer"`
   during `Parser.init` only when `import.meta.url === undefined` (Node
   tests unaffected).
-- Effect failures (e.g. fork throwing) surface as 500/queue retry; a
-  persistently failing fork leaves `pending` set until a later push reuses
-  it — acceptable for the demo, no automatic unjam yet.
+- ~~Effect failures wedge the component~~ — fixed in T19 (per-effect
+  isolation + alarm sweep + `recover` events).
 - Entries ignore ALL pushes while a fork/re-fork is pending (old repo, or a
   stale repo sharing the planned name); work pushed in that window must be
   redone on the new fork (T9c: tightened from old-repo-only).
-- `ArbTrunk` keeps polling trunk forever while its repo is set (by design);
-  component alarms stop once all their entries retire. Disable via
-  `POLL_FALLBACK=off`.
+- `ArbTrunk` polls trunk only while active: the alarm goes dormant after 5
+  min without trunk activity (T19); component alarms stop once all their
+  entries retire. Disable polling entirely via `POLL_FALLBACK=off`.
 - Wrangler warns the `CompiledWasm` rule needs an explicit `fallthrough`;
   deploy succeeds regardless (default rule ignored is harmless here).

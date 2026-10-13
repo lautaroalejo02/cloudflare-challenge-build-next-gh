@@ -7,14 +7,21 @@
 //                                   component DO's onPush
 //   everything else                -> static assets (app/dashboard)
 //
+// Auth (T19, review F1): every non-GET /api/* request and GET /api/entries/:id
+// need header `x-arb-key` == the ARB_ADMIN_KEY secret, checked here before
+// any routing (src/auth.ts). GET /api/state, /api/events and /api/ws stay
+// public for the dashboard.
+//
 // Durable Object layout:
-//   ArbRouter   "router-t14"   routing table, ws hub, create orchestration
-//   ArbTrunk    "trunk-t14"    serialized retirement onto arb-trunk
-//   ReorderBuffer "comp-e<n>"  one per connected producer/consumer component
+//   ArbRouter   "router-t19"      routing table, ws hub, create orchestration
+//   ArbTrunk    "trunk-t19"       serialized retirement onto arb-trunk
+//   ReorderBuffer "t19:comp-e<n>" one per connected producer/consumer component
 
 import { ReorderBuffer, type Env } from "./do.ts";
 import { ArbRouter, ROUTER_NAME } from "./router.ts";
 import { ArbTrunk, TRUNK_NAME } from "./trunk.ts";
+import { componentInstance } from "./shard.ts";
+import { authorize } from "./auth.ts";
 
 export { ReorderBuffer, ArbRouter, ArbTrunk };
 
@@ -27,6 +34,8 @@ interface RepoPushedEvent {
 export default {
 	async fetch(request, env): Promise<Response> {
 		const url = new URL(request.url);
+		const denied = authorize(request, env.ARB_ADMIN_KEY);
+		if (denied) return denied;
 		if (url.pathname === "/api/trunk/init" && request.method === "POST") {
 			const trunk = env.TRUNK.get(env.TRUNK.idFromName(TRUNK_NAME));
 			const resp = await trunk.fetch(request);
@@ -73,14 +82,14 @@ export default {
 						const trunk = env.TRUNK.get(env.TRUNK.idFromName(TRUNK_NAME));
 						await trunk.onPush(repo, after);
 					} else if (route.target === "component" && route.component) {
-						const comp = env.ROB.get(env.ROB.idFromName(route.component));
+						const comp = env.ROB.get(env.ROB.idFromName(componentInstance(route.component)));
 						await comp.onPush(repo, after);
 					}
 					// null route: unknown/stale repo (e.g. leftover from a reset) — drop.
 				}
 				msg.ack();
 			} catch (e) {
-				console.error("queue message failed", e);
+				console.error("queue message failed", String((e as Error)?.message ?? e).split("\n")[0]);
 				msg.retry();
 			}
 		}
