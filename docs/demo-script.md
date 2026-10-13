@@ -8,10 +8,21 @@ Pre-flight (before recording):
 
 ```sh
 cd app/control-plane && npm install && scripts/setup.sh   # queue + subscription + deploy
+# once per deploy: create the admin key (gitignored) and set it as a Worker secret
+node -e "require('fs').writeFileSync('.secret-admin-key', require('crypto').randomBytes(32).toString('base64url'))"
+npx wrangler secret put ARB_ADMIN_KEY < .secret-admin-key
 cd ../demo && npm install
 ```
 
-Dashboard URL: `https://arb-control-plane.<your-subdomain>.workers.dev/`
+Dashboard URL (public, read-only for viewers):
+`https://arb-control-plane.<your-subdomain>.workers.dev/`
+
+Presenter-only URL with the admin controls:
+`https://arb-control-plane.<your-subdomain>.workers.dev/?key=<ADMIN_KEY>`.
+Never put the real key in a slide, a recording or this repo; the demo CLI
+reads it from `ARB_ADMIN_KEY` or `app/control-plane/.secret-admin-key` on its
+own (`app/demo/src/lib/admin-key.ts`). Before recording, check that the
+key does not show in the browser address bar or history on camera.
 
 ---
 
@@ -96,6 +107,11 @@ npx wrangler queues subscription create arb-push-events \
 cd app/demo
 npm run demo -- --base https://arb-control-plane.<your-subdomain>.workers.dev
 ```
+
+Under the T19 review fixes the same scenarios were re-run live (2026-10-13):
+main 60 s, failing-check 66 s, multi 65–81 s over 3 runs, `recover` 0 and
+`retire.failed` 0 (`app/control-plane/NOTES.md`, "Review fixes (T19)" → "Live
+verification"). The beat timings below come from the earlier T11 run.
 
 Expected duration: **~52 s wall** for the main scenario and **~50 s** for
 `--scenario failing-check` — measured live 2026-10-13 with declared stubs
@@ -212,17 +228,31 @@ Narrate through the beats; each maps to a visible dashboard change:
 > "The human decides exactly two things. One: speculation depth — the
 > buffer size."
 
+[STAGE] These controls are admin-only. Reload the dashboard in the
+presenter window with `?key=<ADMIN_KEY>` (placeholder — paste the real key
+off-camera, e.g. `https://arb-control-plane.<your-subdomain>.workers.dev/?key=<ADMIN_KEY>`).
+Only then do the robSize slider and the VETO button render; the public URL
+shows neither. Say on camera: "the public dashboard is read-only for
+viewers; the controls need the admin key." Or, from the terminal, send the
+key as a header (shell variable, never typed literally):
+
 ```sh
-curl -X POST <base>/api/config -H 'content-type: application/json' -d '{"robSize":4}'
+curl -X POST <base>/api/config -H 'content-type: application/json' \
+  -H "x-arb-key: $ARB_ADMIN_KEY" -d '{"robSize":4}'
 ```
 
 > "Two: veto — on the head entry only."
 
-[STAGE] Click the VETO button on the head entry, or:
+[STAGE] Click the VETO button on the head entry (visible only with `?key=`),
+or:
 
 ```sh
-curl -X POST <base>/api/entries/<head-id>/veto
+curl -X POST <base>/api/entries/<head-id>/veto -H "x-arb-key: $ARB_ADMIN_KEY"
 ```
+
+Without the header the request returns `403`, a good aside if asked about
+the public URL. Veto is also refused with `409` while that entry is
+mid-retire (`app/control-plane/NOTES.md`, "Review fixes (T19)").
 
 > "A veto squashes exactly that entry's transitive dependents — highlighted
 > before it lands — and they re-fork from the vetoed entry's own base, so
@@ -324,6 +354,7 @@ In order of preference:
 - [ ] e1 → e2 → e3 retire into the trunk chip in order, mode badges visible
   (`fast-forward`; `splice` on e3 in the failing-check run; shot refs:
   `live-check.png`, `live-final.png`)
-- [ ] `robSize` config + veto shown as the two human controls
+- [ ] `robSize` config + veto shown as the two human controls, dashboard
+  opened with `?key=<ADMIN_KEY>` (placeholder only; real key never on screen)
 - [ ] Real-vs-scripted slide and measured-numbers table on screen
 - [ ] "Built using Cloudflare Workers and Artifacts" line said out loud

@@ -9,11 +9,11 @@ types live in `app/CONTRACTS.md`; this document explains how the pieces move.
 |---|---|---|
 | `rob.ts` | `app/control-plane/src/rob.ts` | Pure reorder-buffer state machine. `apply(state, cmd, now)` returns `{state, effects}`; no Cloudflare imports, unit-tested with `node:test` (incl. index-map, splice decision, git-level retire and declared-stub prediction tests). Per-component state is O(1)-indexed: `byId`, `byRepo`, `childrenOf`, `pendingRepo` maps and a monotone `headCursor` under `_internal.idx`. |
 | Ports | `app/control-plane/src/ports.ts` | `ArtifactsPort` (real, wraps the `ARTIFACTS` binding), `HasherPort`, `CheckerPort`, `RetirerPort` — the state machine's only I/O surface, so integration swaps interfaces not logic. |
-| Component DO | `app/control-plane/src/do.ts` | `ReorderBuffer` Durable Object, **one instance per connected component** (`comp-<rootEntryId>`). Executes effects, persists state, relays ArbEvents to `ArbRouter` for `/api/ws` fan-in, alarms poll only its own live entry repos. Retire effects call `ArbTrunk.retireAtomic` through `RetirerPort`. |
-| Router DO | `app/control-plane/src/router.ts` | `ArbRouter` (`router-t14`): global seq allocation, `entryId→comp` / `repo→comp` routing tables, `POST /api/entries` orchestration with global `robSize`, `/api/state` + `/api/events` aggregation, `/api/ws` hub, config/reset fan-out. |
-| Trunk DO | `app/control-plane/src/trunk.ts` | `ArbTrunk` (`trunk-t17`): serializes every trunk mutation on `arb-trunk` through an in-memory promise queue (DO handlers interleave on `await`). Each retirement runs as one atomic `retireAtomic` slot spanning head-read → ff/splice/overlap → candidate build → candidate check → `main` move, with bounded in-slot rebuilds (`src/atomic.ts`, `MAX_ATOMIC_ATTEMPTS=3`); the legacy `retire`/`moveBranch` RPCs remain but are unused. Owns trunk init + the sole trunk alarm poll + the authoritative `trunk.commit`. |
+| Component DO | `app/control-plane/src/do.ts` | `ReorderBuffer` Durable Object, **one instance per connected component** (`comp-<rootEntryId>`; since T19 the DO instance name is `t19:comp-e<n>` while the public `component` field stays `comp-e<n>`). Executes effects, persists state, relays ArbEvents to `ArbRouter` for `/api/ws` fan-in, alarms poll only its own live entry repos. Retire effects call `ArbTrunk.retireAtomic` through `RetirerPort`. |
+| Router DO | `app/control-plane/src/router.ts` | `ArbRouter` (`router-t19`): global seq allocation, `entryId→comp` / `repo→comp` routing tables, `POST /api/entries` orchestration with global `robSize`, `/api/state` + `/api/events` aggregation, `/api/ws` hub, config/reset fan-out. |
+| Trunk DO | `app/control-plane/src/trunk.ts` | `ArbTrunk` (`trunk-t19`): serializes every trunk mutation on `arb-trunk` through an in-memory promise queue (DO handlers interleave on `await`). Each retirement runs as one atomic `retireAtomic` slot spanning head-read → ff/splice/overlap → candidate build → candidate check → `main` move, with bounded in-slot rebuilds (`src/atomic.ts`, `MAX_ATOMIC_ATTEMPTS=3`); the legacy `retire`/`moveBranch` RPCs remain but are unused. Owns trunk init + the sole trunk alarm poll + the authoritative `trunk.commit`. |
 | Shard helpers | `app/control-plane/src/shard.ts` | Pure: `componentName(rootId)`, `repoToEntryId(repo)`, `mergeStates`, `mergeEvents`. |
-| Worker | `app/control-plane/src/index.ts` | `POST /api/trunk/init` → `ArbTrunk` (+ router inform); other `/api/*` → `ArbRouter`; queue consumer → repo-routed `onPush`; everything else → static assets. |
+| Worker | `app/control-plane/src/index.ts` + `src/auth.ts` | Admin-key gate first (`x-arb-key`, see "Robustness mechanisms"), then `POST /api/trunk/init` → `ArbTrunk` (+ router inform); other `/api/*` → `ArbRouter`; queue consumer → repo-routed `onPush`; everything else → static assets. |
 | Hasher | `app/hasher/` | `hashInterface(files)` — web-tree-sitter + TypeScript grammar WASM, normalizes signatures so formatting/comments/bodies/reordering never move a hash. |
 | Checker | `app/checker/` | `runChecks(env, repo, commit)` — walks the commit tree, strips TS (sucrase), loads a Dynamic Worker via the Worker Loader, calls each `tests/**/*.test.ts` module's `run()`. |
 | Retirer | `app/control-plane/src/retire.ts` + pure `src/splice.ts` (grown out of `app/retirer-spike`) | isomorphic-git on `MemFs` inside the DO: fast-forward when the trunk head is an ancestor of the entry head; otherwise the path-disjoint splice — candidate commit pushed to `refs/heads/arb-candidate` on the trunk repo, checked, then `main` moved via `moveBranch` — all inside the single `ArbTrunk` atomic slot. `P ∩ Q ≠ ∅` → `trunk-overlap` squash. |
@@ -129,9 +129,10 @@ outside the contract's union (contract issue noted in
 | `hash.changed` | ≥1 exported-symbol hash moved | symbol, oldHash, newHash |
 | `squash` | a consumed symbol changed / producer vetoed / producer squashed / trunk overlap / prediction miss | entryId, diagnosis; `trunk-overlap` squashes also carry `overlap: string[]` (the intersecting paths); `prediction-miss` diagnoses carry predicted vs actual signatures |
 | `prediction.hit` / `prediction.miss` | the producer's first push resolved a consumer's pinned symbol (hit: actual == declared; miss: diverged — the consumer is also squashed `prediction-miss`) | `entryId` = consumer, `data.producerId`, `symbol`, `hash` (hit) / `predictedHash`, `actualHash`, `predictedSignature`, `actualSignature`, `commit` (miss) |
+| `recover` | a stale in-flight marker was swept and its work re-issued, or an effect failed and was reported instead of wedging the component (T19) | `data.kind`: `refork` \| `recheck` \| `reretire` \| `fork-failed` \| `<effect>-failed` |
 | `refork` | new fork minted for a squashed entry | repo, generation |
 | `ready` | agent POSTs ready | commit |
-| `check.started` / `check.passed` / `check.failed` | head entry's `runChecks` | commit, durationMs, results; on a splice candidate they carry `splice: true` and the candidate commit on the trunk repo (replayed into the log after the atomic cycle lands rather than streamed live) |
+| `check.started` / `check.passed` / `check.failed` | head entry's `runChecks` | commit, durationMs, results; infra failures carry `data.infra: true` (entry stays `checking`, re-checked later); on a splice candidate they carry `splice: true` and the candidate commit on the trunk repo (replayed into the log after the atomic cycle lands rather than streamed live) |
 | `retired` | head entry landed on trunk | commit, `mode: "fast-forward" \| "splice"`, durationMs |
 | `retire.retry` | an atomic retire attempt was rejected (e.g. non-fast-forward) and rebuilt from the new head inside the same slot | `attempt`, `reason` |
 | `retire.failed` | a retire cycle exhausted its bounded rebuilds or failed outright; clears `retiring` so the next cascade can retry (`strike` counts consecutive failures) | `reason`, `strike`, `exhausted` |
@@ -191,14 +192,38 @@ producer's final head after an early-cutoff push):
 | Queue event lost/delayed | alarm poll every ~3 s over trunk + live repos | dedupe by `repo:commit` (`seenPushes`, cap 500) + `headCommit` equality; spike-measured poll detection median 0.70 s, live push→`push` event observed 1–3 s (queue lands inside the poll cadence; sources aren't tagged in the log) |
 | Duplicate push (queue + alarm both fire) | same dedupe keys | second delivery is a no-op |
 | Push during in-flight refork | pushes to the stale repo name are ignored | known gap: work on the stale fork must be redone |
-| Effect failure (fork throws) | 500 / queue retry | entry's pending-refork flag persists until a later push reuses it; no automatic unjam |
+| Effect failure (fork throws) | per-effect try/catch (T19) | `fork.failed` with backoff or `effect.failed`, plus a `recover` event; the alarm sweep re-issues stale work (see "Robustness mechanisms") |
 | Transient platform error (1042/1104) | spike-observed flakiness | retry once (`spikes/SPIKES.md`) |
-| DO version pinning after deploy | an alarmed DO (~3 s cadence) stayed on the previous deployment *indefinitely* (observed live) | worked around by bumping `DO_NAME` in `src/index.ts` so a fresh object spawns on the new deployment; old objects become harmless zombie pollers. Pending fix: `/api/reset` should clear `trunk.repo` so the alarm chain dies (`app/control-plane/NOTES.md` known gaps) |
+| DO version pinning after deploy | an alarmed DO (~3 s cadence) stayed on the previous deployment *indefinitely* (observed live) | worked around by bumping the DO instance names on every deploy (`router-t19`, `trunk-t19`, `t19:comp-e<n>`) so a fresh object spawns on the new deployment; old objects become harmless zombie pollers. T19 also stops the `ArbTrunk` alarm after 5 min without trunk activity (`app/control-plane/NOTES.md` known gaps) |
 | Repo name collision after reset | `ALREADY_EXISTS` on fork create | retry as `arb-e<seq>-<lane>-<n>-x<k>`, `repoAlias` resolves dependents' sources |
 | LOADER cache cold machine | slow check | retry; worst observed ~7.7 s end-to-end |
 | Squash storms on long chains | — | bounded by `robSize` (speculation depth), same as hardware |
 | Human veto of wrong entry | veto restricted to head; dependents previewed in UI | transitive dependents squash and reparent (recoverable) |
 | Persisted-state shape change on redeploy | constructor forward-fills `_internal` | `{...initialState()._internal, ...stored}` |
+
+## Robustness mechanisms (T19)
+
+Added after the independent review; every confirmed finding got a regression
+test first. Source of truth: `app/control-plane/NOTES.md` ("Review fixes
+(T19)") and the T19 entries in `app/CONTRACTS.md` Changelog.
+
+| Mechanism | What it does | Where |
+|---|---|---|
+| Effect isolation | Each effect runs in its own try/catch. A fork throw emits `fork.failed` and retries with backoff (2 s, doubling, cap 60 s); any other throw emits `effect.failed`; a checker throw becomes an infra result. One failing effect no longer wedges the component. Error strings are single-line and credential-scrubbed, never stacks | `src/effects.ts` |
+| Alarm sweep + `recover` events | The alarm runs a `sweep` that re-issues forks, checks and retires whose in-flight marker is older than 60 s (or whose retry is due). Each recovery emits a `recover` event (`refork`, `recheck`, `reretire`, `fork-failed`, `<effect>-failed`). Component alarms stop once all their entries retire; the `ArbTrunk` alarm goes dormant after 5 min idle | `src/rob.ts` (pure sweep), `src/do.ts`, `src/trunk.ts` |
+| Infra vs verdict checks | `CheckResult.infra` marks "the checker could not run" (Artifacts, loader or network failure) as distinct from a real failure. The checker retries Artifacts reads (0.5 / 1 / 2 s). The buffer never stores an infra result as `entry.checks`: the entry stays `checking` and is re-checked after 10 s. Atomic retire waits 0.5 s / 1 s between attempts and retries infra candidate checks (only those two steps fit `MAX_ATOMIC_ATTEMPTS=3`) | `app/checker/src/retry.ts`, `src/atomic.ts` |
+| Fork drift check on landing | When `fork.done` lands with a fork base different from the producer's current head, unpinned consumes are re-diffed against the producer's current exports; a mismatch squashes and re-forks without handing out a token. Skipped when the base equals the producer head, when the producer is itself re-forking, and for pinned stub symbols. Superseded or orphaned forks are dropped | `src/rob.ts` |
+| Veto / retire guards | Veto returns 409 while the entry is `retiring`. `retire.overlap` and `retire.done` require `retiring` plus status `ready`; duplicate lands on a retired entry are ignored; a stale `retire.done` moves `trunk.commit` forward (and `baseCommit` for a live entry) so a push during retire cannot desync trunk and buffer. Veto also releases the consumers' pinned predictions | `src/rob.ts` |
+| Splice overlap rules | Overlap is path equality **or** a directory prefix (`src/a` vs `src/a/b.ts`), with both sides reported. `diffPaths` also compares file mode, so a mode-only change counts and a blob-to-tree change reports both sides. Gitlinks (submodule entries) are preserved through flatten, overlay and tree write | `src/splice.ts`, `src/retire.ts` |
+| DO instance names per deploy | Router, trunk and component instance names carry a deploy tag (`router-t19`, `trunk-t19`, `t19:comp-e<n>`) so a redeploy spawns fresh objects instead of leaving alarmed ones pinned to old code. Router `nextSeq` survives reset, so entry ids and repo names keep increasing; a first name collision jumps to a random suffix | `src/index.ts`, `src/router.ts` |
+| Admin-key auth | Every non-GET `/api/*` and `GET /api/entries/:id` need header `x-arb-key` equal to the `ARB_ADMIN_KEY` Worker secret (constant-time compare; unset secret means closed), else `403`. `GET /api/state`, `/api/events`, `/api/ws` and the dashboard are public. `GET /api/entries/:id` now returns a write token on every authenticated call (cached per repo for 30 min). `POST /api/reset` restores the default `robSize` | `src/auth.ts`, `src/index.ts` |
+
+Not unit-testable (Durable Object I/O), covered by the closest pure test and
+live runs: the router create queue, the `ArbTrunk` idle alarm and the
+`ReorderBuffer` alarm wiring of `sweep` (`app/control-plane/NOTES.md`).
+Live after the fixes: five runs per the T19 table, all exit 0, `recover` 0 and
+`retire.failed` 0 in every run (control-plane 92 tests, checker 17, dashboard
+31, demo 16 — same source).
 
 ## Scale
 

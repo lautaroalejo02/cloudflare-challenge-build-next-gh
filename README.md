@@ -85,6 +85,12 @@ Concretely, per `app/CONTRACTS.md`:
 - **Interface hashes only decide *when to squash early*.** Behavior is still
   verified at retirement: an unchanged signature does not prove unchanged
   behavior.
+- **Self-healing (T19).** A failing effect is isolated instead of wedging its
+  component, an alarm sweep re-issues stale forks/checks/retires and reports
+  each as a `recover` event, and checker infrastructure failures are retried
+  rather than recorded as verdicts. Details in `docs/architecture.md`
+  ("Robustness mechanisms") and `app/control-plane/NOTES.md` ("Review fixes
+  (T19)").
 
 ## What the human decides
 
@@ -96,7 +102,11 @@ Two things, and nothing else:
 - **Veto**: `POST /api/entries/:id/veto` on the head entry only. A veto
   squashes exactly that entry's transitive dependents — highlighted on the
   dashboard first — which re-fork from the vetoed entry's own base so they
-  can still retire later.
+  can still retire later. Vetoing an entry that is mid-retire returns 409.
+
+Both controls are admin-only since T19: they need the `x-arb-key` header
+(see "Admin key" below). The public dashboard URL is read-only for viewers;
+VETO and the robSize slider appear only when it is opened with `?key=<key>`.
 
 ## "Isn't this just stacked PRs?"
 
@@ -277,6 +287,39 @@ npx wrangler queues subscription create arb-push-events \
   --name arb-ns-push-sub
 ```
 
+### Admin key (set once per deploy)
+
+The destructive and token-minting endpoints are protected by an admin key
+that you create for your own deploy. The value is never committed: generate
+a random one, keep it in the gitignored `app/control-plane/.secret-admin-key`
+file (the root `.secret*` rule ignores it), and push it to the Worker as the
+`ARB_ADMIN_KEY` secret.
+
+```sh
+cd app/control-plane
+node -e "require('fs').writeFileSync('.secret-admin-key', require('crypto').randomBytes(32).toString('base64url'))"
+npx wrangler secret put ARB_ADMIN_KEY < .secret-admin-key
+```
+
+Do this before (or right after) the first deploy; an unset secret leaves the
+protected endpoints closed (always 403), not open
+(`app/control-plane/NOTES.md`, "Review fixes (T19)").
+
+| Endpoint | Access |
+|---|---|
+| `GET /api/state`, `GET /api/events`, `GET /api/ws`, the dashboard at `/` | public (read-only) |
+| every non-GET `/api/*` (`POST /api/entries`, `/ready`, `/veto`, `/api/config`, `/api/reset`, `/api/trunk/init`, ...) | needs header `x-arb-key: <key>`, else `403` |
+| `GET /api/entries/:id` (returns a git write token on every call) | needs `x-arb-key` |
+
+- **Demo CLI.** `npm run demo` reads the key from the `ARB_ADMIN_KEY`
+  environment variable, else from `app/control-plane/.secret-admin-key`, and
+  sends it as `x-arb-key` automatically (`app/demo/src/lib/admin-key.ts`).
+  The local mock ignores it.
+- **Dashboard.** Open `https://arb-control-plane.<your-subdomain>.workers.dev/?key=<key>`
+  to get VETO and the robSize slider; without `?key=` the page is
+  read-only. The key then sits in the browser history, so use it only on a
+  trusted machine (`app/dashboard/app.js`).
+
 The dashboard is served by the same Worker at `/` (Workers static assets);
 `/api/ws` is the live event stream. Optional proof deployments exist for the
 library packages — `app/hasher` (`npm run deploy:test-worker`),
@@ -315,11 +358,13 @@ The mock serves the `main` and `failing-check` scenarios; `multi` needs the
 deployed plane (the runner verifies component isolation via `GET
 /api/events`, which the mock does not implement).
 
-Tests per package: `npm test` (control-plane 54 cases — state machine +
-splice + git-level retire + declared-stub prediction + atomic retire;
-demo 13 scenario/unit cases incl. a full-run prediction case asserting
-2 hits / 1 miss, dashboard 27 event-folding cases, hasher 25 hash checks,
-checker and retirer-spike unit suites).
+Tests per package: `npm test` (control-plane 92 cases — state machine +
+splice + git-level retire + declared-stub prediction + atomic retire +
+effects + auth; checker 17; demo 16 scenario/unit cases incl. a full-run
+prediction case asserting 2 hits / 1 miss; dashboard 31 event-folding and
+admin-key cases; hasher 25 hash checks; retirer-spike unit suite). Counts
+are from `app/control-plane/NOTES.md` ("Review fixes (T19)", control-plane
+was 54 before T19) and were re-run for this update.
 
 ## What is real vs mocked
 
@@ -365,6 +410,7 @@ Every figure was measured in a real run; source file per row.
 | Live end-to-end with declared stubs (T11) | ~52 s wall — predictionHits 2 / misses 1, 3 squashes, 3 retired, 4 checks run, 7 pushes seen | `app/control-plane/NOTES.md` |
 | Live failing-check with declared stubs (T11) | ~50 s wall — same 2/1 verdicts; failing check still blocked retirement (5 checks run) | `app/control-plane/NOTES.md` |
 | Live end-to-end, multi scenario under atomic retire (T17) | 63–77 s wall over 5 runs — 4 squashes, 5 retired, 8 checks run, 12 pushes seen, 2/1 verdicts, `retire.retry` 0 / `retire.failed` 0 | `app/control-plane/NOTES.md` |
+| Live end-to-end after the T19 review fixes | main 60 s, failing-check 66 s, multi 65–81 s over 3 runs, all exit 0 — multi: 4 squashes, 5 retired, 8–9 checks run, 12 pushes seen; `recover` 0 / `retire.failed` 0 in every run | `app/control-plane/NOTES.md` ("Review fixes (T19)") |
 | Reorder-buffer scale bench (state machine) | median per event 30 µs → 394 µs → 16 ms at N = 1k / 10k / 100k single buffer; flat 3–17 µs with per-component buffers; 3,803 pushes, 0 squash-oracle mismatches | `app/control-plane/bench/RESULTS.md` |
 | Full 3-agent scenario, local mock | 2 squashes, 4 early cutoffs, 3 retired in ~23 s | `app/demo/NOTES.md` |
 
