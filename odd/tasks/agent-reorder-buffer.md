@@ -61,11 +61,16 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
   - Parent spot check: `npm test` (control-plane) gave 26/26. The parent ran the live main scenario: exit 0, 3/3 retired in order, squashes 2, early cutoffs 2 (log `odd/logs/parent-e2e.txt`, gitignored).
   - Defects found by the parent: (a) the process hangs until the 5-min timeout after completion (311 s wall vs 40.5 s timeline); (b) in gen 1 the tests agent reported 'nothing to commit - already on base' and retired with head == API head, likely because stale clone dirs are reused across runs. These were sent to T9c.
 - [ ] T9 (D) Demo hardening, split into parallel writers on disjoint surfaces:
-  - T9c: fix the hang, the stale clones and the honest squash-latency stat; redeploy; capture live dashboard screenshots (`odd/prompts/T9c-fixes.md`). Dispatched.
-  - T9d: replace README/docs TBDs with live evidence (`odd/prompts/T9d-docs-numbers.md`). Dispatched.
+  - [x] T9c: fix the hang, the stale clones and the honest squash-latency stat; redeploy; capture live dashboard screenshots. Commits `47fc190`, `3c2a186`.
+    - Root cause: `arb-trunk` survives `/api/reset`, so stale retired files leaked into new seeds. Clone dirs are now run-unique, and the buffer ignores pushes during a pending re-fork (regression test added).
+    - Parent spot check: re-ran the live main scenario; exit 0, process exits ~4 s after completion (66 s wall vs 61.7 s timeline), e3 head `a779ae21` != e1 head `8e557ad1`. The live squash screenshot was reviewed.
+  - [x] T9d: replace README/docs TBDs with live evidence. Commit `5ddda57`. 0 TBDs remain.
   - [x] T9a: dashboard polish + real-event alignment. Commit `e77db98`. Parent spot check: `node --test` gave 24/24; the 1920x1080 squash screenshot was reviewed and the connectors are clean.
     - OPEN: the "squash after push" stat is synthetic in the mock (~1.2 s spacing). Live, squash and push share a timestamp, so the stat would read ~0 ms. Before the video, fix it (measure from the git push time) or hide it.
   - [x] T9b: README, architecture doc and video script. Commit `3967610`. Parent structural readback done. Live E2E numbers are TBD until T8.
+- [ ] T11 (D) Value prediction: declared stubs, hit/miss counter (the wow-scene element and the answer to the 'just stacked PRs' objection). Dispatched to SWE-2 max (`odd/prompts/T11-value-prediction.md`). Stretch, approved by the orchestrator while the owner sleeps.
+- [ ] T12 (D) Scale benchmark of pure `rob.ts` at N = 1K/10K/100K, one buffer vs per-component buffers (`odd/prompts/T12-scale-bench.md`). Strengthens the weakest criterion (scale 3/5).
+- [ ] T13 (D) Docs refresh with T11/T12 evidence, plus recorded live dashboard footage for the video.
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
 Route declaration: T2-T7 are delegated because each package is non-trivial and the six run in parallel in disjoint directories. That is the writer trigger plus the user's explicit request to use many Devin agents. T8 and T9 each go to one writer, because they touch multiple packages.
