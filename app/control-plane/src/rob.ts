@@ -98,6 +98,33 @@ export interface ArbEvent {
 	data?: unknown;
 }
 
+/** Hot-path indexes over `entries` (T14). Persisted as plain objects inside
+ * `_internal` (JSON-serializable); `ensureIdx` rebuilds them when missing or
+ * when `entries.length` moved outside the machine (direct test/bench writes).
+ *
+ * `entries[]` is kept sorted by seq so `byId` maps id -> seq and lookups do a
+ * binary search: insertions may arrive out of order because the router assigns
+ * global seqs before the component DO applies the create.
+ */
+export interface RobIndexes {
+	/** entryId -> seq (position via binary search into the seq-sorted array). */
+	byId: Record<string, number>;
+	/** current repo name -> entryId (all entries; `live` re-checked at read). */
+	byRepo: Record<string, string>;
+	/** producerId -> dependent entryIds. */
+	childrenOf: Record<string, string[]>;
+	/** planned fork repo -> entryId (reverse of `pending`). */
+	pendingRepo: Record<string, string>;
+	/** entries[] index of the lowest-seq live entry; advances monotonically. */
+	headCursor: number;
+	/** Non-retired entries (robSize accounting; vetoed still count). */
+	active: number;
+	/** Highest seq assigned so far (creates may carry an explicit seq). */
+	lastSeq: number;
+	/** entries.length these indexes cover (staleness check for ensureIdx). */
+	n: number;
+}
+
 /** Interpreter-owned bookkeeping, persisted alongside BufferState but
  * stripped from GET /api/state responses. */
 export interface RobInternal {
@@ -126,6 +153,8 @@ export interface RobInternal {
 	predConsumed: Record<string, string[]>;
 	/** Bounded event log for debugging. */
 	eventLog: ArbEvent[];
+	/** Hot-path indexes (T14); maintained by apply(), rebuilt when stale. */
+	idx?: RobIndexes;
 }
 
 export interface RobState extends BufferState {
@@ -157,6 +186,7 @@ export function initialState(): RobState {
 			repoAlias: {},
 			predConsumed: {},
 			eventLog: [],
+			idx: emptyIndexes(),
 		},
 	};
 }
@@ -180,6 +210,10 @@ export type Cmd =
 			/** Declared-stub prediction: the producer's intended exported
 			 * interface, already hashed by the interpreter. */
 			stub?: { exports: SymbolHashes; sigs: SymbolSignatures };
+			/** Sharded control plane (T14): the router assigns the global id/seq
+			 * before the component DO applies the create. */
+			id?: string;
+			seq?: number;
 	  }
 	| {
 			type: "fork.done";
@@ -227,17 +261,106 @@ function err(status: number, error: string): ApplyResult {
 	return { ok: false, status, error };
 }
 
+// --- index maps (T14) ---------------------------------------------------------
+
+export function emptyIndexes(): RobIndexes {
+	return { byId: {}, byRepo: {}, childrenOf: {}, pendingRepo: {}, headCursor: 0, active: 0, lastSeq: 0, n: 0 };
+}
+
+/** Rebuild every index from `entries` + `pending` (re-sorts entries by seq).
+ * Called on first apply after load/persist-restore, and whenever `entries`
+ * changed size outside the machine. */
+export function rebuildIndexes(state: RobState): RobIndexes {
+	const entries = state.entries;
+	entries.sort((a, b) => a.seq - b.seq);
+	const i = emptyIndexes();
+	for (const e of entries) {
+		i.byId[e.id] = e.seq;
+		if (e.repo) i.byRepo[e.repo] = e.id;
+		if (e.producerId) (i.childrenOf[e.producerId] ??= []).push(e.id);
+		if (e.status !== "retired") i.active += 1;
+		if (e.seq > i.lastSeq) i.lastSeq = e.seq;
+	}
+	for (const [id, repo] of Object.entries(state._internal.pending)) i.pendingRepo[repo] = id;
+	while (i.headCursor < entries.length && !live(entries[i.headCursor])) i.headCursor++;
+	i.n = entries.length;
+	state._internal.idx = i;
+	return i;
+}
+
+/** The maintained index set. Rebuilds lazily when absent or when `entries`
+ * changed size behind the machine's back (tests/bench build states directly). */
+function idx(state: RobState): RobIndexes {
+	const i = state._internal.idx;
+	if (!i || i.n !== state.entries.length) return rebuildIndexes(state);
+	return i;
+}
+
+/** Index of `seq` in the seq-sorted entries array, or -1. */
+function indexOfSeq(entries: Entry[], seq: number): number {
+	let lo = 0;
+	let hi = entries.length - 1;
+	while (lo <= hi) {
+		const mid = (lo + hi) >> 1;
+		if (entries[mid].seq === seq) return mid;
+		if (entries[mid].seq < seq) lo = mid + 1;
+		else hi = mid - 1;
+	}
+	return -1;
+}
+
 function find(state: RobState, id: string): Entry | undefined {
+	const seq = idx(state).byId[id];
+	if (seq === undefined) return undefined;
+	const i = indexOfSeq(state.entries, seq);
+	if (i >= 0 && state.entries[i].id === id) return state.entries[i];
+	// Defensive: an index should never disagree with the array; if it does,
+	// fall back to a scan rather than returning a wrong entry.
 	return state.entries.find((e) => e.id === id);
+}
+
+/** Live entry holding `repo` as its CURRENT fork name, or undefined. */
+function entryByRepo(state: RobState, repo: string): Entry | undefined {
+	const id = idx(state).byRepo[repo];
+	if (!id) return undefined;
+	const e = find(state, id);
+	return e && live(e) ? e : undefined;
+}
+
+/** Dependents of `producerId` in registration order (all statuses). */
+function children(state: RobState, producerId: string): Entry[] {
+	const ids = idx(state).childrenOf[producerId];
+	if (!ids) return [];
+	const out: Entry[] = [];
+	for (const id of ids) {
+		const e = find(state, id);
+		if (e) out.push(e);
+	}
+	return out;
+}
+
+function setPending(state: RobState, id: string, repo: string): void {
+	state._internal.pending[id] = repo;
+	idx(state).pendingRepo[repo] = id;
+}
+
+function clearPending(state: RobState, id: string): void {
+	const repo = state._internal.pending[id];
+	if (repo !== undefined) delete idx(state).pendingRepo[repo];
+	delete state._internal.pending[id];
 }
 
 function live(e: Entry): boolean {
 	return e.status !== "retired" && e.status !== "vetoed";
 }
 
-/** Lowest-seq entry that can still retire (not retired, not vetoed). */
+/** Lowest-seq entry that can still retire (not retired, not vetoed). The
+ * cursor only advances: entries are sorted by seq and retired/vetoed is
+ * terminal, so the head never moves back. */
 function head(state: RobState): Entry | undefined {
-	return state.entries.filter(live).sort((a, b) => a.seq - b.seq)[0];
+	const i = idx(state);
+	while (i.headCursor < state.entries.length && !live(state.entries[i.headCursor])) i.headCursor++;
+	return state.entries[i.headCursor];
 }
 
 function emit(state: RobState, effects: Effect[], now: number, ev: Omit<ArbEvent, "ts">): void {
@@ -249,9 +372,25 @@ function emit(state: RobState, effects: Effect[], now: number, ev: Omit<ArbEvent
 
 function forkEffect(state: RobState, effects: Effect[], e: Entry, fromRepo: string): string {
 	const toRepo = `arb-e${e.seq}-${e.lane}-${e.generation}`;
-	state._internal.pending[e.id] = toRepo;
+	setPending(state, e.id, toRepo);
 	effects.push({ type: "fork", entryId: e.id, fromRepo, toRepo });
 	return toRepo;
+}
+
+/** Remove `id` from `childrenOf[oldProducer]` and append under `newProducer`
+ * (undefined = reparent to trunk, i.e. no producer). */
+function reparent(state: RobState, id: string, oldProducer: string | null, newProducer: string | null | undefined): void {
+	if (newProducer === undefined) return;
+	const i = idx(state);
+	if (oldProducer) {
+		const list = i.childrenOf[oldProducer];
+		if (list) {
+			const k = list.indexOf(id);
+			if (k >= 0) list.splice(k, 1);
+			if (!list.length) delete i.childrenOf[oldProducer];
+		}
+	}
+	if (newProducer) (i.childrenOf[newProducer] ??= []).push(id);
 }
 
 /** Diff a consumer's recorded hashes against fresh producer exports. */
@@ -295,7 +434,7 @@ function squashTree(
 	producerCommit: string,
 	reparentTo: string | null | undefined,
 ): void {
-	for (const c of state.entries.filter((x) => live(x) && x.producerId === producer.id)) {
+	for (const c of children(state, producer.id).filter(live)) {
 		// Rebase target for THIS dependent.
 		let fromRepo = baseRepo;
 		let newExports = baseExports;
@@ -309,7 +448,10 @@ function squashTree(
 		c.generation += 1;
 		c.status = "squashed";
 		c.diagnosis = { reason, changed, producerCommit };
-		if (reparentTo !== undefined) c.producerId = reparentTo;
+		if (reparentTo !== undefined) {
+			reparent(state, c.id, c.producerId, reparentTo);
+			c.producerId = reparentTo;
+		}
 		state.stats.squashes += 1;
 		const newRepo = forkEffect(state, effects, c, fromRepo);
 		emit(state, effects, now, {
@@ -365,6 +507,7 @@ function cascade(state: RobState, effects: Effect[], now: number): void {
 
 export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult {
 	const effects: Effect[] = [];
+	idx(state); // heal indexes if entries moved outside the machine
 
 	switch (cmd.type) {
 		case "trunk.init": {
@@ -377,8 +520,8 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 		}
 
 		case "entry.create": {
-			const active = state.entries.filter((e) => e.status !== "retired").length;
-			if (active >= state.robSize) return err(409, "reorder buffer full");
+			const ix = idx(state);
+			if (ix.active >= state.robSize) return err(409, "reorder buffer full");
 			let producer: Entry | undefined;
 			if (cmd.producerId) {
 				producer = find(state, cmd.producerId);
@@ -387,8 +530,8 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			} else if (!state.trunk.repo) {
 				return err(409, "trunk not initialized");
 			}
-			const seq = state.entries.reduce((m, e) => Math.max(m, e.seq), 0) + 1;
-			const id = `e${seq}`;
+			const seq = cmd.seq ?? ix.lastSeq + 1;
+			const id = cmd.id ?? `e${seq}`;
 			// Value prediction: a consumer of a stubbed producer records the
 			// PREDICTED hash (what it forwards against), not the fork's base
 			// content. Pinned symbols are kept in _internal.predConsumed until
@@ -422,12 +565,25 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				diagnosis: null,
 				checks: null,
 			};
-			state.entries.push(entry);
+			// entries stays sorted by seq: a sharded create may carry a seq
+			// lower than entries already applied (router assigns before apply).
+			let pos = state.entries.length;
+			while (pos > 0 && state.entries[pos - 1].seq > seq) pos--;
+			state.entries.splice(pos, 0, entry);
+			ix.n = state.entries.length;
+			ix.byId[id] = seq;
+			if (entry.producerId) (ix.childrenOf[entry.producerId] ??= []).push(id);
+			ix.active += 1;
+			if (seq > ix.lastSeq) ix.lastSeq = seq;
+			// Inserting at/before the cursor shifts the head right — the new
+			// live entry then occupies the earliest live position.
+			if (pos <= ix.headCursor) ix.headCursor = pos;
 			if (pinned.length) state._internal.predConsumed[id] = pinned;
 			if (cmd.stub) state._internal.sigs[id] = { ...cmd.stub.sigs };
 			const fromRepo = producer ? producer.repo : state.trunk.repo;
 			const repo = forkEffect(state, effects, entry, fromRepo);
 			entry.repo = repo;
+			ix.byRepo[repo] = id;
 			emit(state, effects, now, {
 				type: "entry.created",
 				entryId: id,
@@ -449,7 +605,13 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const e = find(state, cmd.entryId);
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
 			const wasSquash = e.status === "squashed";
+			const oldRepo = e.repo;
 			e.repo = cmd.repo;
+			{
+				const ix = idx(state);
+				if (oldRepo && ix.byRepo[oldRepo] === e.id) delete ix.byRepo[oldRepo];
+				ix.byRepo[cmd.repo] = e.id;
+			}
 			e.remote = cmd.remote;
 			e.baseCommit = cmd.baseCommit;
 			e.headCommit = cmd.baseCommit;
@@ -478,7 +640,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			}
 			const planned = state._internal.pending[e.id];
 			if (planned && planned !== cmd.repo) state._internal.repoAlias[planned] = cmd.repo;
-			delete state._internal.pending[e.id];
+			clearPending(state, e.id);
 			effects.push({ type: "token", entryId: e.id, repo: e.repo });
 			if (wasSquash) {
 				emit(state, effects, now, {
@@ -496,10 +658,8 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			if (cmd.repo === state.trunk.repo && cmd.commit === state.trunk.commit) {
 				return { ok: true, state, effects };
 			}
-			const e = state.entries.find((x) => x.repo === cmd.repo && x.status !== "vetoed" && x.status !== "retired");
-			const pendingId = state._internal.pending
-				? Object.keys(state._internal.pending).find((k) => state._internal.pending[k] === cmd.repo)
-				: undefined;
+			const e = entryByRepo(state, cmd.repo);
+			const pendingId = idx(state).pendingRepo[cmd.repo];
 			if (!e && cmd.repo !== state.trunk.repo && !pendingId) return { ok: true, state, effects };
 			if (e && e.headCommit === cmd.commit) return { ok: true, state, effects };
 			state._internal.seenPushes.push(key);
@@ -546,7 +706,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			// Compare each live consumer's recorded hashes against the new exports.
 			const exports = target.exports;
 			const sigs = state._internal.sigs[target.id] ?? {};
-			for (const c of state.entries.filter((x) => live(x) && x.producerId === target.id)) {
+			for (const c of children(state, target.id).filter(live)) {
 				const oldSigs = state._internal.sigs[c.id] ?? {};
 				const changed = consumedDiff(c.consumes, exports, oldSigs, sigs);
 				// Value prediction verdict: on the producer's first real push,
@@ -792,6 +952,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			delete state._internal.retireCandidate[e.id];
 			delete state._internal.retireStart[e.id];
 			e.status = "retired";
+			idx(state).active -= 1;
 			state.trunk.commit = cmd.commit;
 			state.trunk.retiredCount += 1;
 			state.stats.retired += 1;
@@ -809,7 +970,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const h = head(state);
 			if (!h || h.id !== e.id) return err(409, "only the head entry can be vetoed");
 			e.status = "vetoed";
-			delete state._internal.pending[e.id];
+			clearPending(state, e.id);
 			delete state._internal.checking[e.id];
 			delete state._internal.retiring[e.id];
 			delete state._internal.retireCandidate[e.id];

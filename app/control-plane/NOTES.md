@@ -1,6 +1,7 @@
 # arb-control-plane — NOTES
 
-Worker + `ReorderBuffer` Durable Object + queue consumer + HTTP/WS API.
+Worker + Durable Objects (`ArbRouter` + `ArbTrunk` + one `ReorderBuffer` per
+connected component — T14 sharding) + queue consumer + HTTP/WS API.
 Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
 
 ## What was built
@@ -36,17 +37,30 @@ Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
     `refs/heads/arb-candidate`, checked, then `main` moved) — overlap →
     `retire.overlap` → squash `trunk-overlap`. `src/splice.ts` is the pure
     decision fn.
-- `src/do.ts` — `ReorderBuffer` DO. State persisted in DO storage.
-  Executes effects through ports; broadcasts events to WebSockets via the
-  hibernation API (`ctx.acceptWebSocket`, snapshot on connect). DO alarm
-  polls every ~3s (spike 2b) over trunk + live entry repos when
-  `POLL_FALLBACK != "off"`; dedupes against queue events by `repo:commit`
-  and `headCommit`. `GET /api/events` exposes the ring-buffer event log.
-- `src/index.ts` — Worker: `/api/*` -> DO fetch, queue consumer ->
-  `stub.onPush(repo, after)` filtered to `cf.artifacts.repo.pushed` on
+- `src/do.ts` — `ReorderBuffer` DO, one instance per connected component
+  (`comp-<rootEntryId>`; T14 — see "Sharding"). State persisted in DO
+  storage. Executes effects through ports; retire effects go to `ArbTrunk`;
+  ArbEvents relay to `ArbRouter` for `/api/ws` fan-in. DO alarm polls every
+  ~3s (spike 2b) over the component's live entry repos only (the trunk repo
+  belongs to `ArbTrunk`) when `POLL_FALLBACK != "off"`; dedupes against
+  queue events by `repo:commit` and `headCommit`. `GET /internal/events`
+  exposes the ring-buffer event log to the router.
+- `src/router.ts` — `ArbRouter` DO (`router-t14`): global seq allocation,
+  entry/repo → component routing table, `POST /api/entries` orchestration
+  with global `robSize`, `/api/state` + `/api/events` aggregation across
+  components, `/api/ws` hub, config/reset fan-out.
+- `src/trunk.ts` — `ArbTrunk` DO (`trunk-t14`): serialized `retire` /
+  `moveBranch` on `arb-trunk` (promise queue — DO handlers interleave on
+  await), trunk-init, sole trunk alarm poller, authoritative trunk head.
+- `src/shard.ts` — pure helpers: `componentName`, `repoToEntryId`,
+  `mergeStates`, `mergeEvents`.
+- `src/index.ts` — Worker: `POST /api/trunk/init` -> `ArbTrunk` (+ router
+  inform), other `/api/*` -> `ArbRouter`, queue consumer -> repo-routed
+  `onPush(repo, after)` filtered to `cf.artifacts.repo.pushed` on
   `refs/heads/main` in namespace `arb`, everything else -> `env.ASSETS`.
-- `wrangler.toml` — name `arb-control-plane`, artifacts `arb`, DO migration
-  `new_sqlite_classes: [ReorderBuffer]`, queue consumer `arb-push-events`
+- `wrangler.toml` — name `arb-control-plane`, artifacts `arb`, DO bindings
+  `ROB`/`ROUTER`/`TRUNK`, migrations v1 `[ReorderBuffer]` + v2
+  `[ArbRouter, ArbTrunk]`, queue consumer `arb-push-events`
   (`max_batch_timeout=1`), assets `../dashboard` with `run_worker_first` +
   `ASSETS` binding, `nodejs_compat`, `worker_loaders` `LOADER`, rules
   `CompiledWasm` for `tree-sitter.wasm`, vars `POLL_FALLBACK=on`,
@@ -262,9 +276,74 @@ version `a1c784f2-456f-4920-a790-2de3277d7e3b`.
   (verdict moment: "1 hit / 1 miss" counter, e2 `✓ hit` / `✗ miss` ticks,
   PREDICTION HIT/MISS log lines), `live-squash.png`, `live-final.png`.
 
+## Sharding (T14)
+
+**What changed.** The single `default-t11` DO became three roles:
+
+- `ArbRouter` (`router-t14`, `src/router.ts`) — routing table
+  (`entryId→comp`, `repo→comp`, global `nextSeq`), `POST /api/entries`
+  orchestration (producer's component, else `comp-<rootId>`), GLOBAL
+  `robSize` via per-component `/internal/active` fan-out, `/api/state` +
+  `/api/events` aggregation, `/api/ws` hub (component DOs push events to
+  `/internal/emit`), config/reset fan-out.
+- `ArbTrunk` (`trunk-t14`, `src/trunk.ts`) — the ONE shared resource. All
+  `retire`/`moveBranch` calls from every component are serialized through
+  an in-memory promise queue (DO handlers interleave on `await`, so
+  single-threaded alone is not enough). Sole poller of `arb-trunk`; owns
+  the authoritative `trunk.commit` for aggregation.
+- `ReorderBuffer` (`comp-<rootId>`, `src/do.ts`) — one DO per connected
+  producer/consumer component. Retire effects call the `ArbTrunk` stub via
+  the `RetirerPort` interface; alarms poll only the component's own live
+  entry repos.
+
+`src/index.ts` routes `POST /api/trunk/init` to `ArbTrunk` (then informs the
+router), all other `/api/*` to `ArbRouter`, and queue push events by repo
+name: `arb-trunk` → `ArbTrunk.onPush`, `arb-e<seq>-*` → the owning
+component (`repoComp` table, `repoToEntryId` fallback). Unknown/stale repos
+(leftover after reset) are dropped.
+
+**`rob.ts` index maps** (`_internal.idx`, JSON-persisted, healed lazily):
+`byId`, `byRepo`, `childrenOf`, `pendingRepo`, monotone `headCursor`,
+`active` counter. `entries` stays sorted by seq (out-of-order global seqs
+splice in). `entry.create` accepts router-injected `id`/`seq`. Benchmark
+rerun — median per-event time went **flat** (was O(N) scans):
+
+| entries | before, median / p95 | after, median / p95 | scans/event |
+|---|---|---|---|
+| 1,000 | 29.6 µs / 92.3 µs | 2.1 µs / 19.3 µs | ~0 |
+| 10,000 | 393.6 µs / 1,462.6 µs | 2.4 µs / 18.8 µs | ~0 |
+| 100,000 | 16,208 µs / 55,220 µs | 2.7 µs / 23.3 µs | ~0 |
+
+Residual single-DO cost is now state serialization: 80 MB / ~732 ms
+`v8.serialize` at N=100k vs ~0.08 ms per 40-entry component state —
+the concrete argument for the DO split. Details in `bench/RESULTS.md`.
+
+**Live verification** (deployed version `8bfc389a-…`, all exit 0):
+
+- **main** — 59 s wall. `squashes=3 earlyCutoffs=2 retired=3 checksRun=4
+  pushesSeen=8 predictionHits=2 predictionMisses=1`, trunk retired=3.
+- **failing-check** — 62 s wall. Same shape, `checksRun=5` (failed run →
+  scripted fix → retired), trunk retired=3.
+- **multi** (new: orders `api→ui+tests` vs payments `api→ui`) — 80 s wall.
+  `squashes=3 earlyCutoffs=3 retired=5 checksRun=9 pushesSeen=11
+  predictionHits=2 predictionMisses=1`, trunk retired=5. Components
+  verified in `/api/state`: `e1,e3,e4 → comp-e1`, `e2,e5 → comp-e2`. e5
+  squashed exactly once by its own producer's breaking `charge` change;
+  payments retired `e2` BEFORE orders' `e1` — no cross-component
+  head-of-line blocking — while trunk mutations stayed serialized through
+  `ArbTrunk`. Squash-isolation checked from `/api/events`: every interface
+  squash pairs with a producer push in the same transitive root.
+
+**DO name/version notes.** `default-t11` is gone; fresh objects
+`router-t14` / `trunk-t14` / `comp-e*` mean no alarmed-object pinning on
+this deploy (the old zombie `default-t11` object may still poll — it is
+inert). `wrangler.toml` keeps migration v1 (`ReorderBuffer`) and adds v2
+(`ArbRouter`, `ArbTrunk`).
+
 ## Cloudflare resources created
 
-- Worker `arb-control-plane` (DO `ReorderBuffer`, migration v1 sqlite).
+- Worker `arb-control-plane` (DOs `ReorderBuffer` + `ArbRouter` + `ArbTrunk`,
+  migrations v1/v2 sqlite).
 - Queue `arb-push-events`; subscription `arb-ns-push-sub` (id
   `cd1aea7b12074b56921e44accc165019`, `--source artifacts --events repo.pushed
   --source-namespace arb`).
@@ -348,10 +427,10 @@ version `a1c784f2-456f-4920-a790-2de3277d7e3b`.
 - **DO version pinning:** a Durable Object with a continuously firing alarm
   (~3s cadence) stayed on the previous deployment *indefinitely* during T8
   (alarm keeps it warm; `/api/reset` didn't clear `trunk.repo` so the alarm
-  chain survived). Worked around by bumping `DO_NAME` in `src/index.ts`
-  (currently `default-t11` — each bump spawns a fresh object on the new
-  deployment; old objects become harmless zombie pollers). Before reverting
-  to `default`, make `/api/reset` clear `trunk.repo` so the alarm chain dies.
+  chain survived). Worked around by bumping the DO name on deploy — each
+  bump spawns a fresh object on the new deployment; old objects become
+  harmless zombie pollers. T14 renamed everything again (`router-t14`,
+  `trunk-t14`, `comp-e*` — the old `default-t11` may still poll inertly).
 - Persisted-state shape changes need the constructor's `_internal`
   forward-fill (`{...initialState()._internal, ...stored}`); without it an
   old stored object crashes new code paths (`repoAlias` bug, fixed).
@@ -375,7 +454,8 @@ version `a1c784f2-456f-4920-a790-2de3277d7e3b`.
 - Entries ignore ALL pushes while a fork/re-fork is pending (old repo, or a
   stale repo sharing the planned name); work pushed in that window must be
   redone on the new fork (T9c: tightened from old-repo-only).
-- Alarm keeps polling trunk forever while `trunk.repo` is set (by design);
-  disable via `POLL_FALLBACK=off`.
+- `ArbTrunk` keeps polling trunk forever while its repo is set (by design);
+  component alarms stop once all their entries retire. Disable via
+  `POLL_FALLBACK=off`.
 - Wrangler warns the `CompiledWasm` rule needs an explicit `fallthrough`;
   deploy succeeds regardless (default rule ignored is harmless here).

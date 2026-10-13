@@ -1,7 +1,10 @@
-// ReorderBuffer Durable Object: one instance ("default") owns the whole
-// buffer. It feeds commands into the pure machine (src/rob.ts), persists the
-// returned state, executes effects through ports (src/ports.ts), and
-// broadcasts ArbEvents to dashboard WebSockets (hibernation API).
+// ReorderBuffer Durable Object: ONE INSTANCE PER CONNECTED COMPONENT (T14).
+// The DO name is `comp-<rootEntryId>` (e.g. `comp-e1`); `ctx.id.name` is the
+// component key. It feeds commands into the pure machine (src/rob.ts),
+// persists the returned state, executes effects through ports (src/ports.ts)
+// and relays ArbEvents to the ArbRouter DO for /api/ws fan-in. Retirement
+// effects are delegated to the ArbTrunk DO, which serializes all trunk
+// mutations across components.
 
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -20,8 +23,11 @@ import {
 	realHasher,
 	type ArtifactsPort,
 	type Ports,
+	type RetirerPort,
 } from "./ports.ts";
-import { realRetirer, type ArtifactsBinding } from "./retire.ts";
+import { ROUTER_NAME } from "./router.ts";
+import { TRUNK_NAME, type ArbTrunk } from "./trunk.ts";
+import type { ArbRouter } from "./router.ts";
 
 function isAlreadyExists(e: unknown): boolean {
 	const code = (e as { code?: string })?.code;
@@ -29,7 +35,6 @@ function isAlreadyExists(e: unknown): boolean {
 	return code === "ALREADY_EXISTS" || /ALREADY_EXISTS|already exists/i.test(msg);
 }
 
-const TRUNK_REPO = "arb-trunk";
 const STATE_KEY = "state";
 const SEEN_REPO_KEY = "seenRepo";
 const TOKEN_TTL_S = 3600;
@@ -38,9 +43,22 @@ export interface Env {
 	ARTIFACTS: unknown;
 	LOADER: unknown;
 	ROB: DurableObjectNamespace<ReorderBuffer>;
+	ROUTER: DurableObjectNamespace<ArbRouter>;
+	TRUNK: DurableObjectNamespace<ArbTrunk>;
 	ASSETS?: Fetcher;
 	POLL_FALLBACK?: string;
 	POLL_INTERVAL_MS?: string;
+}
+
+/** The component DO's "retirer" is the shared ArbTrunk DO: every component
+ * calls the same object, which serializes all trunk mutations (the trunk is
+ * the single shared resource across shards). */
+function stubRetirer(env: Env): RetirerPort {
+	const stub = () => env.TRUNK.get(env.TRUNK.idFromName(TRUNK_NAME));
+	return {
+		retire: (args) => stub().retire(args),
+		moveBranch: (args) => stub().moveBranch(args),
+	};
 }
 
 interface EffectResults {
@@ -62,7 +80,7 @@ export class ReorderBuffer extends DurableObject<Env> {
 			artifacts: realArtifacts(env.ARTIFACTS as Parameters<typeof realArtifacts>[0]),
 			hasher: realHasher(),
 			checker: realChecker({ ARTIFACTS: env.ARTIFACTS, LOADER: env.LOADER }),
-			retirer: realRetirer(env.ARTIFACTS as ArtifactsBinding),
+			retirer: stubRetirer(env),
 		};
 		ctx.blockConcurrencyWhile(async () => {
 			this.state = (await ctx.storage.get<RobState>(STATE_KEY)) ?? initialState();
@@ -90,8 +108,10 @@ export class ReorderBuffer extends DurableObject<Env> {
 	}
 
 	private hasPollTargets(): boolean {
-		if (!this.state.trunk.repo) return false;
-		return true; // trunk alone is worth polling for its first commit
+		// Only live entries keep this component's alarm alive: a fully retired
+		// or freshly reset component goes dormant (no zombie pollers — see
+		// NOTES "DO version pinning"). The trunk repo is polled by ArbTrunk.
+		return this.state.entries.some((e) => e.status !== "retired" && e.status !== "vetoed");
 	}
 
 	private async ensureAlarm(): Promise<void> {
@@ -112,6 +132,36 @@ export class ReorderBuffer extends DurableObject<Env> {
 			} catch {
 				// socket died between getWebSockets and send; hibernation cleans up
 			}
+		}
+		// Relay to the router DO, which fans the event into the shared /api/ws.
+		this.ctx.waitUntil(this.emitToRouter(ev));
+	}
+
+	private async emitToRouter(ev: ArbEvent): Promise<void> {
+		try {
+			const stub = this.env.ROUTER.get(this.env.ROUTER.idFromName(ROUTER_NAME));
+			await stub.fetch("https://router/internal/emit", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(ev),
+			});
+		} catch (e) {
+			console.error("emit to router failed", e);
+		}
+	}
+
+	/** Tell the router which component owns a repo so queue pushes route here. */
+	private async registerRepo(repo: string): Promise<void> {
+		try {
+			const stub = this.env.ROUTER.get(this.env.ROUTER.idFromName(ROUTER_NAME));
+			await stub.fetch("https://router/internal/registerRepo", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ repo, component: this.ctx.id.name }),
+			});
+		} catch (e) {
+			// Non-fatal: the alarm poll still detects pushes (at poll cadence).
+			console.error("registerRepo failed", e);
 		}
 	}
 
@@ -178,7 +228,10 @@ export class ReorderBuffer extends DurableObject<Env> {
 						exports,
 						sigs,
 					});
-					if (r.ok) queue.push(...r.effects);
+					if (r.ok) {
+						this.ctx.waitUntil(this.registerRepo(created.name));
+						queue.push(...r.effects);
+					}
 					break;
 				}
 				case "check": {
@@ -267,11 +320,11 @@ export class ReorderBuffer extends DurableObject<Env> {
 		await this.processPush(repo, commit);
 	}
 
-	/** Alarm fallback: poll active repos' heads (spike 2b pattern). */
+	/** Alarm fallback: poll this component's live entry repos (the trunk repo
+	 * belongs to ArbTrunk, not this object). */
 	async alarm(): Promise<void> {
 		try {
 			const targets: Array<{ repo: string; known: string | null }> = [];
-			if (this.state.trunk.repo) targets.push({ repo: this.state.trunk.repo, known: this.state.trunk.commit });
 			for (const e of this.state.entries) {
 				if (e.repo && !this.state._internal.pending[e.id] && e.status !== "retired" && e.status !== "vetoed") {
 					targets.push({ repo: e.repo, known: e.headCommit });
@@ -300,8 +353,31 @@ export class ReorderBuffer extends DurableObject<Env> {
 			new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 		try {
-			if (request.method === "POST" && pathname === "/api/trunk/init") {
-				return json(await this.trunkInit());
+			// --- internal routes (ArbRouter fan-in / aggregation) -----------------
+			if (request.method === "GET" && pathname === "/internal/state") {
+				return json(publicState(this.state));
+			}
+			if (request.method === "GET" && pathname === "/internal/active") {
+				return json({ active: this.state._internal.idx?.active ?? this.state.entries.filter((e) => e.status !== "retired").length });
+			}
+			if (request.method === "GET" && pathname === "/internal/events") {
+				return json({ events: this.state._internal.eventLog });
+			}
+			if (request.method === "POST" && pathname === "/internal/reset") {
+				const r = this.applyCmd({ type: "reset" });
+				if (!r.ok) return json({ error: r.error }, r.status);
+				this.seenRepo = {};
+				await this.execEffects(r.effects);
+				await this.persist();
+				return json({ ok: true });
+			}
+			if (request.method === "POST" && pathname === "/internal/config") {
+				const body = (await request.json()) as { robSize?: number };
+				const r = this.applyCmd({ type: "config.set", robSize: body.robSize! });
+				if (!r.ok) return json({ error: r.error }, r.status);
+				await this.execEffects(r.effects);
+				await this.persist();
+				return json({ robSize: this.state.robSize });
 			}
 			if (request.method === "POST" && pathname === "/api/entries") {
 				const body = (await request.json()) as {
@@ -310,8 +386,26 @@ export class ReorderBuffer extends DurableObject<Env> {
 					producerId?: string;
 					consumes?: string[];
 					stub?: Record<string, string>;
+					/** Injected by ArbRouter: globally assigned identity + trunk
+					 * bootstrap for a (possibly fresh) component DO. */
+					id?: string;
+					seq?: number;
+					trunk?: { repo: string; remote: string; commit: string | null };
+					robSize?: number;
 				};
 				if (!body.agent || !body.lane) return json({ error: "agent and lane are required" }, 400);
+				// Component bootstrap: the router supplies trunk info + the global
+				// robSize on every create; a fresh component learns them here.
+				if (body.trunk && !this.state.trunk.repo) {
+					const t = this.applyCmd({ type: "trunk.init", repo: body.trunk.repo, remote: body.trunk.remote, commit: body.trunk.commit });
+					if (!t.ok) return json({ error: t.error }, t.status);
+					await this.execEffects(t.effects);
+				}
+				if (body.robSize && body.robSize !== this.state.robSize) {
+					const c = this.applyCmd({ type: "config.set", robSize: body.robSize });
+					if (!c.ok) return json({ error: c.error }, c.status);
+					await this.execEffects(c.effects);
+				}
 				// Declared-stub value prediction: hash the stub sources with the
 				// real hasher so predicted hashes match what a real push would
 				// produce (T11).
@@ -326,6 +420,8 @@ export class ReorderBuffer extends DurableObject<Env> {
 					producerId: body.producerId,
 					consumes: body.consumes,
 					stub,
+					id: body.id,
+					seq: body.seq,
 				});
 				if (!r.ok) return json({ error: r.error }, r.status);
 				const createdEv = r.effects.find(
@@ -373,31 +469,6 @@ export class ReorderBuffer extends DurableObject<Env> {
 				}
 				return json({ error: "method not allowed" }, 405);
 			}
-			if (request.method === "POST" && pathname === "/api/config") {
-				const body = (await request.json()) as { robSize?: number };
-				if (body.robSize === undefined) return json({ error: "robSize is required" }, 400);
-				const r = this.applyCmd({ type: "config.set", robSize: body.robSize });
-				if (!r.ok) return json({ error: r.error }, r.status);
-				await this.execEffects(r.effects);
-				await this.persist();
-				return json({ robSize: this.state.robSize });
-			}
-			if (request.method === "GET" && pathname === "/api/state") {
-				return json(publicState(this.state));
-			}
-			if (request.method === "GET" && pathname === "/api/events") {
-				// Debug/measurement aid (not in the contract): the internal
-				// ArbEvent log with server timestamps.
-				return json({ events: this.state._internal.eventLog });
-			}
-			if (request.method === "POST" && pathname === "/api/reset") {
-				const r = this.applyCmd({ type: "reset" });
-				if (!r.ok) return json({ error: r.error }, r.status);
-				this.seenRepo = {};
-				await this.execEffects(r.effects);
-				await this.persist();
-				return json({ ok: true });
-			}
 			return json({ error: "not found" }, 404);
 		} catch (e) {
 			return json({ error: String(e instanceof Error ? e.message : e) }, 500);
@@ -420,28 +491,5 @@ export class ReorderBuffer extends DurableObject<Env> {
 
 	async webSocketError(_ws: WebSocket, error: unknown): Promise<void> {
 		console.error("ws error", error);
-	}
-
-	// --- trunk init -------------------------------------------------------------
-
-	private async trunkInit(): Promise<{ repo: string; remote: string; token: string }> {
-		let remote: string;
-		let commit: string | null = null;
-		try {
-			remote = await this.ports.artifacts.getRemote(TRUNK_REPO);
-			commit = (await this.ports.artifacts.log(TRUNK_REPO, 1))[0]?.hash ?? null;
-		} catch {
-			const created = await this.ports.artifacts.create(TRUNK_REPO, {
-				setDefaultBranch: "main",
-				description: "ARB trunk",
-			});
-			remote = created.remote;
-		}
-		const r = this.applyCmd({ type: "trunk.init", repo: TRUNK_REPO, remote, commit });
-		if (!r.ok) throw new Error(r.error);
-		await this.execEffects(r.effects);
-		const token = await this.ports.artifacts.token(TRUNK_REPO, TOKEN_TTL_S);
-		await this.persist();
-		return { repo: TRUNK_REPO, remote, token };
 	}
 }

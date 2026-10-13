@@ -24,9 +24,21 @@ namespace = "arb"
 name = "ROB"
 class_name = "ReorderBuffer"
 
+[[durable_objects.bindings]]
+name = "ROUTER"
+class_name = "ArbRouter"
+
+[[durable_objects.bindings]]
+name = "TRUNK"
+class_name = "ArbTrunk"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ReorderBuffer"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ArbRouter", "ArbTrunk"]
 
 [[queues.consumers]]
 queue = "arb-push-events"

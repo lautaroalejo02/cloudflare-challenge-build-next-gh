@@ -63,3 +63,61 @@ In a synthetic, in-process benchmark of the pure state machine (no network, no D
 - Timings are single-process wall clock on a laptop with GC noise; the 10k and 100k single-mode figures come from 2,500 and 1,200 events, and p95 at 100k comes from only dozens of events per kind.
 - Different kinds appear in different proportions per mode and size, so compare the "ALL" rows loosely and the per-kind rows precisely.
 - Sharded runs retire fewer entries at large N because each shard has its own head and each receives few events.
+
+---
+
+# T14 rerun: same benchmark after index maps landed in `src/rob.ts`
+
+Same harness, same workload, same machine, ~2 minute run. `src/rob.ts` now
+maintains `RobIndexes` (`byId`, `byRepo`, `childrenOf`, `pendingRepo`,
+`headCursor`, `active`, `lastSeq`) inside `_internal`, persisted as plain
+JSON objects and rebuilt lazily when `entries.length` changed outside the
+machine. `head()` is a monotone cursor, `find()` is `byId` + binary search on
+the seq-sorted array, the squash/push child scans go through `childrenOf`,
+and `entry.create` splices into sorted position instead of pushing.
+
+## Per-event cost after indexes (median / p95 us)
+| N | single med | single p95 | single scan (mean) | sharded med | sharded p95 | sharded scan (mean) |
+|---|---|---|---|---|---|---|
+| 1,000 | 2.1 | 19.3 | 0 | 2.1 | 12.0 | 0 |
+| 10,000 | 2.4 | 18.8 | 0 | 3.4 | 51.0 | 2 |
+| 100,000 | 2.7 | 23.3 | 0 | 62.5 | 112.7 | 29 |
+
+Before/after for the single-buffer ALL median: 29.6 -> 2.1 us (N=1k),
+393.6 -> 2.4 us (N=10k), 16,208 -> 2.7 us (N=100k). Scans per event went
+from ~2N to ~0 in single mode: the linear scans the T12 table blamed are
+gone. Per-kind medians at N=100k single: `check.done` 1.5, `push.iface`
+25.7, `retire.done` 1.1 (all us).
+
+Squash fan-out is unchanged (oracle: 0 mismatches, 0 containment violations
+across all 3,803 pushed events in this run too); the `squashTree` work now
+scales with the dependency subtree only.
+
+## What still scales badly in single mode, and what does not
+- Per-event CPU is now flat in N (~2-3 us medians at every N). The residual
+  20-145 us on `push.iface` is the cascade/fan-out work itself, which is
+  proportional to the squash count (3-39 in this workload), not N.
+- State size and (de)serialization are NOT flat: the single state is
+  0.69 / 7.43 / 80.07 MB and `v8.serialize` of it costs
+  3.7 / 52 / 732 ms at N = 1k / 10k / 100k, on every `persist()`. Sharded
+  states serialize in 0.24 / 0.14 / 0.08 ms each. This, not apply() CPU, is
+  now the single-DO bottleneck — and the reason T14 still shards.
+- Sharded medians at N=100k rose to 62.5 us (vs 17.2 before indexes). Same
+  caveat as before applies: one-process simulation locality, not algorithmic
+  growth (mean scans 29 in 40-entry shards; the residual scan is the small
+  `filter(live)` on the ~40-entry children list). The `BENCH_HOT` control was
+  not re-run this time.
+- `head()`/`find(last)` isolated on the built states: single 23.1/16.5 us
+  (1k), 294.6/141.9 us (10k), 14,736/10,044 us (100k) vs sharded ~1/0.5 us —
+  but in the new code these helper shapes only run inside `ensureIdx`
+  rebuilds, not per event.
+
+## Updated scale story
+Index maps removed the O(N) per-event cost from the pure machine: a single
+buffer now processes events in ~2-3 us median at every measured N, and every
+push still squashed exactly the oracle's dependent set (0/3,803 mismatches).
+What does not scale is the single DO's serialized state: 80 MB / ~0.7 s
+serialize at N=100k. One DO per connected component bounds both the CPU and
+the persisted state by component size (40-entry shards serialize in <0.25 ms).
+Cross-component dependencies, routing overhead, and real Durable Object
+latency remain unmeasured — see the live-scenario numbers in NOTES.md.
