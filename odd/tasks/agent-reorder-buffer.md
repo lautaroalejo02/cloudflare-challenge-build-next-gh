@@ -98,7 +98,21 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
   - Parent found a deploy-blocking issue: footage over 25 MiB inside the assets dir breaks `wrangler deploy` (confirmed by dry-run). Fixed with `app/dashboard/.assetsignore` (commit `ae8d957`): the dry-run fails without it and passes with it.
   - Tagged `demo-stable-3`.
 - [ ] T18 (D) Fresh clone from GitHub, following the README literally (no credentials); docs sync with T17. Dispatched.
-- [ ] R1 (D, read-only) Independent Opus review of the control-plane core and submission risks (incl. the public `/api/reset`). Dispatched.
+- [x] R1 (D, read-only) Independent Opus review. 0 critical, 4 high, 5 medium, 3 low; `npm test` 54/54.
+  - Core verified sound: checks always run on the exact landing commit; P/Q use the right base; never a textual merge; in-order within a component.
+  - High:
+    - unauthenticated destructive and token endpoints;
+    - transient infra failures treated as permanent check failures;
+    - a failed effect wedges the component;
+    - a lost squash when the producer pushes during the consumer's in-flight fork (reproduced).
+  - Medium:
+    - a veto during retire is overridden (reproduced);
+    - a push during retire desyncs trunk and buffer;
+    - splice disjointness misses file/dir conflicts (reproduced);
+    - the one-shot re-fork token;
+    - out-of-order push handling;
+    - ops: alarm pinning, `-xN` collisions.
+- [ ] T19 (D) Fix the R1 findings with regression tests; admin-key auth; deploy; live main / failing-check / multi x3. Dispatched to SWE-2 max with a rollback safety net to `demo-stable-3` (`odd/prompts/T19-review-fixes.md`).
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
 Route declaration: T2-T7 are delegated because each package is non-trivial and the six run in parallel in disjoint directories. That is the writer trigger plus the user's explicit request to use many Devin agents. T8 and T9 each go to one writer, because they touch multiple packages.
