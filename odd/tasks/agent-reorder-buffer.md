@@ -60,7 +60,7 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
   - Writer evidence: live main scenario ~38 s; failing-check exercised a real failed check, then the fix, then a splice retirement (`arb: splice 7c42bc81 onto f4a406a3`). Timings: push to squash ~1.7 s, refork 2.3-4.5 s, checks 90-187 ms, fast-forward ~510 ms, splice 1085 ms.
   - Parent spot check: `npm test` (control-plane) gave 26/26. The parent ran the live main scenario: exit 0, 3/3 retired in order, squashes 2, early cutoffs 2 (log `odd/logs/parent-e2e.txt`, gitignored).
   - Defects found by the parent: (a) the process hangs until the 5-min timeout after completion (311 s wall vs 40.5 s timeline); (b) in gen 1 the tests agent reported 'nothing to commit - already on base' and retired with head == API head, likely because stale clone dirs are reused across runs. These were sent to T9c.
-- [ ] T9 (D) Demo hardening, split into parallel writers on disjoint surfaces:
+- [x] T9 (D) Demo hardening, split into parallel writers on disjoint surfaces:
   - [x] T9c: fix the hang, the stale clones and the honest squash-latency stat; redeploy; capture live dashboard screenshots. Commits `47fc190`, `3c2a186`.
     - Root cause: `arb-trunk` survives `/api/reset`, so stale retired files leaked into new seeds. Clone dirs are now run-unique, and the buffer ignores pushes during a pending re-fork (regression test added).
     - Parent spot check: re-ran the live main scenario; exit 0, process exits ~4 s after completion (66 s wall vs 61.7 s timeline), e3 head `a779ae21` != e1 head `8e557ad1`. The live squash screenshot was reviewed.
