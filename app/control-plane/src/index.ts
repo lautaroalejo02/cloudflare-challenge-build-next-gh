@@ -13,7 +13,7 @@ interface RepoPushedEvent {
 
 // DO id: bump to spawn a fresh object on new code. The previous object keeps
 // running on the old version while its alarm stays warm (read-only repo polls).
-const DO_NAME = "default-t8g";
+const DO_NAME = "default-t11";
 
 export default {
 	async fetch(request, env): Promise<Response> {

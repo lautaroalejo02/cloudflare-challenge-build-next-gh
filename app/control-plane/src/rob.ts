@@ -16,7 +16,7 @@ export type EntryStatus =
 	| "vetoed";
 
 export interface Diagnosis {
-	reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap";
+	reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap" | "prediction-miss";
 	changed: Array<{
 		symbol: string;
 		oldHash: string;
@@ -48,6 +48,10 @@ export interface Entry {
 	headCommit: string | null;
 	exports: SymbolHashes;
 	consumes: SymbolHashes;
+	/** Symbols whose `exports` values are unconfirmed stub predictions
+	 * (declared at registration). Cleared when the entry's first real push
+	 * resolves them against reality. */
+	predicted: string[];
 	generation: number;
 	diagnosis: Diagnosis | null;
 	checks: CheckResult | null;
@@ -63,6 +67,11 @@ export interface BufferState {
 		retired: number;
 		checksRun: number;
 		pushesSeen: number;
+		/** (consumer, symbol) pairs where the producer's declared stub matched
+		 * the first real push. */
+		predictionHits: number;
+		/** (consumer, symbol) pairs where reality diverged from the stub. */
+		predictionMisses: number;
 	};
 }
 
@@ -78,6 +87,8 @@ export interface ArbEvent {
 		| "check.started"
 		| "check.passed"
 		| "check.failed"
+		| "prediction.hit"
+		| "prediction.miss"
 		| "retired"
 		| "veto"
 		| "config"
@@ -108,6 +119,11 @@ export interface RobInternal {
 	/** Planned repo name -> actual name when a fork had to use a suffix
 	 * (name collision with a repo left over from before a reset). */
 	repoAlias: Record<string, string>;
+	/** Consumer entryId -> consumed symbols pinned to the producer's declared
+	 * stub hash at registration. Pinned consumes survive the consumer's own
+	 * fork.done (the fork carries the pre-push base) and are released when the
+	 * producer's first push resolves its predictions. */
+	predConsumed: Record<string, string[]>;
 	/** Bounded event log for debugging. */
 	eventLog: ArbEvent[];
 }
@@ -121,7 +137,15 @@ export function initialState(): RobState {
 		trunk: { repo: "", commit: null, retiredCount: 0 },
 		robSize: 8,
 		entries: [],
-		stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0 },
+		stats: {
+			squashes: 0,
+			earlyCutoffs: 0,
+			retired: 0,
+			checksRun: 0,
+			pushesSeen: 0,
+			predictionHits: 0,
+			predictionMisses: 0,
+		},
 		_internal: {
 			sigs: {},
 			pending: {},
@@ -131,6 +155,7 @@ export function initialState(): RobState {
 			retireStart: {},
 			seenPushes: [],
 			repoAlias: {},
+			predConsumed: {},
 			eventLog: [],
 		},
 	};
@@ -146,7 +171,16 @@ export function publicState(state: RobState): BufferState {
 
 export type Cmd =
 	| { type: "trunk.init"; repo: string; remote: string; commit: string | null }
-	| { type: "entry.create"; agent: string; lane: string; producerId?: string; consumes?: string[] }
+	| {
+			type: "entry.create";
+			agent: string;
+			lane: string;
+			producerId?: string;
+			consumes?: string[];
+			/** Declared-stub prediction: the producer's intended exported
+			 * interface, already hashed by the interpreter. */
+			stub?: { exports: SymbolHashes; sigs: SymbolSignatures };
+	  }
 	| {
 			type: "fork.done";
 			entryId: string;
@@ -355,6 +389,21 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			}
 			const seq = state.entries.reduce((m, e) => Math.max(m, e.seq), 0) + 1;
 			const id = `e${seq}`;
+			// Value prediction: a consumer of a stubbed producer records the
+			// PREDICTED hash (what it forwards against), not the fork's base
+			// content. Pinned symbols are kept in _internal.predConsumed until
+			// the producer's first push resolves them.
+			const producerPredicted = producer?.predicted ?? [];
+			const consumes: SymbolHashes = {};
+			const pinned: string[] = [];
+			for (const s of cmd.consumes ?? []) {
+				if (producer && producerPredicted.includes(s)) {
+					consumes[s] = producer.exports[s] ?? "";
+					pinned.push(s);
+				} else {
+					consumes[s] = "";
+				}
+			}
 			const entry: Entry = {
 				id,
 				seq,
@@ -366,20 +415,32 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				producerId: cmd.producerId ?? null,
 				baseCommit: "",
 				headCommit: null,
-				exports: {},
-				consumes: Object.fromEntries((cmd.consumes ?? []).map((s) => [s, ""])),
+				exports: cmd.stub ? { ...cmd.stub.exports } : {},
+				consumes,
+				predicted: cmd.stub ? Object.keys(cmd.stub.exports) : [],
 				generation: 0,
 				diagnosis: null,
 				checks: null,
 			};
 			state.entries.push(entry);
+			if (pinned.length) state._internal.predConsumed[id] = pinned;
+			if (cmd.stub) state._internal.sigs[id] = { ...cmd.stub.sigs };
 			const fromRepo = producer ? producer.repo : state.trunk.repo;
 			const repo = forkEffect(state, effects, entry, fromRepo);
 			entry.repo = repo;
 			emit(state, effects, now, {
 				type: "entry.created",
 				entryId: id,
-				data: { agent: entry.agent, lane: entry.lane, seq, producerId: entry.producerId, repo },
+				data: {
+					agent: entry.agent,
+					lane: entry.lane,
+					seq,
+					producerId: entry.producerId,
+					repo,
+					exports: entry.exports,
+					consumes: entry.consumes,
+					predicted: entry.predicted,
+				},
 			});
 			break;
 		}
@@ -392,10 +453,28 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			e.remote = cmd.remote;
 			e.baseCommit = cmd.baseCommit;
 			e.headCommit = cmd.baseCommit;
-			e.exports = cmd.exports;
-			state._internal.sigs[e.id] = cmd.sigs ?? {};
+			// A stubbed producer's fork carries its pre-push base: keep the
+			// declared (predicted) hashes and signatures for predicted symbols
+			// until the first real push resolves them against reality.
+			if (e.predicted.length) {
+				const keep: SymbolHashes = {};
+				const keepSig: SymbolSignatures = {};
+				const curSigs = state._internal.sigs[e.id] ?? {};
+				for (const sym of e.predicted) {
+					keep[sym] = e.exports[sym];
+					keepSig[sym] = curSigs[sym] ?? "";
+				}
+				e.exports = { ...cmd.exports, ...keep };
+				state._internal.sigs[e.id] = { ...(cmd.sigs ?? {}), ...keepSig };
+			} else {
+				e.exports = cmd.exports;
+				state._internal.sigs[e.id] = cmd.sigs ?? {};
+			}
+			// Consumes pinned to a producer's stub prediction keep the declared
+			// hash, not the fork's (pre-push) content; unpinned ones fill in.
+			const pinned = new Set(state._internal.predConsumed[e.id] ?? []);
 			for (const sym of Object.keys(e.consumes)) {
-				e.consumes[sym] = cmd.exports[sym] ?? e.consumes[sym];
+				if (!pinned.has(sym)) e.consumes[sym] = cmd.exports[sym] ?? e.consumes[sym];
 			}
 			const planned = state._internal.pending[e.id];
 			if (planned && planned !== cmd.repo) state._internal.repoAlias[planned] = cmd.repo;
@@ -443,8 +522,13 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				break;
 			}
 			target.headCommit = cmd.commit;
+			// Snapshot declared-stub predictions before the real push overwrites
+			// them; a push carrying hashes resolves them exactly once.
+			const predictedSyms = cmd.exports ? target.predicted.slice() : [];
+			const predSigs = { ...(state._internal.sigs[target.id] ?? {}) };
 			if (cmd.exports) target.exports = cmd.exports;
 			if (cmd.sigs) state._internal.sigs[target.id] = cmd.sigs;
+			if (predictedSyms.length) target.predicted = [];
 			target.diagnosis = null;
 			if (target.status === "squashed" || target.status === "failed" || target.status === "ready" || target.status === "checking") {
 				target.status = "speculating";
@@ -465,6 +549,79 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			for (const c of state.entries.filter((x) => live(x) && x.producerId === target.id)) {
 				const oldSigs = state._internal.sigs[c.id] ?? {};
 				const changed = consumedDiff(c.consumes, exports, oldSigs, sigs);
+				// Value prediction verdict: on the producer's first real push,
+				// each consumed symbol pinned to a declared-stub hash gets a
+				// hit/miss verdict instead of the ordinary diff bookkeeping.
+				const pinned = (state._internal.predConsumed[c.id] ?? []).filter((s) =>
+					predictedSyms.includes(s),
+				);
+				if (pinned.length) {
+					const missed: Diagnosis["changed"] = [];
+					for (const sym of pinned) {
+						const actual = exports[sym] ?? "";
+						if (c.consumes[sym] === actual) {
+							state.stats.predictionHits += 1;
+							emit(state, effects, now, {
+								type: "prediction.hit",
+								entryId: c.id,
+								data: { producerId: target.id, symbol: sym, hash: actual, commit: cmd.commit },
+							});
+						} else {
+							state.stats.predictionMisses += 1;
+							missed.push({
+								symbol: sym,
+								oldHash: c.consumes[sym],
+								newHash: actual,
+								oldSignature: predSigs[sym] ?? "",
+								newSignature: sigs[sym] ?? "",
+							});
+							emit(state, effects, now, {
+								type: "prediction.miss",
+								entryId: c.id,
+								data: {
+									producerId: target.id,
+									symbol: sym,
+									predictedHash: c.consumes[sym],
+									actualHash: actual,
+									predictedSignature: predSigs[sym] ?? "",
+									actualSignature: sigs[sym] ?? "",
+									commit: cmd.commit,
+								},
+							});
+						}
+					}
+					delete state._internal.predConsumed[c.id];
+					if (missed.length) {
+						// Diagnose predicted-vs-actual for the missed symbols plus any
+						// other consumed drift in the same push (the miss wins the
+						// reason; the agent still sees every symbol that moved).
+						const diagChanged = missed.concat(changed.filter((d) => !pinned.includes(d.symbol)));
+						emit(state, effects, now, {
+							type: "hash.changed",
+							entryId: c.id,
+							data: { producerId: target.id, commit: cmd.commit, changed },
+						});
+						if (state._internal.pending[c.id]) {
+							c.diagnosis = { reason: "prediction-miss", changed: diagChanged, producerCommit: cmd.commit };
+							continue;
+						}
+						c.generation += 1;
+						c.status = "squashed";
+						c.diagnosis = { reason: "prediction-miss", changed: diagChanged, producerCommit: cmd.commit };
+						state.stats.squashes += 1;
+						const newRepo = forkEffect(state, effects, c, target.repo);
+						emit(state, effects, now, {
+							type: "squash",
+							entryId: c.id,
+							data: { reason: "prediction-miss", changed: diagChanged, generation: c.generation, repo: newRepo },
+						});
+						squashTree(state, effects, now, c, "producer-squashed", newRepo, exports, sigs, cmd.commit, undefined);
+						continue;
+					}
+					// All pinned symbols hit; any remaining diff is on symbols the
+					// stub never declared -> ordinary interface change below.
+					if (changed.length === 0) continue; // pure hit: not a cutoff
+				}
 				if (changed.length === 0) {
 					state.stats.earlyCutoffs += 1;
 					emit(state, effects, now, {

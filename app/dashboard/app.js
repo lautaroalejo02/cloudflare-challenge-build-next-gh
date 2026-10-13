@@ -32,6 +32,7 @@
       '<div class="statsbar" id="statsbar">' +
       '  <div class="stat"><span class="stat-num" id="s-squashes">0</span><span class="stat-label">squashes</span></div>' +
       '  <div class="stat"><span class="stat-num" id="s-cutoffs">0</span><span class="stat-label">early cutoffs</span></div>' +
+      '  <div class="stat"><span class="stat-num pred" id="s-pred">0 hit / 0 miss</span><span class="stat-label">stub predictions</span></div>' +
       '  <div class="stat"><span class="stat-num" id="s-retired">0</span><span class="stat-label">retired</span></div>' +
       '  <div class="stat"><span class="stat-num" id="s-checks">0</span><span class="stat-label">checks run</span></div>' +
       '  <div class="stat"><span class="stat-num" id="s-pushes">0</span><span class="stat-label">pushes seen</span></div>' +
@@ -76,6 +77,7 @@
       checksRun: document.getElementById('s-checks'),
       pushesSeen: document.getElementById('s-pushes')
     };
+    el.predStat = document.getElementById('s-pred');
     el.reforkT = document.getElementById('s-reforkt');
 
     el.robsize.addEventListener('input', function () {
@@ -121,6 +123,7 @@
     Object.keys(el.stats).forEach(function (k) {
       el.stats[k].textContent = state.stats[k];
     });
+    el.predStat.textContent = state.stats.predictionHits + ' hit / ' + state.stats.predictionMisses + ' miss';
     var rf = A.reforkTiming(state);
     el.reforkT.textContent = !rf ? '—' : (rf.deltaMs / 1000).toFixed(1) + ' s';
     if (document.activeElement !== el.robsize) {
@@ -197,15 +200,27 @@
     track += '</div>';
 
     var fwd = '';
+    var prod = e.producerId ? A.findEntry(state, e.producerId) : null;
     Object.keys(e.consumes).forEach(function (sym) {
-      fwd += '<span class="tag fwd" title="' + esc(e.consumes[sym]) + '">' +
+      // Forwarded against the producer's DECLARED stub while predicted[] holds
+      // it; the verdict tick lands on the row when the first real push scores it.
+      var isPred = !!(prod && prod.predicted && prod.predicted.indexOf(sym) >= 0);
+      var tick = e._predTicks && e._predTicks[sym];
+      fwd += '<span class="tag fwd' + (isPred ? ' pred' : '') + '" title="' + esc(e.consumes[sym]) +
+        (isPred ? ' · predicted from declared stub — unconfirmed' : '') + '">' +
         'forwarded: ' + esc(sym) + '<b>' + h4(e.consumes[sym]) + '</b>' +
-        (e.producerId ? '<i>← ' + esc(e.producerId) + '</i>' : '') + '</span>';
+        (e.producerId ? '<i>← ' + esc(e.producerId) + '</i>' : '') +
+        (isPred ? '<i class="pred-mark">≈ stub</i>' : '') +
+        (tick ? '<i class="pred-tick ' + tick + '">' + (tick === 'hit' ? '✓ hit' : '✗ miss') + '</i>' : '') +
+        '</span>';
     });
 
     var exp = '';
     Object.keys(e.exports).forEach(function (sym) {
-      exp += '<span class="tag exp" title="' + esc(e.exports[sym]) + '">' + esc(sym) + '<b>' + h4(e.exports[sym]) + '</b></span>';
+      var isPred = e.predicted && e.predicted.indexOf(sym) >= 0;
+      exp += '<span class="tag exp' + (isPred ? ' pred' : '') + '" title="' + esc(e.exports[sym]) +
+        (isPred ? ' · declared stub — unconfirmed' : '') + '">' +
+        esc(sym) + '<b>' + h4(e.exports[sym]) + '</b>' + (isPred ? '<i class="pred-mark">≈</i>' : '') + '</span>';
     });
 
     var diag = '';
@@ -214,7 +229,8 @@
         'interface-changed': 'interface changed',
         'producer-vetoed': 'producer vetoed',
         'producer-squashed': 'producer squashed',
-        'trunk-overlap': 'trunk overlap'
+        'trunk-overlap': 'trunk overlap',
+        'prediction-miss': 'stub prediction miss'
       };
       var reason = reasons[e.diagnosis.reason] || e.diagnosis.reason || 'squashed';
       var baseLabel = e.diagnosis.reason === 'trunk-overlap' ? 'trunk' : 'producer';

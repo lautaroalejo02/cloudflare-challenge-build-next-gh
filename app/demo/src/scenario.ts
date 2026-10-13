@@ -4,7 +4,7 @@ import { ApiClient } from "./lib/http.ts";
 import { authUrl, cloneRepo, commitAll, git, hasChanges, head, push } from "./lib/git.ts";
 import { syncFixture } from "./lib/fixture.ts";
 import { createTimeline, scoped } from "./lib/timeline.ts";
-import { startApiAgent } from "./agents/api.ts";
+import { ORDER_STUB, startApiAgent } from "./agents/api.ts";
 import { startUiAgent } from "./agents/ui.ts";
 import { startTestsAgent } from "./agents/tests.ts";
 
@@ -80,15 +80,23 @@ async function main(): Promise<void> {
   log(`trunk init: ${trunk.repo} ${trunk.remote}`);
   await pushFixture(trunk.remote, trunk.token, log);
 
-  // Delay the producer's refactor push until both consumers exist: the early
-  // cutoff is counted per live consumer at push-detection time, and the live
-  // plane's fork+hash in createEntry takes a few seconds.
-  const apiH = startApiAgent({ api, workRoot: WORK_ROOT, log: scoped(tl, "api"), firstPushDelayMs: 6000 });
+  // Value prediction (T11): the API agent declares its stub at registration;
+  // the consumers register immediately and forward against the declared
+  // hashes. The producer's first push is delayed until both consumers exist —
+  // verdicts (hit/miss) are resolved per live consumer at push-detection time.
+  const apiH = startApiAgent({
+    api,
+    workRoot: WORK_ROOT,
+    log: scoped(tl, "api"),
+    firstPushDelayMs: 9000,
+    breakingChangeDelayMs: 12_000,
+    stub: { "src/api/order.ts": ORDER_STUB },
+  });
   const apiId = await apiH.entryId;
-  tl("scenario", `api entry is ${apiId}; staggering consumer registrations`);
-  await sleep(2000);
+  tl("scenario", `api entry is ${apiId}; consumers register against the declared stub`);
+  await sleep(1500);
   const uiH = startUiAgent({ api, workRoot: WORK_ROOT, log: scoped(tl, "ui"), producerId: apiId });
-  await sleep(2000);
+  await sleep(1500);
   const testsH = startTestsAgent({
     api,
     workRoot: WORK_ROOT,
@@ -98,7 +106,7 @@ async function main(): Promise<void> {
   });
 
   const lastStatus = new Map<string, string>();
-  const lastStats = { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0 };
+  const lastStats = { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0 };
   const watcher = setInterval(() => {
     api
       .state()

@@ -44,6 +44,7 @@ export class ApiClient {
     lane: string;
     producerId?: string;
     consumes?: string[];
+    stub?: Record<string, string>;
   }): Promise<{ entry: Entry; token: string }> {
     return this.req("POST", "/api/entries", body);
   }

@@ -74,6 +74,7 @@ b { font-weight: 700; }
 .stat:nth-child(1) .stat-num { color: var(--red); }
 .stat:nth-child(2) .stat-num { color: var(--amber); }
 .stat:nth-child(3) .stat-num { color: var(--green); }
+.stat-num.pred { font-size: 15px; color: var(--amber); line-height: 26px; }
 .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--dim); }
 .controls {
   margin-left: auto; display: flex; align-items: center; gap: 10px;
@@ -174,6 +175,12 @@ b { font-weight: 700; }
 .tag.fwd { color: var(--amber); border-color: #4a3a1a; background: #1c1608; }
 .tag.fwd i { font-style: normal; color: var(--dim); margin-left: 5px; }
 .tag.exp { color: var(--blue); border-color: #1d3350; background: #0d1622; }
+.tag.pred { border-style: dashed; border-color: var(--amber); }
+.tag.pred b { color: var(--amber); }
+.pred-mark { font-style: normal; color: var(--amber); font-size: 10px; margin-left: 4px; letter-spacing: .04em; }
+.pred-tick { font-style: normal; font-size: 10px; margin-left: 5px; font-weight: 700; letter-spacing: .04em; }
+.pred-tick.hit { color: var(--green); }
+.pred-tick.miss { color: var(--red); }
 .tag-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin-right: 2px; }
 .tag-sep { width: 10px; }
 
@@ -244,6 +251,8 @@ b { font-weight: 700; }
 .log-line.t-retired, .log-line.t-check\.passed { border-left-color: var(--green); color: #a9e8c9; }
 .log-line.t-hash\.unchanged { border-left-color: var(--amber); color: #e8cf9a; }
 .log-line.t-hash\.changed { border-left-color: var(--red); }
+.log-line.t-prediction\.hit { border-left-color: var(--amber); color: #e8cf9a; }
+.log-line.t-prediction\.miss { border-left-color: var(--red); color: #f0b6bd; font-weight: 600; }
 .log-line.t-entry\.created, .log-line.t-refork { border-left-color: var(--blue); }
 
 /* scrollbar */

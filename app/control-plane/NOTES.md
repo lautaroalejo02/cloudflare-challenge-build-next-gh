@@ -11,12 +11,13 @@ Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
   the DO. Internal bookkeeping (`_internal`: signature texts, in-flight
   forks, check/retire dedupe, push dedupe, event log) is persisted but
   stripped from `GET /api/state` via `publicState()`.
-- `test/` — 26 node:test cases (run with `node --experimental-strip-types`,
+- `test/` — 33 node:test cases (run with `node --experimental-strip-types`,
   Node 22.15): `rob.test.ts` state machine (forwarding, early cutoff, squash
   + diagnosis, transitive squash, in-order retirement, failing check +
   retry, robSize 409, veto + transitive dependents, veto non-head 409,
   reset, push dedupe/unknown-repo, pending-refork dedupe, splice/overlap
-  retire plan, stale-plan drop, no-op ready on squashed refork),
+  retire plan, stale-plan drop, no-op ready on squashed refork, declared-stub
+  value prediction),
   `splice.test.ts` pure path-disjoint decision, `retire.test.ts` git-level
   fast-forward/splice/already-on-trunk on `MemFs` + isomorphic-git.
 - `src/ports.ts` — port interfaces + real implementations:
@@ -156,6 +157,111 @@ Scenario timeline (trimmed, `--scenario failing-check`):
 [+  46.4s] [final ] all three retired in order
 ```
 
+## Value prediction (T11)
+
+**What:** `POST /api/entries` accepts `stub: Record<path,string>` —
+TypeScript sources declaring the entry's intended exported signatures. The
+DO hashes them with the real hasher (`do.ts`), so `entry.exports` starts as
+*predicted* hashes and `entry.predicted` lists the unconfirmed symbols.
+Consumers registering while `producer.predicted` is non-empty forward
+against the declared hashes (`consumes[sym]` = predicted; pinned in
+`_internal.predConsumed[consumerId]`). The producer's first push carrying
+real exports resolves each pinned symbol per consumer: match →
+`prediction.hit` + `predictionHits++`; diverge → `prediction.miss` +
+`predictionMisses++` and a squash with `reason: "prediction-miss"`
+(diagnosis carries predicted vs actual signatures; non-pinned drift in the
+same push is merged into the diagnosis). Later pushes are ordinary
+interface changes.
+
+**Mechanics (rob.ts):** `fork.done` keeps declared hashes/sigs for predicted
+symbols (the new fork carries pre-push base content) and keeps pinned
+consumes values instead of overwriting them with the fork's exports. On
+`push`, `predictedSyms`/`predSigs` are snapshotted before real exports
+overwrite `target.exports`/`predicted`; verdicts run per live consumer
+before the ordinary `consumedDiff` handling. A pure hit (all pins match,
+nothing else changed) counts as neither squash nor early cutoff. Prediction
+squashes go through `squashTree` like any squash, so dependents of a missed
+consumer cascade.
+
+**Demo:** the API agent registers `stub: {"src/api/order.ts": ORDER_STUB}`
+(v1 signatures with a throwing body). UI + Tests register ~1.5 s apart while
+`predicted` is still set, forwarding `createOrder`/`Order` (ui) and
+`createOrder` (tests) against the declared hashes. The first real push lands
+`createOrder` exactly as declared but adds `currency` to `Order` → e2 hits
+createOrder + misses Order (squashed `prediction-miss`, gen 1), e3 hits
+createOrder (keeps running). The scripted v2 breaking change then squashes
+both as `interface-changed`, as before. `--scenario failing-check` takes the
+same path.
+
+**Dashboard:** stats bar "stub predictions: X hit / Y miss"; producer export
+tags carry a dashed `≈` marker while `predicted` is non-empty; consumer
+forwarded tags show `≈ stub` while the producer's prediction is unconfirmed
+and `✓ hit`/`✗ miss` ticks once the verdict lands (ticks reset on refork);
+`PREDICTION HIT/MISS` lines in the event log; `mock.js` replays the full
+predicted → hit/miss → squash → cutoff → retire flow.
+
+**Tests:** `rob.test.ts` +7 cases (stub registration marks exports
+predicted, pinned consumes survive fork.done, hit/miss verdicts on the first
+push, miss → refork, a later push is an ordinary squash, post-resolution
+consumers see actuals, non-predicted changes unaffected). `agent.test.ts`
++1 full-run case asserting 2 hits / 1 miss and a `prediction-miss` squash
+against the mock control plane. `state.test.js` +3 cases (predicted field
+folding, push clears the marker, verdict ticks + stats) and mock-replay
+expectations updated (squashes 4, pushesSeen 8, hits 2 / miss 1).
+
+**Decisions:**
+- Stub hashing happens in `do.ts` (`hashInterface` over `body.stub`), keeping
+  `rob.ts` pure — same split as push hashing.
+- The demo stub declares the current v1 interface (the task's example), so
+  pinned hashes equal the fork base — the showcase is the declared-intent
+  bookkeeping: hits mean "delivered as promised", misses mean "reality
+  differed". A stub that declares a not-yet-existing interface works
+  identically (its predicted hash differs from base and still resolves on
+  the first push).
+- `entry.predicted` clears on the first push that carries `cmd.exports`; the
+  real plane hashes every entry push, so resolution is total. A declared
+  symbol the push never delivers yields `actualHash: ""` → a miss for any
+  consumer that pinned it.
+- `DO_NAME` bumped to `"default-t11"` for a fresh DO on deploy (warm-alarm
+  version pin — see Known gaps).
+
+**Contract issues:**
+- `POST /api/entries` gained `stub`; `Entry.predicted`,
+  `Diagnosis.reason = "prediction-miss"`, `stats.predictionHits/Misses`, and
+  `prediction.hit`/`prediction.miss` events were added to `app/CONTRACTS.md`
+  with changelog lines. Verdict events carry `entryId` = consumer +
+  `data.producerId` — same convention as `hash.changed`.
+- `entry.created` now emits `exports`, `consumes`, `predicted` in `data`
+  (previously `{agent, lane, seq, producerId, repo}` only) so the dashboard
+  can mark predicted exports before the first snapshot refresh.
+
+**Resources:** none new — same Worker / DO / queue / namespace. Deployed
+version `a1c784f2-456f-4920-a790-2de3277d7e3b`.
+
+**Known gaps:**
+- A consumer registering after the producer's first push sees actual exports
+  (no pin, no verdict) — by design.
+- Predictions resolve only on pushes that carry hashed exports; the real
+  plane always hashes entry pushes, so no unhashed-push path exists today.
+
+**Live (2026-10-13, deployed `arb-control-plane` @ a1c784f2):**
+- Main scenario: exit 0 in ~52 s. `predictionHits=2`,
+  `predictionMisses=1`, `squashes=3` (e2 prediction-miss + e2/e3
+  interface-changed), `earlyCutoffs=0`, `retired=3`, `checksRun=4`,
+  `pushesSeen=7`.
+- `--scenario failing-check`: exit 0 in ~50 s. Same verdicts; e3's scripted
+  failing check still blocked retirement until the fix (`checksRun=5`).
+- Re-run for screenshots: exit 0 in ~47 s, same stats.
+- Timeline (main run): api registers with stub +10.5 s → consumers +14.5 /
+  +15.7 s → first api push +21.8 s → verdicts + squash detected +24.3 s
+  (one poll tick) → e2 refork +26.1 s → breaking push +35.0 s → ordinary
+  squashes +36.9 s → all retired +51.6 s.
+- Screenshots: `app/dashboard/screenshots/live-predicted.png` (`≈` markers
+  on e1's predicted exports + `≈ stub` on e2's forwarded tags — consumers
+  running against the declared stub pre-push), `live-prediction.png`
+  (verdict moment: "1 hit / 1 miss" counter, e2 `✓ hit` / `✗ miss` ticks,
+  PREDICTION HIT/MISS log lines), `live-squash.png`, `live-final.png`.
+
 ## Cloudflare resources created
 
 - Worker `arb-control-plane` (DO `ReorderBuffer`, migration v1 sqlite).
@@ -243,9 +349,9 @@ Scenario timeline (trimmed, `--scenario failing-check`):
   (~3s cadence) stayed on the previous deployment *indefinitely* during T8
   (alarm keeps it warm; `/api/reset` didn't clear `trunk.repo` so the alarm
   chain survived). Worked around by bumping `DO_NAME` in `src/index.ts`
-  (`default-t8*` — each bump spawns a fresh object on the new deployment;
-  old objects become harmless zombie pollers). Before reverting to
-  `default`, make `/api/reset` clear `trunk.repo` so the alarm chain dies.
+  (currently `default-t11` — each bump spawns a fresh object on the new
+  deployment; old objects become harmless zombie pollers). Before reverting
+  to `default`, make `/api/reset` clear `trunk.repo` so the alarm chain dies.
 - Persisted-state shape changes need the constructor's `_internal`
   forward-fill (`{...initialState()._internal, ...stored}`); without it an
   old stored object crashes new code paths (`repoAlias` bug, fixed).

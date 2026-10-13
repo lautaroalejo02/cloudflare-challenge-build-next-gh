@@ -57,7 +57,13 @@ function trunked(commit = "t0"): RobState {
 /** Create an entry and complete its fork. Returns final state. */
 function created(
 	state: RobState,
-	opts: { agent: string; lane: string; producerId?: string; consumes?: string[] },
+	opts: {
+		agent: string;
+		lane: string;
+		producerId?: string;
+		consumes?: string[];
+		stub?: { exports: Record<string, string>; sigs: Record<string, string> };
+	},
 	base: { commit: string; exports?: Record<string, string>; sigs?: Record<string, string> },
 ): { state: RobState; id: string } {
 	const seq = state.entries.length + 1;
@@ -578,4 +584,249 @@ test("retire.planned: stale plan (entry no longer retiring) is dropped", () => {
 	const { state, effects } = runEff(s, { type: "retire.planned", entryId: "e1", candidate: "candX" });
 	assert.equal(state._internal.retireCandidate["e1"], undefined);
 	assert.equal(effects.filter((e) => e.type === "check").length, 0);
+});
+
+// --- T11: declared-stub value prediction -------------------------------------
+
+const STUB = {
+	exports: { createOrder: "hP", Order: "hO" },
+	sigs: { createOrder: "sigP", Order: "sigO" },
+};
+
+test("stub: producer exports are predicted at registration and survive the fork", () => {
+	let s = trunked();
+	let r = runEff(s, { type: "entry.create", agent: "api", lane: "api", stub: STUB });
+	s = r.state;
+	const e1 = entry(s, "e1");
+	assert.deepEqual(e1.exports, { createOrder: "hP", Order: "hO" });
+	assert.deepEqual(e1.predicted, ["createOrder", "Order"]);
+	const createdEv = broadcasts(r.effects, "entry.created")[0];
+	assert.deepEqual((createdEv.data as { predicted: string[] }).predicted, ["createOrder", "Order"]);
+
+	// The fork's actual (base) exports merge in; predicted symbols keep the
+	// declared hashes until the producer's first real push resolves them.
+	s = run(s, {
+		type: "fork.done",
+		entryId: "e1",
+		repo: "arb-e1-api-0",
+		remote: "https://x/e1",
+		baseCommit: "p0",
+		exports: { createOrder: "hBase", Order: "hBaseO", helper: "hx" },
+		sigs: { createOrder: "sigBase", Order: "sigBaseO", helper: "sigx" },
+	});
+	assert.equal(entry(s, "e1").exports.createOrder, "hP");
+	assert.equal(entry(s, "e1").exports.Order, "hO");
+	assert.equal(entry(s, "e1").exports.helper, "hx");
+	assert.deepEqual(entry(s, "e1").predicted, ["createOrder", "Order"]);
+});
+
+test("consumer forwards against predicted hashes before the producer pushes", () => {
+	let s = trunked();
+	let r = runEff(s, { type: "entry.create", agent: "api", lane: "api", stub: STUB });
+	s = r.state;
+	// Consumer registers while the producer fork is still in flight: its fork
+	// effect targets the producer's planned repo and its consumes pin the
+	// predicted hashes immediately (value prediction, not the base content).
+	r = runEff(s, {
+		type: "entry.create",
+		agent: "ui",
+		lane: "ui",
+		producerId: "e1",
+		consumes: ["createOrder", "Order"],
+	});
+	s = r.state;
+	assert.equal(entry(s, "e2").consumes.createOrder, "hP");
+	assert.equal(entry(s, "e2").consumes.Order, "hO");
+	assert.equal(forkEffects(r.effects)[0].fromRepo, "arb-e1-api-0");
+
+	s = run(s, {
+		type: "fork.done",
+		entryId: "e1",
+		repo: "arb-e1-api-0",
+		remote: "https://x/e1",
+		baseCommit: "p0",
+		exports: { createOrder: "hBase", Order: "hBaseO" },
+		sigs: { createOrder: "sigBase", Order: "sigBaseO" },
+	});
+	// The consumer's fork contains the producer's BASE, but its recorded
+	// consumes stay the predicted hashes it forwarded against.
+	s = run(s, {
+		type: "fork.done",
+		entryId: "e2",
+		repo: "arb-e2-ui-0",
+		remote: "https://x/e2",
+		baseCommit: "p0",
+		exports: { createOrder: "hBase", Order: "hBaseO" },
+		sigs: {},
+	});
+	assert.equal(entry(s, "e2").consumes.createOrder, "hP");
+	assert.equal(entry(s, "e2").consumes.Order, "hO");
+});
+
+/** Stubbed e1 (predicted createOrder=hP, Order=hO) with e2 consuming both and
+ * e3 consuming createOrder; all forks landed on base commit p0. */
+function predictedWorld(): RobState {
+	let s = trunked();
+	s = created(s, { agent: "api", lane: "api", stub: STUB }, {
+		commit: "p0",
+		exports: { createOrder: "hBase", Order: "hBaseO" },
+		sigs: { createOrder: "sigBase", Order: "sigBaseO" },
+	}).state;
+	s = created(s, { agent: "ui", lane: "ui", producerId: "e1", consumes: ["createOrder", "Order"] }, {
+		commit: "p0",
+		exports: { createOrder: "hBase", Order: "hBaseO" },
+	}).state;
+	s = created(s, { agent: "tests", lane: "tests", producerId: "e1", consumes: ["createOrder"] }, {
+		commit: "p0",
+		exports: { createOrder: "hBase", Order: "hBaseO" },
+	}).state;
+	return s;
+}
+
+test("first push resolves predictions: per-consumer hit/miss with stats and events", () => {
+	const s = predictedWorld();
+	// First real push: createOrder landed as declared (hit), Order diverged
+	// (miss — a field was added that the stub did not declare).
+	const r = runEff(s, {
+		type: "push",
+		repo: "arb-e1-api-0",
+		commit: "p1",
+		exports: { createOrder: "hP", Order: "hO2", helper: "hx" },
+		sigs: { createOrder: "sigP", Order: "sigO2", helper: "sigx" },
+	});
+	const evs = (t: string) => broadcasts(r.effects, t);
+
+	// e2 forwarded {createOrder, Order}: hit on createOrder, miss on Order.
+	const e2 = entry(r.state, "e2");
+	assert.equal(e2.status, "squashed");
+	assert.equal(e2.generation, 1);
+	assert.deepEqual(e2.diagnosis, {
+		reason: "prediction-miss",
+		changed: [
+			{ symbol: "Order", oldHash: "hO", newHash: "hO2", oldSignature: "sigO", newSignature: "sigO2" },
+		],
+		producerCommit: "p1",
+	});
+	// e3 forwarded {createOrder} only: pure hit, untouched.
+	assert.equal(entry(r.state, "e3").status, "speculating");
+	assert.equal(entry(r.state, "e3").diagnosis, null);
+
+	assert.equal(r.state.stats.predictionHits, 2);
+	assert.equal(r.state.stats.predictionMisses, 1);
+	assert.equal(r.state.stats.squashes, 1);
+	assert.equal(r.state.stats.earlyCutoffs, 0); // a hit is not a cutoff
+	assert.equal(evs("prediction.hit").length, 2);
+	assert.equal(evs("prediction.miss").length, 1);
+	const miss = evs("prediction.miss")[0];
+	assert.equal(miss.entryId, "e2");
+	const squash = evs("squash")[0];
+	assert.equal(squash.entryId, "e2");
+	assert.equal((squash.data as { reason: string }).reason, "prediction-miss");
+	// The producer's predictions are resolved by the first push.
+	assert.deepEqual(entry(r.state, "e1").predicted, []);
+
+	// Re-fork lands on the real head: consumes unpin and record the actuals.
+	const s2 = run(r.state, {
+		type: "fork.done",
+		entryId: "e2",
+		repo: "arb-e2-ui-1",
+		remote: "https://x/e2g1",
+		baseCommit: "p1",
+		exports: { createOrder: "hP", Order: "hO2" },
+	});
+	assert.equal(entry(s2, "e2").consumes.Order, "hO2");
+});
+
+test("predictions resolve once: later interface changes are ordinary squashes", () => {
+	let s = predictedWorld();
+	s = run(s, {
+		type: "push",
+		repo: "arb-e1-api-0",
+		commit: "p1",
+		exports: { createOrder: "hP", Order: "hO2" },
+		sigs: { createOrder: "sigP", Order: "sigO2" },
+	});
+	// Second push changes createOrder: ordinary interface-changed squash, not
+	// a prediction verdict.
+	const r = runEff(s, {
+		type: "push",
+		repo: "arb-e1-api-0",
+		commit: "p2",
+		exports: { createOrder: "hP2", Order: "hO2" },
+		sigs: { createOrder: "sigP2", Order: "sigO2" },
+	});
+	assert.equal(entry(r.state, "e3").status, "squashed");
+	assert.equal(entry(r.state, "e3").diagnosis!.reason, "interface-changed");
+	assert.equal(r.state.stats.predictionHits, 2); // p1: e2.createOrder + e3.createOrder; p2: none
+	assert.equal(r.state.stats.predictionMisses, 1);
+	assert.equal(broadcasts(r.effects, "prediction.miss").length, 0);
+	assert.equal(broadcasts(r.effects, "prediction.hit").length, 0);
+	// e3 squashes; e2 (mid-refork from its earlier prediction-miss) just gets
+	// the hash.changed notice and an updated diagnosis.
+	const changed = broadcasts(r.effects, "hash.changed");
+	assert.deepEqual(changed.map((e) => e.entryId).sort(), ["e2", "e3"]);
+	assert.equal(broadcasts(r.effects, "squash").length, 1);
+});
+
+test("consumer registering after resolution forwards actual, not predicted, hashes", () => {
+	let s = predictedWorld();
+	s = run(s, {
+		type: "push",
+		repo: "arb-e1-api-0",
+		commit: "p1",
+		exports: { createOrder: "hP", Order: "hO2" },
+	});
+	// e4 registers post-resolution: consumes fill from the fork's actuals.
+	let r = runEff(s, {
+		type: "entry.create",
+		agent: "docs",
+		lane: "docs",
+		producerId: "e1",
+		consumes: ["Order"],
+	});
+	s = r.state;
+	assert.equal(entry(s, "e4").consumes.Order, "");
+	s = run(s, {
+		type: "fork.done",
+		entryId: "e4",
+		repo: "arb-e4-docs-0",
+		remote: "https://x/e4",
+		baseCommit: "p1",
+		exports: { createOrder: "hP", Order: "hO2" },
+	});
+	assert.equal(entry(s, "e4").consumes.Order, "hO2");
+});
+
+test("non-predicted consumed symbol changing on the first push is an ordinary squash", () => {
+	let s = trunked();
+	// Stub predicts createOrder only; e2 also consumes unpredicted Order.
+	s = created(s, { agent: "api", lane: "api", stub: {
+		exports: { createOrder: "hP" },
+		sigs: { createOrder: "sigP" },
+	} }, {
+		commit: "p0",
+		exports: { createOrder: "hBase", Order: "hBaseO" },
+		sigs: { createOrder: "sigBase", Order: "sigBaseO" },
+	}).state;
+	s = created(s, { agent: "ui", lane: "ui", producerId: "e1", consumes: ["createOrder", "Order"] }, {
+		commit: "p0",
+		exports: { createOrder: "hBase", Order: "hBaseO" },
+		sigs: { createOrder: "sigBase", Order: "sigBaseO" },
+	}).state;
+
+	const r = runEff(s, {
+		type: "push",
+		repo: "arb-e1-api-0",
+		commit: "p1",
+		exports: { createOrder: "hP", Order: "hO2" },
+		sigs: { createOrder: "sigP", Order: "sigO2" },
+	});
+	const e2 = entry(r.state, "e2");
+	assert.equal(e2.status, "squashed");
+	assert.equal(e2.diagnosis!.reason, "interface-changed"); // not a prediction verdict
+	assert.equal(r.state.stats.predictionHits, 1);           // createOrder hit
+	assert.equal(r.state.stats.predictionMisses, 0);
+	assert.equal(broadcasts(r.effects, "prediction.hit").length, 1);
+	assert.equal(broadcasts(r.effects, "prediction.miss").length, 0);
+	assert.equal(broadcasts(r.effects, "squash").length, 1);
 });

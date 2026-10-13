@@ -7,7 +7,7 @@ import { startMockServer, type MockServer } from "../src/mock-server.ts";
 import { ApiClient } from "../src/lib/http.ts";
 import { authUrl, cloneRepo, commitAll, git, hasChanges, head, push } from "../src/lib/git.ts";
 import { detectCreateOrderVersion } from "../src/lib/signatures.ts";
-import { startApiAgent, ORDER_V2 } from "../src/agents/api.ts";
+import { startApiAgent, ORDER_STUB, ORDER_V2 } from "../src/agents/api.ts";
 import { startUiAgent } from "../src/agents/ui.ts";
 import { startTestsAgent } from "../src/agents/tests.ts";
 
@@ -110,6 +110,49 @@ test("main scenario: early cutoff then squash, generation bump and re-clone", { 
     assert.match(checkoutAtTrunk, /renderExpressCheckout/);
     const testAtTrunk = await git(["-C", trunkRepo, "show", "main:tests/create-order.feature.test.ts"]);
     assert.match(testAtTrunk, /EUR/);
+  } finally {
+    await mock.close();
+  }
+});
+
+test("prediction: stub consumers get hit/miss verdicts on the first real push", { timeout: 90_000 }, async () => {
+  const { api, mock, workRoot } = await boot("pred");
+  try {
+    await api.reset();
+    await pushFixture(api, workRoot);
+
+    const apiH = startApiAgent({
+      api,
+      workRoot,
+      log: noop,
+      pollMs: 120,
+      firstPushDelayMs: 400,
+      breakingChangeDelayMs: 1200,
+      stub: { "src/api/order.ts": ORDER_STUB },
+    });
+    const apiId = await apiH.entryId;
+    const uiH = startUiAgent({ api, workRoot, log: noop, producerId: apiId, pollMs: 120 });
+    const testsH = startTestsAgent({ api, workRoot, log: noop, producerId: apiId, pollMs: 120 });
+
+    const [a, u, t] = await Promise.all([apiH.done, uiH.done, testsH.done]);
+    assert.equal(a.status, "retired");
+    assert.equal(u.status, "retired");
+    assert.equal(t.status, "retired");
+
+    const s = await api.state();
+    // First push: createOrder lands exactly as declared (e2+e3 hit), Order
+    // gains an undeclared currency field (e2 misses and is squashed).
+    assert.equal(s.stats.predictionHits, 2);
+    assert.equal(s.stats.predictionMisses, 1);
+    assert.ok(
+      mock.internals.squashes.some((x) => x.reason === "prediction-miss"),
+      "expected a prediction-miss squash",
+    );
+    // The later breaking change still squashes as an ordinary interface change.
+    assert.ok(
+      mock.internals.squashes.some((x) => x.reason === "interface-changed"),
+      "expected an interface-changed squash",
+    );
   } finally {
     await mock.close();
   }

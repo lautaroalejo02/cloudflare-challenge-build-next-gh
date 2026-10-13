@@ -11,7 +11,7 @@ export type EntryStatus =
   | "vetoed";
 
 export interface Diagnosis {
-  reason: "interface-changed" | "producer-vetoed" | "producer-squashed";
+  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "prediction-miss";
   changed: Array<{
     symbol: string;
     oldHash: string;
@@ -43,6 +43,7 @@ export interface Entry {
   headCommit: string | null;
   exports: SymbolHashes;
   consumes: SymbolHashes;
+  predicted: string[];
   generation: number;
   diagnosis: Diagnosis | null;
   checks: CheckResult | null;
@@ -58,6 +59,8 @@ export interface BufferState {
     retired: number;
     checksRun: number;
     pushesSeen: number;
+    predictionHits: number;
+    predictionMisses: number;
   };
 }
 

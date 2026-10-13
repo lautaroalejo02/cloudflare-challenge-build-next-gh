@@ -252,9 +252,49 @@ test('authoritative data.stats overrides local increments', () => {
   assert.equal(s.stats.pushesSeen, 7);
 });
 
+test('entry.created with a declared stub exposes predicted exports', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e1', ts: 1, data: {
+    agent: 'api-agent', lane: 'api', seq: 1, producerId: null, repo: 'arb-e1-api-0',
+    exports: { createOrder: 'a91f3b2c10d4', Order: '77aa02be9910' },
+    predicted: ['createOrder', 'Order'] } });
+  const e = A.findEntry(s, 'e1');
+  assert.deepEqual(e.predicted, ['createOrder', 'Order']);
+  assert.equal(e.exports.Order, '77aa02be9910');
+});
+
+test('push clears the predicted marker', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e1', ts: 1, data: {
+    agent: 'a', lane: 'api', seq: 1, producerId: null, repo: 'arb-e1-api-0',
+    exports: { createOrder: 'a91f' }, predicted: ['createOrder'] } });
+  A.applyEvent(s, { type: 'push', entryId: 'e1', ts: 2, data: { repo: 'arb-e1-api-0', commit: 'c1' } });
+  assert.deepEqual(A.findEntry(s, 'e1').predicted, []);
+});
+
+test('prediction.hit/miss ticks the consumer and bumps stats', () => {
+  const s = A.createState();
+  [entry({ id: 'e1', seq: 1, predicted: ['createOrder', 'Order'] }),
+   entry({ id: 'e2', seq: 2, lane: 'ui', producerId: 'e1',
+           consumes: { createOrder: 'a91f3b2c10d4', Order: '77aa02be9910' } })]
+    .forEach(e => A.upsertEntry(s, e));
+  A.applyEvent(s, { type: 'prediction.hit', entryId: 'e2', ts: 1, data: {
+    producerId: 'e1', symbol: 'createOrder', hash: 'a91f3b2c10d4', commit: 'c1' } });
+  A.applyEvent(s, { type: 'prediction.miss', entryId: 'e2', ts: 2, data: {
+    producerId: 'e1', symbol: 'Order', predictedHash: '77aa02be9910', actualHash: 'c4d5e6f7a8b9',
+    predictedSignature: 'interface Order{old}', actualSignature: 'interface Order{new}', commit: 'c1' } });
+  const e2 = A.findEntry(s, 'e2');
+  assert.equal(e2._predTicks.createOrder, 'hit');
+  assert.equal(e2._predTicks.Order, 'miss');
+  assert.equal(s.stats.predictionHits, 1);
+  assert.equal(s.stats.predictionMisses, 1);
+  assert.ok(s.log.some(l => l.type === 'prediction.miss' && l.text.indexOf('PREDICTION MISS') === 0));
+});
+
 test('mock script covers every required event type', () => {
   const types = new Set(ArbMock.build().map(s => s.ev.type));
   ['entry.created', 'push', 'hash.unchanged', 'hash.changed', 'squash', 'refork',
+   'prediction.hit', 'prediction.miss',
    'check.passed', 'check.failed', 'retired'].forEach(t => assert.ok(types.has(t), 'missing ' + t));
 });
 
@@ -269,15 +309,18 @@ test('full mock replay lands all four entries on trunk', () => {
   assert.ok(s.entries.every(e => e.status === 'retired'));
   assert.equal(s.trunk.retiredCount, 4);
   assert.equal(s.trunk.commit, '88cc99887766');
-  assert.equal(s.stats.squashes, 3);      // e2, e3 (interface-changed) + e4 (trunk-overlap)
+  assert.equal(s.stats.squashes, 4);      // e2 (prediction-miss) + e2, e3 (interface-changed) + e4 (trunk-overlap)
   assert.equal(s.stats.earlyCutoffs, 2);  // one hash.unchanged per live consumer
   assert.equal(s.stats.retired, 4);
   assert.equal(s.stats.checksRun, 6);
-  assert.equal(s.stats.pushesSeen, 7);
+  assert.equal(s.stats.pushesSeen, 8);
+  assert.equal(s.stats.predictionHits, 2);   // createOrder declared==delivered for e2 + e3
+  assert.equal(s.stats.predictionMisses, 1); // Order gained an undeclared field (e2)
   const e2 = A.findEntry(s, 'e2');
-  assert.equal(e2.generation, 1);
-  assert.equal(e2.repo, 'arb-e2-ui-1');
+  assert.equal(e2.generation, 2);
+  assert.equal(e2.repo, 'arb-e2-ui-2');
   assert.equal(e2.consumes.createOrder, 'c07e55aa11bb'); // refork recorded the new hash
+  assert.equal(e2.consumes.Order, 'c4d5e6f7a8b9');       // miss refork recorded the actual hash
   assert.equal(e2._retireMode, 'splice');
   const e4 = A.findEntry(s, 'e4');
   assert.equal(e4.generation, 1);

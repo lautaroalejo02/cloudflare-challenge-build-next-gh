@@ -17,7 +17,7 @@
       trunk: { repo: 'arb-trunk', commit: null, retiredCount: 0 },
       robSize: 8,
       entries: [],
-      stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0 },
+      stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0 },
       log: [],
       // local-only timing tracking: latest squash -> refork latency
       _lastReforkAt: 0,
@@ -44,6 +44,7 @@
       headCommit: e.headCommit || null,
       exports: e.exports || {},
       consumes: e.consumes || {},
+      predicted: Array.isArray(e.predicted) ? e.predicted : [],
       generation: typeof e.generation === 'number' ? e.generation : 0,
       diagnosis: e.diagnosis || null,
       checks: e.checks || null,
@@ -54,7 +55,8 @@
       _cutoffAt: e._cutoffAt || 0,
       _hashAt: e._hashAt || 0,
       _retireMode: e._retireMode || null,   // "fast-forward" | "splice" (retired events)
-      _hcCommit: e._hcCommit || null        // producer commit that triggered the last hash.changed
+      _hcCommit: e._hcCommit || null,       // producer commit that triggered the last hash.changed
+      _predTicks: e._predTicks || {}        // symbol -> 'hit' | 'miss' (last prediction verdict)
     };
   }
 
@@ -72,7 +74,8 @@
       var keep = {
         cutoffs: existing.cutoffs, _squashAt: existing._squashAt,
         _retireAt: existing._retireAt, _cutoffAt: existing._cutoffAt, _hashAt: existing._hashAt,
-        _retireMode: existing._retireMode, _hcCommit: existing._hcCommit
+        _retireMode: existing._retireMode, _hcCommit: existing._hcCommit,
+        _predTicks: existing._predTicks
       };
       Object.assign(existing, e);
       Object.assign(existing, keep);
@@ -144,6 +147,9 @@
             agent: data.agent, lane: data.lane,
             producerId: data.producerId == null ? null : data.producerId,
             repo: data.repo || '',
+            exports: data.exports || {},
+            consumes: data.consumes || {},
+            predicted: data.predicted || [],
             status: data.status || 'speculating'
           });
         }
@@ -162,6 +168,8 @@
         }
         if (entry) {
           entry.headCommit = data.commit || data.headCommit || entry.headCommit;
+          // A push on this entry resolves any declared-stub predictions.
+          if (entry.predicted && entry.predicted.length) entry.predicted = [];
           if (entry.diagnosis) entry.diagnosis = null; // contract: cleared when the agent pushes again
           if (entry.status === 'squashed' || entry.status === 'failed' ||
               entry.status === 'ready' || entry.status === 'checking') {
@@ -199,6 +207,24 @@
         var ch0 = changes[0];
         pushLog(state, ev, 'hash.changed ' + (hashOwner ? hashOwner.id : '?') + (ch0 ? ' · ' + ch0.symbol + ' ' + shortHash(ch0.oldHash) + '→' + shortHash(ch0.newHash) : '') +
           (entry && producer && entry !== producer ? ' · consumed by ' + entry.id : ''));
+        break;
+      }
+      case 'prediction.hit':
+      case 'prediction.miss': {
+        // entryId is the CONSUMER; data carries the producer + verdict fields.
+        var hit = ev.type === 'prediction.hit';
+        if (entry && data.symbol) {
+          if (!entry._predTicks) entry._predTicks = {};
+          entry._predTicks[data.symbol] = hit ? 'hit' : 'miss';
+          // On a hit the forwarded hash was confirmed; on a miss the consumer
+          // is about to be squashed and reforked onto the actual hash.
+          if (hit && data.hash) entry.consumes[data.symbol] = data.hash;
+        }
+        bump = hit ? 'predictionHits' : 'predictionMisses';
+        pushLog(state, ev, (hit ? 'PREDICTION HIT ' : 'PREDICTION MISS ') + (entry ? entry.id : '?') +
+          (data.symbol ? ' · ' + data.symbol + ' ' +
+            (hit ? shortHash(data.hash) : shortHash(data.predictedHash) + '→' + shortHash(data.actualHash)) : '') +
+          (data.producerId ? ' (declared by ' + data.producerId + ')' : ''));
         break;
       }
       case 'squash': {
@@ -245,6 +271,8 @@
               if (c && c.symbol && c.newHash) entry.consumes[c.symbol] = c.newHash;
             });
           }
+          // New generation forwards against actual hashes: verdict ticks reset.
+          entry._predTicks = {};
         }
         pushLog(state, ev, 'refork ' + (entry ? entry.id : '?') + (entry ? ' → ' + entry.repo + ' · gen ' + entry.generation : ''));
         break;

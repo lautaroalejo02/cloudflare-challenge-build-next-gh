@@ -16,6 +16,8 @@ export interface AgentOptions {
   lane: string;
   producerId?: string;
   consumes?: string[];
+  /** Declared-stub value prediction: sources the producer commits to export. */
+  stub?: Record<string, string>;
   workRoot: string;
   log: Log;
   pollMs?: number;
@@ -58,9 +60,11 @@ export function startAgent(opts: AgentOptions): AgentHandle {
       lane: opts.lane,
       producerId: opts.producerId,
       consumes: opts.consumes,
+      stub: opts.stub,
     });
     resolveId(entry.id);
     opts.log(`registered ${entry.id} seq=${entry.seq} lane=${entry.lane} repo=${entry.repo}`);
+    if (entry.predicted?.length) opts.log(`declared stub: predicted exports [${entry.predicted.join(", ")}]`);
 
     let lastToken = token;
     let gen = -1;

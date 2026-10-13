@@ -304,9 +304,29 @@ export class ReorderBuffer extends DurableObject<Env> {
 				return json(await this.trunkInit());
 			}
 			if (request.method === "POST" && pathname === "/api/entries") {
-				const body = (await request.json()) as { agent?: string; lane?: string; producerId?: string; consumes?: string[] };
+				const body = (await request.json()) as {
+					agent?: string;
+					lane?: string;
+					producerId?: string;
+					consumes?: string[];
+					stub?: Record<string, string>;
+				};
 				if (!body.agent || !body.lane) return json({ error: "agent and lane are required" }, 400);
-				const r = this.applyCmd({ type: "entry.create", agent: body.agent, lane: body.lane, producerId: body.producerId, consumes: body.consumes });
+				// Declared-stub value prediction: hash the stub sources with the
+				// real hasher so predicted hashes match what a real push would
+				// produce (T11).
+				let stub: { exports: ReturnType<typeof interfaceToMaps>["exports"]; sigs: ReturnType<typeof interfaceToMaps>["sigs"] } | undefined;
+				if (body.stub && typeof body.stub === "object" && Object.keys(body.stub).length > 0) {
+					stub = interfaceToMaps(await this.ports.hasher.hashInterface(body.stub));
+				}
+				const r = this.applyCmd({
+					type: "entry.create",
+					agent: body.agent,
+					lane: body.lane,
+					producerId: body.producerId,
+					consumes: body.consumes,
+					stub,
+				});
 				if (!r.ok) return json({ error: r.error }, r.status);
 				const createdEv = r.effects.find(
 					(e): e is Extract<Effect, { type: "broadcast" }> => e.type === "broadcast" && e.event.type === "entry.created",

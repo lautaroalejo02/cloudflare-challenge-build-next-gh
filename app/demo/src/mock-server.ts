@@ -26,6 +26,9 @@ import type {
 interface InternalEntry extends Entry {
   tokenPending: boolean;
   forkN: number;
+  /** Consumed symbols pinned to the producer's declared stub (value
+   * prediction); released on the producer's first push. */
+  predConsumed?: Set<string>;
 }
 
 export interface MockInternals {
@@ -83,7 +86,7 @@ export async function startMockServer(
   let seq = 0;
   let robSize = 8;
   const trunk = { repo: "arb-trunk", commit: null as string | null, retiredCount: 0 };
-  const stats = { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0 };
+  const stats = { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0 };
 
   // Single-flight mutation queue: all state changes (push detection, squashes,
   // ready/check transitions, retirement) serialize through it so concurrent
@@ -107,7 +110,7 @@ export async function startMockServer(
   };
   const terminal = (e: Entry) => e.status === "retired" || e.status === "vetoed";
   const pub = (e: InternalEntry): Entry => {
-    const { tokenPending, forkN, ...rest } = e;
+    const { tokenPending, forkN, predConsumed, ...rest } = e;
     return rest;
   };
 
@@ -185,6 +188,10 @@ export async function startMockServer(
     if (!terminal(e)) e.status = "speculating";
     stats.pushesSeen++;
     const prevHashes = e.exports;
+    // A push with real hashes resolves this entry's declared-stub predictions
+    // exactly once: each pinned consumer symbol gets a hit/miss verdict.
+    const wasPredicted = new Set(e.predicted ?? []);
+    e.predicted = [];
     const { hashes, sigs } = await exportsAtCommit(repoPath(e.repo), sha);
     e.exports = hashes;
     sigsByEntry.set(e.id, sigs);
@@ -194,6 +201,34 @@ export async function startMockServer(
       if (c.producerId !== e.id || terminal(c)) continue;
       hadConsumers = true;
       const changed = diffConsumes(c, hashes, sigs);
+      const pinned = [...(c.predConsumed ?? [])].filter((s) => wasPredicted.has(s));
+      if (pinned.length) {
+        const missed: Diagnosis["changed"] = [];
+        for (const sym of pinned) {
+          const actual = hashes[sym] ?? "missing";
+          if (c.consumes[sym] === actual) {
+            stats.predictionHits++;
+            log(`prediction hit ${c.id} ${sym}`);
+          } else {
+            stats.predictionMisses++;
+            missed.push({
+              symbol: sym,
+              oldHash: c.consumes[sym],
+              newHash: actual,
+              oldSignature: (consumeSigs.get(c.id) ?? new Map<string, string>()).get(sym) ?? "",
+              newSignature: sigs.get(sym) ?? "",
+            });
+            log(`prediction miss ${c.id} ${sym}`);
+          }
+        }
+        c.predConsumed = new Set();
+        if (missed.length) {
+          await squashEntry(c, repoPath(e.repo), sha, "prediction-miss", missed.concat(changed.filter((d) => !pinned.includes(d.symbol))));
+          squashedAny = true;
+          continue;
+        }
+        if (changed.length === 0) continue; // pure hit: not a cutoff
+      }
       if (changed.length > 0) {
         await squashEntry(c, repoPath(e.repo), sha, "interface-changed", changed);
         squashedAny = true;
@@ -286,6 +321,7 @@ export async function startMockServer(
     lane: string;
     producerId?: string;
     consumes?: string[];
+    stub?: Record<string, string>;
   }): Promise<{ entry: Entry; token: string }> {
     const producer = body.producerId ? entries.find((p) => p.id === body.producerId) : null;
     if (body.producerId && !producer) throw httpError(400, `unknown producerId ${body.producerId}`);
@@ -299,11 +335,30 @@ export async function startMockServer(
     await git(["clone", "--bare", "--quiet", srcPath, repoPath(name)]);
     heads.set(name, srcHead);
     const exp = srcHead ? await exportsAtCommit(srcPath, srcHead) : { hashes: {} as SymbolHashes, sigs: new Map<string, string>() };
+    // Declared stub (value prediction): hash the declared sources with the
+    // mock's regex extractor; predicted symbols keep the stub hash over the
+    // fork's base content until the entry's first real push resolves them.
+    const stubSigs = new Map<string, string>();
+    const stubHashes: SymbolHashes = {};
+    for (const src of Object.values(body.stub ?? {})) {
+      for (const [name, sig] of extractSignatures(src)) {
+        stubSigs.set(name, sig);
+        stubHashes[name] = hashSig(sig);
+      }
+    }
+    const predicted = Object.keys(stubHashes);
     const consumes: SymbolHashes = {};
     const cs = new Map<string, string>();
+    const predConsumed = new Set<string>();
     const prodSigs = producer ? (sigsByEntry.get(producer.id) ?? new Map<string, string>()) : new Map<string, string>();
     for (const sym of body.consumes ?? []) {
-      consumes[sym] = producer ? (producer.exports[sym] ?? "missing") : (exp.hashes[sym] ?? "missing");
+      if (producer && producer.predicted.includes(sym)) {
+        // Forward against the producer's DECLARED hash, not the fork base.
+        consumes[sym] = producer.exports[sym] ?? "missing";
+        predConsumed.add(sym);
+      } else {
+        consumes[sym] = producer ? (producer.exports[sym] ?? "missing") : (exp.hashes[sym] ?? "missing");
+      }
       cs.set(sym, producer ? (prodSigs.get(sym) ?? "") : (exp.sigs.get(sym) ?? ""));
     }
     const e: InternalEntry = {
@@ -317,16 +372,18 @@ export async function startMockServer(
       producerId: body.producerId ?? null,
       baseCommit: srcHead ?? "",
       headCommit: srcHead,
-      exports: exp.hashes,
+      exports: { ...exp.hashes, ...stubHashes },
       consumes,
+      predicted,
       generation: 0,
       diagnosis: null,
       checks: null,
       tokenPending: false,
       forkN: 0,
+      predConsumed,
     };
     entries.push(e);
-    sigsByEntry.set(e.id, exp.sigs);
+    sigsByEntry.set(e.id, new Map([...exp.sigs, ...stubSigs]));
     consumeSigs.set(e.id, cs);
     log(`created ${e.id} (${e.lane}) repo=${name} base=${(srcHead ?? "none").slice(0, 8)}`);
     return { entry: pub(e), token: `mock-token-${e.id}-g0` };
@@ -370,6 +427,8 @@ export async function startMockServer(
     stats.retired = 0;
     stats.checksRun = 0;
     stats.pushesSeen = 0;
+    stats.predictionHits = 0;
+    stats.predictionMisses = 0;
     sigsByEntry.clear();
     consumeSigs.clear();
     heads.clear();

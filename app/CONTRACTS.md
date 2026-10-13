@@ -47,13 +47,15 @@ interface Entry {
   headCommit: string | null;      // latest pushed commit on this entry's fork
   exports: SymbolHashes;          // this entry's exported-interface hashes at headCommit
   consumes: SymbolHashes;         // producer symbols this entry depends on, with the hashes it forked against
+  predicted: string[];            // exported symbols whose `exports` values are unconfirmed stub predictions;
+                                  // cleared when the entry's first real push resolves them against reality
   generation: number;             // 0 at creation, +1 per squash/re-fork
   diagnosis: Diagnosis | null;    // set when squashed, cleared when the agent pushes again
   checks: CheckResult | null;     // last check run
 }
 
 interface Diagnosis {
-  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap";
+  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap" | "prediction-miss";
   changed: Array<{ symbol: string; oldHash: string; newHash: string; oldSignature: string; newSignature: string }>;
   producerCommit: string;
 }
@@ -64,16 +66,18 @@ interface BufferState {
   trunk: { repo: string; commit: string | null; retiredCount: number };
   robSize: number;                // max non-retired entries (speculation depth), default 8
   entries: Entry[];               // all entries, sorted by seq
-  stats: { squashes: number; earlyCutoffs: number; retired: number; checksRun: number; pushesSeen: number };
+  stats: { squashes: number; earlyCutoffs: number; retired: number; checksRun: number; pushesSeen: number;
+           predictionHits: number; predictionMisses: number }; // per (consumer, symbol) stub-prediction verdicts
 }
 ```
 
 ## HTTP API (control-plane Worker, base `/api`)
 All JSON. Errors: `{ "error": string }` with a 4xx/5xx status.
 - `POST /api/trunk/init` `{ fromDir?: never }` → `{ repo, remote, token }`. Creates `arb-trunk` if missing. The demo then pushes the fixture to it.
-- `POST /api/entries` `{ agent, lane, producerId?: string, consumes?: string[] }` → `{ entry: Entry, token: string }`.
+- `POST /api/entries` `{ agent, lane, producerId?: string, consumes?: string[], stub?: Record<path, string> }` → `{ entry: Entry, token: string }`.
   - Forks from the producer's fork at its current head (forwarding), or from trunk if there is no producer.
   - `consumes` lists the producer symbol names this entry depends on. Their current hashes are recorded in `entry.consumes`.
+  - `stub` (value prediction) is TypeScript source declaring the entry's *intended* exported signatures. The control plane hashes it with the real hasher; `entry.exports` starts as these predicted hashes and `entry.predicted` lists the predicted symbols until the entry's first real push resolves them. Consumers registering while `producer.predicted` is non-empty forward against the predicted hashes, and get a `prediction.hit` (no squash) or `prediction.miss` (squash with reason `prediction-miss`) verdict per consumed symbol on that first push.
   - `token` is a write token for `entry.repo`, valid 1 hour.
   - Rejected with 409 when non-retired entries are already `>= robSize`.
 - `GET /api/entries/:id` → `{ entry: Entry, token?: string }`. Includes a fresh write `token` when the entry was re-forked since the agent last fetched it, so the agent can clone the new fork.
@@ -89,7 +93,8 @@ All JSON. Errors: `{ "error": string }` with a 4xx/5xx status.
 ```ts
 interface ArbEvent {
   type: "entry.created" | "push" | "hash.unchanged" | "hash.changed" | "squash" | "refork" | "ready"
-      | "check.started" | "check.passed" | "check.failed" | "retired" | "veto" | "config" | "reset";
+      | "check.started" | "check.passed" | "check.failed" | "prediction.hit" | "prediction.miss"
+      | "retired" | "veto" | "config" | "reset";
   ts: number;          // Date.now() on the server
   entryId?: string;
   data?: unknown;      // type-specific; include enough for the UI (e.g. symbol, oldHash, newHash, commit, durationMs)
@@ -145,3 +150,8 @@ interface RetirerPort {
 - 2026-10-13 (T8): `GET /api/events` debug endpoint added.
 - 2026-10-13 (T8): `entry.ready` accepts a squashed entry's re-forked base (`headCommit === baseCommit`), enabling a no-op retirement when the base already contains the entry's intent.
 - 2026-10-13 (T8): `GET /api/entries/:id` fresh-token trigger changed from "generation bumped" to "repo changed" — Artifacts tokens are per-repo, and generation bumps precede re-fork completion.
+- 2026-10-13 (T11): `POST /api/entries` accepts `stub?: Record<path, string>` — declared exported signatures, hashed by the real hasher into predicted `entry.exports`.
+- 2026-10-13 (T11): `Entry.predicted: string[]` added — symbols whose `exports` are unconfirmed stub predictions, cleared on the entry's first real push.
+- 2026-10-13 (T11): `Diagnosis.reason` gains `"prediction-miss"` — squash reason when a consumed symbol's actual hash diverges from the producer's declared stub on its first push (diagnosis carries predicted vs actual signature).
+- 2026-10-13 (T11): `stats.predictionHits` / `stats.predictionMisses` added — per (consumer, symbol) verdicts on the producer's first push.
+- 2026-10-13 (T11): `ArbEvent` gains `"prediction.hit"` (`data: { producerId, symbol, hash, commit }`) and `"prediction.miss"` (`data: { producerId, symbol, predictedHash, actualHash, predictedSignature, actualSignature, commit }`); `entryId` is the consumer.
