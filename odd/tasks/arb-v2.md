@@ -22,7 +22,7 @@ The v1 demo needs scripted dependency declarations and is blind to same-signatur
 - Max 3 concurrent SWE-2 runs (rate-limit lesson from v1).
 
 ## Safety net
-Known-good: tag `demo-stable-5` (`dfc05ea`), Worker version `b3e47042-6c08-467a-b947-3350a0b7ce40`. Live main passed on it (68 s, 3 retired).
+Known-good: tag `demo-stable-6` (`a16239e`), Worker version `9f105998-1985-432d-af28-df1908c3d014`; V2 live main passed 3/3. Previous: `demo-stable-5`, Worker `b3e47042-6c08-467a-b947-3350a0b7ce40` (v1 + redesign).
 
 ## Delivery strategy
 `exception-ok`: forecast is about 1,800 authored lines, above the 400-line budget. Reason: hackathon deadline, and the user authorized pushing to `main` once it works. Each task still lands as its own work-unit commit.
@@ -38,7 +38,14 @@ Route legend: D = delegated writer, I = inline (orchestrator), A = audit (Sonnet
 - [x] V3 (D, SWE-2) Control plane: inference, Jev client, judge flow, stats, sweep, router aggregation. No deploy. Prompt `odd/prompts/V3-control-plane.md`. Done `f70c0be`: 124/124 tests (parent re-ran; the 92 v1 tests stay green); the wrangler dry-run builds. Sonnet audit found 1 BLOCKER: unbound `globalThis.fetch` means Jev always fails in workerd. It also found 5 majors (stale verdict loses the net change, no live-producer check, wrong forkedExports baseline, false deps.undeclared, usage selection) and minors (source store growth, body timeout, prototype names, hot-path allocation).
 - [ ] V3b (D) Fix the control-plane audit findings 1-10. Prompt `odd/prompts/V3b-control-plane-audit-fixes.md`. The first SWE-2 run hit the free rate limit before editing anything (`odd/logs/V3b.err`). Re-routed to Codex gpt-6.1-sol (`odd/logs/V3b-codex.out`). Done `45d2b03`: 155/155 tests (parent re-ran), tsc clean, the dry-run builds. Parent bench at N=100k in single mode on the same machine: v1 `a634b36` median 10.3 µs / p95 78.3 µs vs v2 median 19.1 µs / p95 79.7 µs (about 1.9x median, flat p95). The recorded 2.7 µs came from an earlier, quieter run; docs must quote the same-machine comparison, not 2.7 µs for v2.
 - [x] V5 (D, Codex gpt-6.1-sol) Dashboard rendering of V2 events + mock replay. Prompt `odd/prompts/V5-dashboard.md`. Done `4fab37a`: 44/44 dashboard tests (parent re-ran), screenshots `app/dashboard/screenshots/v2-*.png`. Live check pending V4.
-- [ ] V4 (D, Devin `claude-opus-5-5-medium`; the user approved spending Pro quota on 2026-10-13 because SWE-2's free rate limit could cut a deploy) Integration after V1b+V3b: real hasher wiring, demo behavior-change beat, deploy with bumped DO names, live runs. Prompt ready: `odd/prompts/V4-integration.md`.
+- [x] V4 (D, Devin `claude-opus-5-5-medium`; the user approved spending Pro quota on 2026-10-13 because SWE-2's free rate limit could cut a deploy) Integration after V1b+V3b: real hasher wiring, demo behavior-change beat, deploy with bumped DO names, live runs. Prompt: `odd/prompts/V4-integration.md`.
+  - Done `a16239e`, Worker `9f105998-1985-432d-af28-df1908c3d014`.
+  - Live: main x3, failing-check and multi all exit 0.
+  - Jev on `createOrder`: the refactor judged 0.02 (clear) and the VAT behavior change 0.93-0.97 (squash), in 4 of 4 runs that contain the beat.
+  - Parent spot check: 156/156 control-plane and 18/18 demo tests; reset without the key returns 403; the live events have 0 `art_v2_` and 0 `Bearer`.
+  - Pushed to `main` (`ce2d463`) and tagged `demo-stable-6`.
+  - Known gap: inference reads imports from the whole entry tree, so the UI also inferred `charge` from an untouched trunk file. Main now shows 1 prediction hit / 0 misses, and runs take about 90-100 s.
+- [ ] V8 (D, Codex) Restrict inference to imports in files the entry changed since its `baseCommit`. Redeploy and run live. Prompt `odd/prompts/V8-inference-scope.md`.
 - [ ] V6 (A) Sonnet audit per landed unit (V1, V2, V3, V4).
 - [ ] V7 (D) Docs: README, `docs/architecture.md`, `docs/demo-script.md`.
 - [ ] S1 (stretch) Jev producer routing from `task` text.
