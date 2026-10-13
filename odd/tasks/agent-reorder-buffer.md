@@ -92,7 +92,13 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
   - Takes: main, multi, multi-720, failing-check. The `.webm` files are LOCAL ONLY (gitignored, 16-30 MB each) in `app/dashboard/recordings/`; timelines are committed.
   - Parent check: ffprobe main.webm = 86.9 s; no tokens in the timelines.
   - Found defect: cross-component splice-candidate race on the shared trunk can wedge a component (`retiring` never cleared). The recording avoided it with `--delay-ready e5:30000` (workaround).
-- [ ] T17 (D) Fix the trunk retirement race: atomic per-attempt retire inside ArbTrunk, bounded rebuild, never wedge. Prove it with 5 consecutive live multi runs without a delay. Dispatched (`odd/prompts/T17-trunk-race.md`) with a rollback safety net to `demo-stable-2`.
+- [x] T17 (D) Trunk retirement is atomic per attempt inside ArbTrunk, with bounded rebuild, never wedges, and emits retire.retry/retire.failed. Commit `c476588`; Worker `4e0fdc50`.
+  - Writer: control-plane 54/54; 5/5 live multi runs without a delay, all exit 0.
+  - Parent spot check: control-plane `npm test` 54/54; 2/2 live multi runs without a delay, exit 0 (retired 5, squashes 4).
+  - Parent found a deploy-blocking issue: footage over 25 MiB inside the assets dir breaks `wrangler deploy` (confirmed by dry-run). Fixed with `app/dashboard/.assetsignore` (commit `ae8d957`): the dry-run fails without it and passes with it.
+  - Tagged `demo-stable-3`.
+- [ ] T18 (D) Fresh clone from GitHub, following the README literally (no credentials); docs sync with T17. Dispatched.
+- [ ] R1 (D, read-only) Independent Opus review of the control-plane core and submission risks (incl. the public `/api/reset`). Dispatched.
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
 Route declaration: T2-T7 are delegated because each package is non-trivial and the six run in parallel in disjoint directories. That is the writer trigger plus the user's explicit request to use many Devin agents. T8 and T9 each go to one writer, because they touch multiple packages.
