@@ -69,7 +69,12 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
     - OPEN: the "squash after push" stat is synthetic in the mock (~1.2 s spacing). Live, squash and push share a timestamp, so the stat would read ~0 ms. Before the video, fix it (measure from the git push time) or hide it.
   - [x] T9b: README, architecture doc and video script. Commit `3967610`. Parent structural readback done. Live E2E numbers are TBD until T8.
 - [ ] T11 (D) Value prediction: declared stubs, hit/miss counter (the wow-scene element and the answer to the 'just stacked PRs' objection). Dispatched to SWE-2 max (`odd/prompts/T11-value-prediction.md`). Stretch, approved by the orchestrator while the owner sleeps.
-- [ ] T12 (D) Scale benchmark of pure `rob.ts` at N = 1K/10K/100K, one buffer vs per-component buffers (`odd/prompts/T12-scale-bench.md`). Strengthens the weakest criterion (scale 3/5).
+- [x] T12 (D) Scale benchmark of pure `rob.ts` at N = 1K/10K/100K, one buffer vs per-component buffers. Commit `1ab5382` (finished by a Claude subagent after the SWE-2 rate limit).
+  - Single buffer: median per event 29.6 µs / 394 µs / 16.2 ms at 1k / 10k / 100k (super-linear; linear scans in `head()`, `squashTree`, lookups).
+  - Sharded: per-event work flat (<20 µs).
+  - Containment: 0 squashes outside transitive dependents across 3,803 pushes.
+  - Parent spot check: N=1000 run reproduced (head() 23.6 µs single vs 1.3 µs sharded).
+- [ ] T14 (D) Act on T12: index maps and a head cursor in `rob.ts`, plus one ReorderBuffer DO per connected component (routing by root producer). Re-run the bench. Runs AFTER T11 (same files).
 - [ ] T13 (D) Docs refresh with T11/T12 evidence, plus recorded live dashboard footage for the video.
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
