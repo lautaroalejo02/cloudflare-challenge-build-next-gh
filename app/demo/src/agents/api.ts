@@ -67,6 +67,45 @@ export function createOrder(cart: Cart, region: string): Order {
 }
 `;
 
+// Body-only refactor of ORDER_V1_1: identical exported interface (Order keeps
+// `currency`, createOrder keeps the v1 signature), so this push must produce
+// an early cutoff — no consumed symbol hash changes. This is the middle push
+// of the live scenario: stub resolution -> body-only cutoff -> breaking change.
+export const ORDER_V1_1_REFACTORED = `export interface LineItem {
+  sku: string;
+  qty: number;
+  unitPrice: number;
+}
+
+export interface Cart {
+  items: LineItem[];
+}
+
+export interface Order {
+  id: string;
+  region: string;
+  currency: string;
+  itemCount: number;
+  totalCents: number;
+}
+
+function sumCart(cart: Cart): { totalCents: number; itemCount: number } {
+  return cart.items.reduce(
+    (acc, item) => ({
+      totalCents: acc.totalCents + item.qty * item.unitPrice,
+      itemCount: acc.itemCount + item.qty,
+    }),
+    { totalCents: 0, itemCount: 0 },
+  );
+}
+
+export function createOrder(cart: Cart, region: string): Order {
+  const { totalCents, itemCount } = sumCart(cart);
+  const id = \`ord-\${itemCount}-\${totalCents}\`;
+  return { id, region, currency: "USD", itemCount, totalCents };
+}
+`;
+
 // Body-only refactor: identical exported interface, so the control plane's
 // interface hash is unchanged and the push must produce an early cutoff.
 export const ORDER_V1_REFACTORED = `export interface LineItem {
@@ -156,12 +195,19 @@ export function startApiAgent(opts: {
   pollMs?: number;
   timeoutMs?: number;
   firstPushDelayMs?: number;
+  /** Delay before the body-only refactor push (stub runs only). Must be long
+   * enough for the stub-resolving push to be detected and the prediction-miss
+   * re-fork to land, so the cutoff is attributable to a push of its own. */
+  bodyOnlyDelayMs?: number;
   breakingChangeDelayMs?: number;
-  /** Declared-stub value prediction (T11). When set, step 1 lands the
-   * signature-as-declared refactor that nonetheless adds a field to Order. */
+  /** Declared-stub value prediction (T11). When set, the run is three pushes:
+   * the signature-as-declared refactor that nonetheless adds a field to Order
+   * (resolves predictions), then a body-only refactor (early cutoff), then
+   * the breaking change (squashes). */
   stub?: Record<string, string>;
 }): AgentHandle {
   const firstDelay = opts.firstPushDelayMs ?? 500;
+  const bodyDelay = opts.bodyOnlyDelayMs ?? 1500;
   const breakDelay = opts.breakingChangeDelayMs ?? 10_000;
   const stepsFor = (gen: number): Step[] => [
     ...(gen === 0
@@ -173,6 +219,15 @@ export function startApiAgent(opts: {
               : "refactor(api): extract sumCart helper from createOrder",
             apply: (dir: string) => writeOrder(dir, opts.stub ? ORDER_V1_1 : ORDER_V1_REFACTORED),
           },
+          ...(opts.stub
+            ? [
+                {
+                  delayMs: bodyDelay,
+                  message: "refactor(api): reimplement sumCart with reduce",
+                  apply: (dir: string) => writeOrder(dir, ORDER_V1_1_REFACTORED),
+                },
+              ]
+            : []),
         ]
       : []),
     {

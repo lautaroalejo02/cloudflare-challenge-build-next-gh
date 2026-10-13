@@ -144,21 +144,28 @@ export function startAgent(opts: AgentOptions): AgentHandle {
       if (e.status === "vetoed") throw new Error(`${entry.id} was vetoed`);
 
       if (e.status === "failed") {
-        failedPolls++;
-        if (!fixUsed && opts.fixForFailure) {
-          const step = opts.fixForFailure(dir, e.checks);
-          if (step) {
-            fixUsed = true;
-            opts.log(`checks failed (${e.checks?.failed ?? "?"} failing) - applying scripted fix`);
-            step.apply(dir);
-            const sha = await commitAll(dir, step.message, opts.agent);
-            if (sha !== null) {
-              await push(dir);
-              readySha = sha; // posted on the next polls once headCommit catches up
+        // A "failed" verdict is stale while the recorded check ran on a commit
+        // older than the fix we just pushed: push detection and the re-check
+        // are async, so the status can lag the real head for several polls.
+        // Only failures of the latest pushed head count toward giving up.
+        const fixAwaitingCheck = readySha !== null && e.checks != null && e.checks.commit !== readySha;
+        if (!fixAwaitingCheck) {
+          failedPolls++;
+          if (!fixUsed && opts.fixForFailure) {
+            const step = opts.fixForFailure(dir, e.checks);
+            if (step) {
+              fixUsed = true;
+              opts.log(`checks failed (${e.checks?.failed ?? "?"} failing) - applying scripted fix`);
+              step.apply(dir);
+              const sha = await commitAll(dir, step.message, opts.agent);
+              if (sha !== null) {
+                await push(dir);
+                readySha = sha; // posted on the next polls once headCommit catches up
+              }
             }
+          } else if (failedPolls >= 5) {
+            throw new Error(`${entry.id} checks keep failing`);
           }
-        } else if (failedPolls >= 5) {
-          throw new Error(`${entry.id} checks keep failing`);
         }
       }
       await sleep(pollMs);

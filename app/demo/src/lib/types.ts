@@ -11,7 +11,7 @@ export type EntryStatus =
   | "vetoed";
 
 export interface Diagnosis {
-  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "prediction-miss";
+  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap" | "prediction-miss";
   changed: Array<{
     symbol: string;
     oldHash: string;

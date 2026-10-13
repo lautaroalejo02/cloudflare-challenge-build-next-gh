@@ -89,7 +89,8 @@ async function main(): Promise<void> {
     workRoot: WORK_ROOT,
     log: scoped(tl, "api"),
     firstPushDelayMs: 9000,
-    breakingChangeDelayMs: 12_000,
+    bodyOnlyDelayMs: 7000,
+    breakingChangeDelayMs: 10_000,
     stub: { "src/api/order.ts": ORDER_STUB },
   });
   const apiId = await apiH.entryId;

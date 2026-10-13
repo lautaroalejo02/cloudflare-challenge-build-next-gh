@@ -242,6 +242,58 @@ Live dashboard captures (headless Edge, 1920x1080):
 diagnosis) and `live-final.png` (all three entries retired, "re-fork ready
 4.1 s").
 
+## T15: early-cutoff restoration + flaky-test fix (2026-10-13)
+
+### Regression: `earlyCutoffs: 0` after value prediction (T11)
+
+Cause: T11 replaced the API agent's gen-0 step list with two pushes — the
+stub-resolving push (`ORDER_V1_1`, adds `currency` to `Order` → prediction
+miss for ui) and the breaking push (`ORDER_V2`). The body-only refactor that
+used to produce the early cutoff disappeared, so no push ever left the
+exported interface unchanged.
+
+Fix: `ORDER_V1_1_REFACTORED` — identical exported interface to `ORDER_V1_1`
+(Order keeps `currency`, createOrder keeps the v1 signature; `sumCart`
+reimplemented with `reduce`, body-only change) — is pushed as a middle step
+when `stub` is set, via the new `bodyOnlyDelayMs` option. Live gen-0 timeline
+is now three pushes in order: stub resolution (2 hits / 1 miss), body-only
+refactor (early cutoff, no squash), breaking change (squashes). Runs without
+`stub` keep the original two-step shape.
+
+### Flaky test: `e2 checks keep failing` (~1 in 6-10 locally)
+
+Cause found via `repro` state dump: the tests agent's fix commit *was*
+committed and pushed (`test: fix wrong expectation`), but the mock still
+showed `headCommit` at the failing commit and the entry at `failed`. Root
+cause is in `src/agents/base.ts`: `failedPolls` counted **polls**, not failed
+checks on the current head. After the fix push, the entry stays `failed`
+until the control plane detects the new head — and the mock serializes push
+detection, squash re-forks and checks through one promise queue, so a busy
+tick (the producer's concurrent push costs several git spawns) delays
+detection past 5 polls (~600 ms). The agent then gave up while its fix was
+still in flight.
+
+Fix: a `failed` verdict is stale while `entry.checks.commit` is older than
+the fix commit just pushed (`readySha`). Those polls are skipped; only
+failures of the latest pushed head count toward the 5-poll give-up. No
+timeouts or retry counts were raised — the throw now requires the check to
+have actually re-run on the fixed commit.
+
+### Verification
+
+- `npm test`: **10/10 consecutive runs, 0 failures** (12/12 tests each).
+- Live main scenario
+  `npm run demo -- --base https://arb-control-plane.lautitomasalejo.workers.dev`:
+  exit 0, complete at +64.3s. Final stats:
+  `{"squashes":3,"earlyCutoffs":2,"retired":3,"checksRun":4,"pushesSeen":8,"predictionHits":2,"predictionMisses":1}`.
+  Order observed: prediction hits/miss on push 1 → `earlyCutoffs 0 -> 2` on
+  the body-only push → `squashes 1 -> 3` on the breaking push → e1→e2→e3
+  retired in order.
+- Live `--scenario failing-check`: exit 0, complete at +58.9s. The failing v2
+  feature test was checked on e3's gen-1 head (e3 `speculating -> failed`),
+  the scripted fix landed and re-checked, and e3 retired. Final stats:
+  `{"squashes":3,"earlyCutoffs":2,"retired":3,"checksRun":5,"pushesSeen":9,"predictionHits":2,"predictionMisses":1}`.
+
 ## Known gaps
 
 - No WebSocket client; the timeline polls `/api/state` every 800 ms.
