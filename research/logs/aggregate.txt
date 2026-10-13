@@ -1,0 +1,27 @@
+coverage per judge: {'S1': 25, 'S2': 25, 'S3': 25, 'S4': 25, 'S5': 25}
+id   total   wow mecha usefu scale feasi not_m  n top5 kill  author name
+I23  23.75  5.00  4.50  3.50  3.25  2.50  5.00  4    3    2  A1  One-Round Pools (error-locating-array integration)
+I24  22.75  4.00  4.50  4.00  3.00  3.50  3.75  4    0    1  A1  Agent Reorder Buffer (speculative forwarding)
+I09  22.75  3.75  4.50  4.00  3.50  4.00  3.00  4    1    3  A5  Intent-Registered Transactions (improved baseline)
+I13  22.50  3.00  4.00  4.00  3.75  3.50  4.25  4    1    2  A1  Grace Period (RCU for breaking changes)
+I07  22.50  3.50  4.25  3.25  3.50  3.25  4.75  4    1    0  A2  Retraction-Aware Repository
+I22  22.25  3.00  4.00  4.00  3.75  4.50  3.00  4    1    2  A5  Adaptive Token-Blocks
+I15  22.25  2.75  4.25  3.75  4.00  5.00  2.50  4    0    3  A5  Singleflight Dispatch
+I05  22.25  5.00  3.75  2.75  3.25  2.50  5.00  4    0    3  A1  Atomized Repo (one Artifacts repo per symbol, capability tokens)
+I02  22.00  3.00  4.50  3.00  4.00  4.00  3.50  4    1    2  A2  Monotone Extension Forge
+I08  21.50  4.00  4.25  3.50  3.50  2.50  3.75  4    0    1  A2  Reference-Preserving Patch Transport
+I06  21.50  3.00  4.00  4.00  3.50  4.00  3.00  4    0    1  A3  Escrow Recording
+I18  21.25  4.00  3.75  3.50  3.25  3.25  3.50  4    1    0  A1  Three-Isolate Review (Diffy on Dynamic Workers)
+I17  21.25  3.00  4.25  3.75  4.00  3.25  3.00  4    0    0  A2  Verification-Cut Repository
+I16  21.25  3.50  4.00  2.50  3.00  4.00  4.25  4    1    2  A3  Starboard Rule
+I11  21.25  3.25  3.75  2.50  3.50  4.00  4.25  4    0    1  A3  Trophic Commit
+I01  21.25  4.00  3.50  3.50  3.75  2.50  4.00  4    1    0  A5  Precedent Registry
+I21  21.00  3.50  3.75  4.00  3.50  4.00  2.25  4    0    3  A5  Epoch Train
+I04  20.75  3.25  3.75  3.00  3.00  4.00  3.75  4    1    1  A3  Complying Presentation
+I12  20.50  3.25  4.50  3.00  2.50  3.50  3.75  4    0    1  A2  Configuration Forge
+I03  20.25  3.25  3.50  3.75  3.75  3.50  2.50  4    0    1  A4  The Evidence Locker — chain-of-custody verification for agent code
+I25  20.00  2.75  3.25  2.50  3.75  4.00  3.75  4    0    2  A3  Inc Loss
+I10  20.00  3.25  3.50  3.75  3.50  3.50  2.50  4    1    2  A4  The Wake-Up Ledger
+I20  19.75  4.25  3.50  3.00  2.50  2.75  3.75  4    0    1  A4  Contact Tracing — symbol-level quarantine for a fast trunk
+I14  19.75  3.75  3.25  2.50  3.25  3.75  3.25  4    0    2  A4  The Replay Booth — challenge-budget review for auto-landing trunks
+I19  18.00  3.25  3.00  2.50  3.00  3.75  2.50  4    0    2  A4  Tower Control — wake-separation merge scheduling

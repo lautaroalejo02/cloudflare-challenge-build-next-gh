@@ -1,0 +1,12 @@
+name = "spike-2a-consumer"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[[kv_namespaces]]
+binding = "EVENTS"
+id = "acf51f086194441faee47ce59e62112f"
+
+[[queues.consumers]]
+queue = "spike-2a-queue"
+max_batch_size = 10
+max_batch_timeout = 5

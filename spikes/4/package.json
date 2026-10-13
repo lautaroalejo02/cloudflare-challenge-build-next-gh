@@ -1,0 +1,14 @@
+{
+  "name": "spike-4-hash-interface",
+  "private": true,
+  "version": "0.0.0",
+  "bin": {
+    "hash-interface": "./bin/hash-interface.js"
+  },
+  "scripts": {
+    "test": "node test/run.js"
+  },
+  "dependencies": {
+    "ts-morph": "^27.0.0"
+  }
+}

@@ -1,0 +1,14 @@
+name = "research-spike-1-0d0967"
+main = "src/index.js"
+compatibility_date = "2026-10-12"
+account_id = "f3adabb2e83104cf7b9c244077547991"
+
+[[artifacts]]
+binding = "ARTIFACTS"
+namespace = "research-spike-1"
+
+[limits]
+cpu_ms = 50
+
+[observability]
+enabled = false

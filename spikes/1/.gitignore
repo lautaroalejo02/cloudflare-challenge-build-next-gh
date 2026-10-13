@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+tmp/
+.secret*
+.npm-cache/
+worker-configuration.d.ts
+results.json

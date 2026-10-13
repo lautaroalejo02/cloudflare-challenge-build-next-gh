@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+tmp/
+.secret*
+.spike-secret
+.npm-cache/
+.dev.vars
+spikes/_logs/
+*.log

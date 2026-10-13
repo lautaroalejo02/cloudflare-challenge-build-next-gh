@@ -1,0 +1,21 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "spike-5a",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-10-12",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": { "enabled": true },
+	"artifacts": [{ "binding": "ARTIFACTS", "namespace": "spike-5a" }],
+	"containers": [
+		{
+			"class_name": "Spike5aSandbox",
+			"image": "registry.cloudflare.com/f3adabb2e83104cf7b9c244077547991/spike-5a-spike5asandbox:eb187c4e",
+			"instance_type": "lite",
+			"max_instances": 1
+		}
+	],
+	"durable_objects": {
+		"bindings": [{ "class_name": "Spike5aSandbox", "name": "SANDBOX" }]
+	},
+	"migrations": [{ "new_sqlite_classes": ["Spike5aSandbox"], "tag": "v1" }]
+}

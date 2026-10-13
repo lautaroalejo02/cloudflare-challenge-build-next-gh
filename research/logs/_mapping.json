@@ -1,0 +1,102 @@
+{
+ "I01": {
+  "author": "A5",
+  "name": "Precedent Registry"
+ },
+ "I02": {
+  "author": "A2",
+  "name": "Monotone Extension Forge"
+ },
+ "I03": {
+  "author": "A4",
+  "name": "The Evidence Locker \u2014 chain-of-custody verification for agent code"
+ },
+ "I04": {
+  "author": "A3",
+  "name": "Complying Presentation"
+ },
+ "I05": {
+  "author": "A1",
+  "name": "Atomized Repo (one Artifacts repo per symbol, capability tokens)"
+ },
+ "I06": {
+  "author": "A3",
+  "name": "Escrow Recording"
+ },
+ "I07": {
+  "author": "A2",
+  "name": "Retraction-Aware Repository"
+ },
+ "I08": {
+  "author": "A2",
+  "name": "Reference-Preserving Patch Transport"
+ },
+ "I09": {
+  "author": "A5",
+  "name": "Intent-Registered Transactions (improved baseline)"
+ },
+ "I10": {
+  "author": "A4",
+  "name": "The Wake-Up Ledger"
+ },
+ "I11": {
+  "author": "A3",
+  "name": "Trophic Commit"
+ },
+ "I12": {
+  "author": "A2",
+  "name": "Configuration Forge"
+ },
+ "I13": {
+  "author": "A1",
+  "name": "Grace Period (RCU for breaking changes)"
+ },
+ "I14": {
+  "author": "A4",
+  "name": "The Replay Booth \u2014 challenge-budget review for auto-landing trunks"
+ },
+ "I15": {
+  "author": "A5",
+  "name": "Singleflight Dispatch"
+ },
+ "I16": {
+  "author": "A3",
+  "name": "Starboard Rule"
+ },
+ "I17": {
+  "author": "A2",
+  "name": "Verification-Cut Repository"
+ },
+ "I18": {
+  "author": "A1",
+  "name": "Three-Isolate Review (Diffy on Dynamic Workers)"
+ },
+ "I19": {
+  "author": "A4",
+  "name": "Tower Control \u2014 wake-separation merge scheduling"
+ },
+ "I20": {
+  "author": "A4",
+  "name": "Contact Tracing \u2014 symbol-level quarantine for a fast trunk"
+ },
+ "I21": {
+  "author": "A5",
+  "name": "Epoch Train"
+ },
+ "I22": {
+  "author": "A5",
+  "name": "Adaptive Token-Blocks"
+ },
+ "I23": {
+  "author": "A1",
+  "name": "One-Round Pools (error-locating-array integration)"
+ },
+ "I24": {
+  "author": "A1",
+  "name": "Agent Reorder Buffer (speculative forwarding)"
+ },
+ "I25": {
+  "author": "A3",
+  "name": "Inc Loss"
+ }
+}

@@ -1,0 +1,8 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "spike-5b-runner",
+	"main": "src/index.js",
+	"compatibility_date": "2026-10-12",
+	"worker_loaders": [{ "binding": "LOADER" }],
+	"artifacts": [{ "binding": "ARTIFACTS", "namespace": "spike-5b" }],
+}

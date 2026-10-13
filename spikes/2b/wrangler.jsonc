@@ -1,0 +1,25 @@
+{
+	"name": "spike-2b-poller",
+	"main": "src/index.js",
+	"compatibility_date": "2026-10-12",
+	"artifacts": [
+		{
+			"binding": "ARTIFACTS",
+			"namespace": "spike-2b"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "POLLER",
+				"class_name": "Spike2bPoller"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["Spike2bPoller"]
+		}
+	]
+}

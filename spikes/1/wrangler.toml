@@ -1,0 +1,12 @@
+name = "spike-1-artifacts-rt"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+account_id = "f3adabb2e83104cf7b9c244077547991"
+workers_dev = true
+
+[[artifacts]]
+binding = "ARTIFACTS"
+namespace = "spike-1"
+
+[limits]
+cpu_ms = 50

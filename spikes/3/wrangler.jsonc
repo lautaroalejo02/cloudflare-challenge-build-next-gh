@@ -1,0 +1,11 @@
+{
+  "name": "spike-3-artifacts",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-12",
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "spike-3"
+    }
+  ]
+}
