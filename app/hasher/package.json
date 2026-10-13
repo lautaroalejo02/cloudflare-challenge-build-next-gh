@@ -1,0 +1,18 @@
+{
+  "name": "arb-hasher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Exported-interface hashing for TypeScript, runs inside a Cloudflare Worker (web-tree-sitter)",
+  "scripts": {
+    "test": "node --experimental-strip-types test/run.mjs",
+    "deploy:test-worker": "wrangler deploy --config worker/wrangler.toml",
+    "tail:test-worker": "wrangler tail arb-test-hasher --format json"
+  },
+  "dependencies": {
+    "web-tree-sitter": "0.27.1"
+  },
+  "devDependencies": {
+    "wrangler": "^4.149.0"
+  }
+}

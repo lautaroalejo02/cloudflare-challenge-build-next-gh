@@ -1,0 +1,8 @@
+name = "arb-test-hasher"
+main = "index.ts"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+rules = [
+  { type = "CompiledWasm", globs = ["**/*.wasm"] },
+]
