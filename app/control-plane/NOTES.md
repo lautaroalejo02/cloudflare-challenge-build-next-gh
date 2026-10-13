@@ -217,6 +217,15 @@ Scenario timeline (trimmed, `--scenario failing-check`):
   lets already-emitted dependent refork effects resolve the real source name.
   A run-epoch component in the contract naming scheme would remove the need
   for this.
+- **Stale repos can share the pending fork name (fixed, T9c).** While a
+  (re)fork is in flight, `_internal.pending[id]` holds the PLANNED name —
+  which may collide with a repo left over from before a reset. A late `pushed`
+  event for that stale repo was matched via `pending` and adopted as the
+  entry's head/exports mid-flight (the entry even flipped back to
+  `speculating`). `apply` now ignores ALL pushes for an entry while
+  `pending[id]` is set — the agent has no token yet, so nothing legitimate
+  can arrive; the fork's own head lands via `fork.done`. Covered by the
+  "stale-repo push to the pending refork name is ignored" test.
 - `Entry.status` has no `retiring` state and `Entry` has no field for
   in-flight forks; kept in `_internal` (not part of `GET /api/state`). Fine.
 - `POST /api/trunk/init` returns a fresh `token` every call (contract says
@@ -257,8 +266,9 @@ Scenario timeline (trimmed, `--scenario failing-check`):
 - Effect failures (e.g. fork throwing) surface as 500/queue retry; a
   persistently failing fork leaves `pending` set until a later push reuses
   it — acceptable for the demo, no automatic unjam yet.
-- `squashed` entries whose refork is in flight ignore pushes to the old
-  repo name; work pushed to the stale fork in that window must be redone.
+- Entries ignore ALL pushes while a fork/re-fork is pending (old repo, or a
+  stale repo sharing the planned name); work pushed in that window must be
+  redone on the new fork (T9c: tightened from old-repo-only).
 - Alarm keeps polling trunk forever while `trunk.repo` is set (by design);
   disable via `POLL_FALLBACK=off`.
 - Wrangler warns the `CompiledWasm` rule needs an explicit `fallthrough`;

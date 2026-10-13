@@ -7,6 +7,6 @@
   "scripts": {
     "demo": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/scenario.ts",
     "mock": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/mock-server.ts",
-    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/agent.test.ts"
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test \"test/*.test.ts\""
   }
 }

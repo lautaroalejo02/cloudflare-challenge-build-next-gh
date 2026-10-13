@@ -105,8 +105,10 @@ Verified locally: `{"squashes":2,"earlyCutoffs":4,"retired":3}` in ~23 s.
 
 - Agents run under `node --experimental-strip-types` (no tsx dep); all sources
   are erasable-syntax-only TS (no parameter properties, enums, namespaces).
-- Clone dirs are `tmp/<entryId>-g<gen>` and are recreated per generation; the
-  old `-g0` clone is kept so a squash visibly produces a new workdir.
+- Clone dirs are `tmp/run-<id>/<entryId>-g<gen>` — unique per run because
+  entry ids restart at e1 after `/api/reset` — and are recreated per
+  generation; the old `-g0` clone is kept so a squash visibly produces a new
+  workdir. All of `tmp/` is wiped at scenario start.
 - Ready-posting races a squash: the agent re-checks `generation` before each
   scripted step and treats a 409 `stale commit` on `/ready` as "loop and
   re-read state" — the mock 409s when the posted commit is not the current
@@ -137,6 +139,108 @@ Verified locally: `{"squashes":2,"earlyCutoffs":4,"retired":3}` in ~23 s.
 ## Cloudflare resources created
 
 None — this package is local-only by design.
+
+## Live run (T9c)
+
+Against `https://arb-control-plane.lautitomasalejo.workers.dev` (deployed
+2026-10-13, version `3700ee7d`).
+
+Defects found by the orchestrator's live run (`odd/logs/parent-e2e.txt`) and
+their root causes / fixes:
+
+1. **Process hang** — the run finished at +40.5s but the process exited only
+   at ~311s. Cause: the 5-minute `setTimeout` behind `Promise.race` stayed
+   pending after completion and kept the event loop alive. Fix: the timeout
+   timer is now `unref`'d and `clearTimeout`ed on completion, and the runner
+   flushes stdout/stderr then calls `process.exit(code)` — queued pipe writes
+   can't be truncated and fetch keep-alive sockets can't delay the exit.
+2. **Tests agent contributed nothing in generation 1** — e3 retired with head
+   `6ea008d9` (= e1's head) after "nothing to commit ... already on base".
+   Root cause found from `tmp/trunk-src` on disk: `arb-trunk` persists across
+   runs (`/api/reset` does not delete repos) and the previous run's retired
+   `tests/create-order.feature.test.ts` (v2 variant) was still on trunk. The
+   seeder copied the fixture *over* the old worktree, so the stale file rode
+   into seed commit `0419d445`, then into every fork — the gen-1 rewrite was
+   byte-identical. Fixes: (a) `syncFixture` (`src/lib/fixture.ts`) deletes
+   every non-`.git` entry before copying, so the seed is exactly the fixture;
+   (b) clone dirs moved to run-unique `tmp/run-<id>/<entry>-g<gen>` and `tmp/`
+   is still wiped at scenario start; (c) control-plane `rob.ts` now ignores
+   ALL pushes to an entry while its (re)fork is pending — a stale repo sharing
+   the planned fork name could previously inject its head/exports mid-flight
+   (same class of aliasing, covered by a new `rob.test.ts` case).
+3. **Misleading dashboard stat** — "squash after push" was ~0ms live (the DO
+   stamps the producer push and consumer squashes in one `apply`). Replaced by
+   "re-fork ready": `refork.ts − squash.ts` of the entry's latest squash, an
+   honest server-side latency (read 4.1 s live; 1.3 s in the mock replay —
+   e3 squash at 7150 → refork at 8400).
+
+### Main scenario — exit 0, complete +38.0s, process exit ~1.2s later (wall 39.2s)
+
+```
+[+   0.3s] [scenario] POST /api/reset ok
+[+   2.8s] [scenario] fixture pushed to trunk at b96ad7d5
+[+   5.3s] [api     ] registered e1 seq=1 lane=api repo=arb-e1-api-0-x16
+[+  13.9s] [api     ] pushed 87b73c82 "refactor(api): extract sumCart helper from createOrder" (gen 0)
+[+  15.2s] [tests   ] pushed 8ed60577 "test: add createOrder feature coverage" (gen 0)
+[+  25.1s] [api     ] pushed f24a302d "feat(api)!: createOrder now takes { region, currency } options" (gen 0)
+[+  27.2s] [buffer  ] stats.squashes 0 -> 2
+[+  28.8s] [buffer  ] e1 (api) ready -> retired
+[+  31.3s] [tests   ] cloning arb-e3-tests-1-x12 -> e3-g1 (generation 1)
+[+  32.9s] [tests   ] detected createOrder signature v2 - writing v2 feature test
+[+  34.3s] [tests   ] pushed 66b4f88d "test: reapply feature coverage for new createOrder interface" (gen 1)
+[+  36.0s] [buffer  ] e2 (ui) ready -> retired
+[+  36.8s] [buffer  ] e3 (tests) ready -> retired
+[+  38.0s] [final   ] e1 api    status=retired gen=0 head=f24a302d
+[+  38.0s] [final   ] e2 ui     status=retired gen=1 head=37bedada
+[+  38.0s] [final   ] e3 tests  status=retired gen=1 head=66b4f88d
+[+  38.0s] [final   ] stats={"squashes":2,"earlyCutoffs":2,"retired":3,"checksRun":4,"pushesSeen":6} trunk=015bee1d retired=3
+[+  38.0s] [scenario] all three entries retired onto trunk in order - demo complete
+EXIT_CODE=0 WALL_MS=39190
+```
+
+### `--scenario failing-check` — exit 0, complete +45.8s, exit ~0.8s later (wall 46.6s)
+
+```
+[+   0.3s] [scenario] POST /api/reset ok
+[+   3.0s] [scenario] fixture pushed to trunk at 40c730db
+[+  15.6s] [tests   ] pushed 0a352333 "test: add createOrder feature coverage" (gen 0)
+[+  25.7s] [api     ] pushed 90ffecca "feat(api)!: createOrder now takes { region, currency } options" (gen 0)
+[+  28.8s] [buffer  ] stats.squashes 0 -> 2
+[+  30.4s] [buffer  ] e1 (api) ready -> retired
+[+  36.4s] [tests   ] pushed b044f649 "test: reapply feature coverage for new createOrder interface" (gen 1)
+[+  39.3s] [buffer  ] e3 (tests) speculating -> failed
+[+  40.0s] [tests   ] checks failed (1 failing) - applying scripted fix
+[+  42.5s] [buffer  ] e3 (tests) failed -> speculating
+[+  44.9s] [buffer  ] e3 (tests) ready -> retired
+[+  45.8s] [final   ] e1 api    status=retired gen=0 head=90ffecca
+[+  45.8s] [final   ] e2 ui     status=retired gen=1 head=517943ed
+[+  45.8s] [final   ] e3 tests  status=retired gen=1 head=5b405add
+[+  45.8s] [final   ] stats={"squashes":2,"earlyCutoffs":2,"retired":3,"checksRun":5,"pushesSeen":7} trunk=f26c0ce2 retired=3
+[+  45.8s] [scenario] all three entries retired onto trunk in order - demo complete
+EXIT_CODE=0 WALL_MS=46617
+```
+
+Trunk check (`git clone` of `arb-trunk` main afterwards): the file is present
+at head and was added by the tests agent's own commits, delivered via splice:
+
+```
+$ git log --format='%h %s' -- tests/create-order.feature.test.ts
+f26c0ce arb: splice 5b405addec84ff70c90fc572ac7612da6d6fd9da onto 517943edb11ad571a1ef8280096063c664d3dd57
+40c730d chore: seed fixture (order api, checkout ui, tests)
+015bee1 arb: splice 66b4f88d05d7011678c324eca6b9d778814bf380 onto 37bedadaa4c12f128822762cca18ede4d6843120
+b96ad7d chore: seed fixture (order api, checkout ui, tests)
+6bede76 arb: splice 29d64510c4cf64fc548305b8a31602779242a530 onto 8f465f0452e01cca8befa5c89a2e029c2de182df
+...
+```
+
+(`015bee1` splices the main run's e3 head `66b4f88d`; `f26c0ce` splices the
+failing-check run's e3 head `5b405add`; the `chore: seed fixture` entries are
+the seeder deleting the previous run's stale file — now a true reset.)
+
+Live dashboard captures (headless Edge, 1920x1080):
+`app/dashboard/screenshots/live-squash.png` (e2 SQUASHED with the v1→v2
+diagnosis) and `live-final.png` (all three entries retired, "re-fork ready
+4.1 s").
 
 ## Known gaps
 

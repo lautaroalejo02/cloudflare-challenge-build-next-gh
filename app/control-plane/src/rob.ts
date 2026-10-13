@@ -432,8 +432,14 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				break;
 			}
 			const target = e ?? find(state, pendingId!)!;
-			// Ignore pushes to a stale fork while a refork is in flight.
-			if (state._internal.pending[target.id] && state._internal.pending[target.id] !== cmd.repo) {
+			// Ignore ALL pushes while a fork/re-fork for this entry is in flight:
+			// the agent has no write token yet, so anything arriving is either
+			// the old fork or — because /api/reset does not delete repos — a
+			// stale repo that happens to share the planned name. Adopting its
+			// commits would alias the entry onto old content (observed live:
+			// stale fork repos named `arb-e<seq>-<lane>-<n>` persist across runs).
+			// The fork's own head is set by fork.done anyway.
+			if (state._internal.pending[target.id]) {
 				break;
 			}
 			target.headCommit = cmd.commit;

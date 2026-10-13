@@ -396,6 +396,54 @@ test("push dedupe by commit and unknown repo ignored", () => {
 	assert.equal(s.trunk.commit, "t9");
 });
 
+test("stale-repo push to the pending refork name is ignored", () => {
+	let s = trunked();
+	s = created(s, { agent: "a", lane: "api" }, {
+		commit: "p1",
+		exports: { createOrder: "h1" },
+		sigs: { createOrder: "sig1" },
+	}).state;
+	s = created(s, { agent: "u", lane: "ui", producerId: "e1", consumes: ["createOrder"] }, {
+		commit: "p1",
+		exports: { createOrder: "h1" },
+	}).state;
+
+	// Producer push squashes e2; its re-fork is in flight under the planned
+	// name arb-e2-ui-1. /api/reset does not delete repos, so a stale repo with
+	// that exact name may still exist and emit a late push event — it must NOT
+	// be adopted as e2's head (observed live: a squashed entry flipping back to
+	// speculating on a stale repo's commit).
+	const r1 = runEff(s, {
+		type: "push", repo: "arb-e1-api-0", commit: "p2",
+		exports: { createOrder: "h2" }, sigs: { createOrder: "sig2" },
+	});
+	s = r1.state;
+	assert.equal(entry(s, "e2").status, "squashed");
+	assert.equal(s._internal.pending["e2"], "arb-e2-ui-1");
+
+	const pushesBefore = s.stats.pushesSeen;
+	const r2 = runEff(s, {
+		type: "push", repo: "arb-e2-ui-1", commit: "STALE",
+		exports: { createOrder: "hz" }, sigs: { createOrder: "sigz" },
+	});
+	s = r2.state;
+	assert.equal(entry(s, "e2").headCommit, "p1"); // not the stale commit
+	assert.equal(entry(s, "e2").status, "squashed");
+	assert.equal(s.stats.pushesSeen, pushesBefore);
+
+	// The real re-fork lands under a collision suffix; pushes to the actual
+	// repo work, pushes to the stale name stay ignored.
+	s = run(s, {
+		type: "fork.done", entryId: "e2", repo: "arb-e2-ui-1-x1",
+		remote: "https://x/e2g1", baseCommit: "p2", exports: { createOrder: "h2" },
+	});
+	s = run(s, { type: "push", repo: "arb-e2-ui-1", commit: "STALE2", exports: {} });
+	assert.equal(entry(s, "e2").headCommit, "p2");
+	s = run(s, { type: "push", repo: "arb-e2-ui-1-x1", commit: "q1", exports: { createOrder: "h2" } });
+	assert.equal(entry(s, "e2").headCommit, "q1");
+	assert.equal(entry(s, "e2").status, "speculating");
+});
+
 test("squash pending dedupe: second producer push updates diagnosis, no double fork", () => {
 	let s = trunked();
 	s = created(s, { agent: "a", lane: "api" }, {
