@@ -30,15 +30,15 @@ test("repoToEntryId parses fork names incl. -xN alias suffixes", () => {
 test("mergeStates concatenates entries by seq, sums stats, takes trunk head", () => {
 	const a = initialState();
 	a.entries.push(
-		{ id: "e1", seq: 1, agent: "a", lane: "api", status: "retired", repo: "r1", remote: "", producerId: null, baseCommit: "b", headCommit: "h", exports: {}, consumes: {}, predicted: [], generation: 0, diagnosis: null, checks: null },
-		{ id: "e3", seq: 3, agent: "u", lane: "ui", status: "ready", repo: "r3", remote: "", producerId: "e1", baseCommit: "b", headCommit: "h", exports: {}, consumes: {}, predicted: [], generation: 0, diagnosis: null, checks: null },
+		{ id: "e1", seq: 1, agent: "a", lane: "api", status: "retired", repo: "r1", remote: "", producerId: null, baseCommit: "b", headCommit: "h", exports: {}, consumes: {}, consumesInferred: false, forkedExports: {}, bodies: {}, judging: [], predicted: [], generation: 0, diagnosis: null, checks: null },
+		{ id: "e3", seq: 3, agent: "u", lane: "ui", status: "ready", repo: "r3", remote: "", producerId: "e1", baseCommit: "b", headCommit: "h", exports: {}, consumes: {}, consumesInferred: false, forkedExports: {}, bodies: {}, judging: [], predicted: [], generation: 0, diagnosis: null, checks: null },
 	);
 	a.stats.squashes = 2;
 	a.stats.retired = 1;
 	a.trunk.retiredCount = 1;
 	const b = initialState();
 	b.entries.push(
-		{ id: "e2", seq: 2, agent: "p", lane: "api", status: "retired", repo: "r2", remote: "", producerId: null, baseCommit: "b", headCommit: "h", exports: {}, consumes: {}, predicted: [], generation: 0, diagnosis: null, checks: null },
+		{ id: "e2", seq: 2, agent: "p", lane: "api", status: "retired", repo: "r2", remote: "", producerId: null, baseCommit: "b", headCommit: "h", exports: {}, consumes: {}, consumesInferred: false, forkedExports: {}, bodies: {}, judging: [], predicted: [], generation: 0, diagnosis: null, checks: null },
 	);
 	b.stats.earlyCutoffs = 4;
 	b.stats.retired = 1;

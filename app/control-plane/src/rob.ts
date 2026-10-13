@@ -16,7 +16,14 @@ export type EntryStatus =
 	| "vetoed";
 
 export interface Diagnosis {
-	reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap" | "prediction-miss";
+	reason:
+		| "interface-changed"
+		| "producer-vetoed"
+		| "producer-squashed"
+		| "trunk-overlap"
+		| "prediction-miss"
+		/** (V2) Jev judged the producer's body-only change behavior-visible. */
+		| "behavior-changed";
 	changed: Array<{
 		symbol: string;
 		oldHash: string;
@@ -25,6 +32,34 @@ export interface Diagnosis {
 		newSignature: string;
 	}>;
 	producerCommit: string;
+	/** (V2) Present only for `behavior-changed`: the highest-probability
+	 * Jev verdict behind the squash. */
+	judgment?: { model: string; probability: number };
+}
+
+/** (V2) An import edge, as extracted by the hasher (app/hasher `ImportRef`). */
+export interface ImportRef {
+	/** Importing file, repo-relative. */
+	file: string;
+	/** Resolved imported file (repo-relative for relative specifiers, the
+	 * specifier as written for bare ones). */
+	from: string;
+	/** Imported binding names; `"*"` = namespace import. */
+	names: string[];
+}
+
+/** (V2) Signature map arriving on push/fork.done commands: either the plain
+ * signature text or `{ signature, file }` when the hasher knows the
+ * declaring file (needed by import-based dependency inference). */
+export type SigField = Record<string, string | { signature: string; file?: string }>;
+
+/** (V2) One per-symbol Jev verdict carried by `judge.done`. */
+export interface JudgeVerdict {
+	symbol: string;
+	/** Jev probability in [0,1], or null when judging was unavailable. */
+	probability: number | null;
+	model?: string;
+	reason?: string;
 }
 
 export interface CheckResult {
@@ -53,6 +88,17 @@ export interface Entry {
 	headCommit: string | null;
 	exports: SymbolHashes;
 	consumes: SymbolHashes;
+	/** (V2) True when `consumes` was omitted at registration and is derived
+	 * from the entry's imports on every push. */
+	consumesInferred: boolean;
+	/** (V2) The producer's `exports` snapshot at this entry's latest
+	 * (re-)fork ({} when forked from trunk): the baseline for inference. */
+	forkedExports: SymbolHashes;
+	/** (V2) Exported symbol -> bodyHash at headCommit. */
+	bodies: SymbolHashes;
+	/** (V2) Consumed symbols with a pending Jev judgment; non-empty blocks
+	 * checks and retirement. */
+	judging: string[];
 	/** Symbols whose `exports` values are unconfirmed stub predictions
 	 * (declared at registration). Cleared when the entry's first real push
 	 * resolves them against reality. */
@@ -77,6 +123,12 @@ export interface BufferState {
 		predictionHits: number;
 		/** (consumer, symbol) pairs where reality diverged from the stub. */
 		predictionMisses: number;
+		/** (V2) Jev judgments completed (non-null verdicts). */
+		judgments: number;
+		/** (V2) Squashes caused by Jev verdicts. */
+		semanticSquashes: number;
+		/** (V2) Consumed symbols derived from imports. */
+		inferredDeps: number;
 	};
 }
 
@@ -100,6 +152,18 @@ export interface ArbEvent {
 		| "veto"
 		| "config"
 		| "reset"
+		/** (V2) Newly inferred consumed symbols; `entryId` = consumer,
+		 * `data` = { producerId, symbols: Record<name, hash> }. */
+		| "deps.inferred"
+		/** (V2, best effort) The consumer imports files another live entry
+		 * owns without declaring it; `data` = { fromEntryId, paths, symbols }. */
+		| "deps.undeclared"
+		/** (V2) A Jev verdict landed; `data` = { producerId, symbol,
+		 * probability, verdict, commit, model }. */
+		| "jev.judged"
+		/** (V2) Jev was unreachable/stale; `data` = { producerId, symbol,
+		 * reason }. Treated as `clear`. */
+		| "jev.unavailable"
 		/** Recovery narration (T19): a stale in-flight marker was swept and the
 		 * work re-issued, or an effect threw and was reported instead of
 		 * wedging the queue. `data` carries {kind, entryId?, detail?}. */
@@ -178,10 +242,31 @@ export interface RobInternal {
 	 * fork.done (the fork carries the pre-push base) and are released when the
 	 * producer's first push resolves its predictions. */
 	predConsumed: Record<string, string[]>;
+	/** (V2) entryId -> exported symbol -> repo-relative declaring file
+	 * (drives import-based dependency inference and `deps.undeclared`). */
+	files: Record<string, SymbolHashes>;
+	/** (V2) consumerId -> consumed symbol -> pending Jev mark (sweep +
+	 * staleness bookkeeping; `judging` on the entry is the public view). */
+	judgeMarks: Record<string, Record<string, JudgeMark>>;
+	/** (V2) entryId -> "fromEntryId|path" keys already reported through
+	 * `deps.undeclared` (dedupe per import edge). */
+	depsReported: Record<string, string[]>;
 	/** Bounded event log for debugging. */
 	eventLog: ArbEvent[];
 	/** Hot-path indexes (T14); maintained by apply(), rebuilt when stale. */
 	idx?: RobIndexes;
+}
+
+/** (V2) Bookkeeping for one pending Jev judgment on a consumed symbol. */
+export interface JudgeMark {
+	/** When the judgment was emitted (stale-marker sweep). */
+	at: number;
+	/** Producer commit the judgment is about (staleness + judge.done match). */
+	commit: string;
+	producerId: string;
+	/** Body hashes for the behavior-changed diagnosis. */
+	oldBody: string;
+	newBody: string;
 }
 
 export interface RobState extends BufferState {
@@ -201,6 +286,9 @@ export function initialState(): RobState {
 			pushesSeen: 0,
 			predictionHits: 0,
 			predictionMisses: 0,
+			judgments: 0,
+			semanticSquashes: 0,
+			inferredDeps: 0,
 		},
 		_internal: {
 			sigs: {},
@@ -218,6 +306,9 @@ export function initialState(): RobState {
 			seenPushes: [],
 			repoAlias: {},
 			predConsumed: {},
+			files: {},
+			judgeMarks: {},
+			depsReported: {},
 			eventLog: [],
 			idx: emptyIndexes(),
 		},
@@ -242,7 +333,7 @@ export type Cmd =
 			consumes?: string[];
 			/** Declared-stub prediction: the producer's intended exported
 			 * interface, already hashed by the interpreter. */
-			stub?: { exports: SymbolHashes; sigs: SymbolSignatures };
+			stub?: { exports: SymbolHashes; sigs: SigField };
 			/** Sharded control plane (T14): the router assigns the global id/seq
 			 * before the component DO applies the create. */
 			id?: string;
@@ -255,7 +346,9 @@ export type Cmd =
 			remote: string;
 			baseCommit: string;
 			exports: SymbolHashes;
-			sigs?: SymbolSignatures;
+			sigs?: SigField;
+			/** (V2) Exported symbol -> bodyHash of the forked content. */
+			bodies?: SymbolHashes;
 			/** Planned name the fork effect targeted (`Effect.fork.toRepo`). A
 			 * fork.done whose planned name no longer matches the entry's
 			 * pending fork was superseded by a newer re-fork and is dropped. */
@@ -267,7 +360,26 @@ export type Cmd =
 	/** A non-fork effect threw (token, broadcast, ...): narrate it as a
 	 * `recover` event; the effect queue continues (T19). */
 	| { type: "effect.failed"; entryId?: string; effect: string; reason: string }
-	| { type: "push"; repo: string; commit: string; exports?: SymbolHashes; sigs?: SymbolSignatures }
+	| {
+			type: "push";
+			repo: string;
+			commit: string;
+			exports?: SymbolHashes;
+			sigs?: SigField;
+			/** (V2) Import edges of the pushed tree (hasher `extractImports`). */
+			imports?: ImportRef[];
+			/** (V2) Exported symbol -> bodyHash of the pushed content. */
+			bodies?: SymbolHashes;
+	  }
+	/** (V2) Jev verdicts for one consumer/producer pair (one judge effect). */
+	| {
+			type: "judge.done";
+			consumerId: string;
+			producerId: string;
+			commit: string;
+			generation: number;
+			verdicts: JudgeVerdict[];
+	  }
 	| { type: "entry.ready"; entryId: string; commit: string }
 	| { type: "check.done"; entryId: string; result: CheckResult }
 	/** One atomic-cycle attempt rebuilt after a rejected trunk move (T17).
@@ -304,6 +416,9 @@ export type Effect =
 	| { type: "token"; entryId: string; repo: string }
 	| { type: "check"; entryId: string; repo: string; commit: string }
 	| { type: "retire"; entryId: string; fromRepo: string; commit: string; baseCommit: string; toRepo: string; branch: string }
+	/** (V2) Judge `symbols` of `producerId` at `commit` for `consumerId`
+	 * (generation pins the consumer view the verdict applies to). */
+	| { type: "judge"; consumerId: string; producerId: string; symbols: string[]; commit: string; generation: number }
 	| { type: "broadcast"; event: ArbEvent };
 
 export type ApplyResult =
@@ -322,6 +437,33 @@ export function emptyIndexes(): RobIndexes {
 	return { byId: {}, byRepo: {}, childrenOf: {}, pendingRepo: {}, headCursor: 0, active: 0, lastSeq: 0, n: 0 };
 }
 
+/** (V2) Defaults for Entry fields added after v1, used to forward-fill
+ * persisted/hand-built entries. */
+export function entryDefaults(): Pick<Entry, "consumesInferred" | "forkedExports" | "bodies" | "judging"> {
+	return { consumesInferred: false, forkedExports: {}, bodies: {}, judging: [] };
+}
+
+/** Split a `SigField` into plain signatures + declaring files. */
+function splitSigs(field: SigField | undefined): { sigs: SymbolSignatures; files: SymbolHashes } {
+	const sigs: SymbolSignatures = {};
+	const files: SymbolHashes = {};
+	for (const [k, v] of Object.entries(field ?? {})) {
+		if (typeof v === "string") sigs[k] = v;
+		else {
+			sigs[k] = v.signature;
+			if (v.file) files[k] = v.file;
+		}
+	}
+	return { sigs, files };
+}
+
+/** Clear an entry's pending judgments (squash/re-fork/terminal state makes
+ * any in-flight verdict moot). */
+function clearJudging(state: RobState, e: Entry): void {
+	e.judging = [];
+	delete state._internal.judgeMarks[e.id];
+}
+
 /** Rebuild every index from `entries` + `pending` (re-sorts entries by seq).
  * Called on first apply after load/persist-restore, and whenever `entries`
  * changed size outside the machine. */
@@ -330,12 +472,20 @@ export function rebuildIndexes(state: RobState): RobIndexes {
 	entries.sort((a, b) => a.seq - b.seq);
 	const i = emptyIndexes();
 	for (const e of entries) {
+		// (V2) forward-fill fields absent from v1-persisted entries.
+		Object.assign(e, entryDefaults(), e);
 		i.byId[e.id] = e.seq;
 		if (e.repo) i.byRepo[e.repo] = e.id;
 		if (e.producerId) (i.childrenOf[e.producerId] ??= []).push(e.id);
 		if (e.status !== "retired") i.active += 1;
 		if (e.seq > i.lastSeq) i.lastSeq = e.seq;
 	}
+	// (V2) forward-fill stats/internal maps added after v1.
+	state.stats = { ...initialState().stats, ...state.stats };
+	const ii = state._internal;
+	ii.files ??= {};
+	ii.judgeMarks ??= {};
+	ii.depsReported ??= {};
 	for (const [id, repo] of Object.entries(state._internal.pending)) i.pendingRepo[repo] = id;
 	while (i.headCursor < entries.length && !live(entries[i.headCursor])) i.headCursor++;
 	i.n = entries.length;
@@ -525,6 +675,7 @@ function squashTree(
 		c.generation += 1;
 		c.status = "squashed";
 		c.diagnosis = { reason, changed, producerCommit };
+		clearJudging(state, c);
 		if (reparentTo !== undefined) {
 			reparent(state, c.id, c.producerId, reparentTo);
 			c.producerId = reparentTo;
@@ -561,7 +712,10 @@ export const INFRA_RECHECK_MS = 10_000;
 /** Advance the retirement pipeline: the head entry checks, then retires. */
 function cascade(state: RobState, effects: Effect[], now: number): void {
 	const h = head(state);
-	if (!h || state._internal.pending[h.id]) return;
+	// (V2) pending Jev judgments gate checks and retirement — a later verdict
+	// may still squash this entry, so the pipeline waits for the judgment
+	// (bounded by the 60 s stale-mark sweep).
+	if (!h || state._internal.pending[h.id] || (h.judging?.length ?? 0) > 0) return;
 	if (h.status === "ready" && !state._internal.checking[h.id]) {
 		if (!h.checks || h.checks.commit !== h.headCommit) {
 			h.status = "checking";
@@ -596,6 +750,16 @@ function cascade(state: RobState, effects: Effect[], now: number): void {
 
 export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult {
 	const effects: Effect[] = [];
+	// (V2) forward-fill fields missing from v1-persisted states; idx() may
+	// skip rebuildIndexes when the index still matches, so this runs here.
+	state.stats = { ...initialState().stats, ...state.stats };
+	const ii0 = state._internal;
+	ii0.files ??= {};
+	ii0.judgeMarks ??= {};
+	ii0.depsReported ??= {};
+	for (const e of state.entries) {
+		if (e.judging === undefined) Object.assign(e, entryDefaults(), e);
+	}
 	idx(state); // heal indexes if entries moved outside the machine
 
 	switch (cmd.type) {
@@ -636,6 +800,9 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 					consumes[s] = "";
 				}
 			}
+			// (V2) `consumes` omitted on a produced entry => infer it from
+			// imports on every push (explicit [] still counts as declared).
+			const consumesInferred = cmd.consumes === undefined && producer !== undefined;
 			const entry: Entry = {
 				id,
 				seq,
@@ -649,6 +816,10 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				headCommit: null,
 				exports: cmd.stub ? { ...cmd.stub.exports } : {},
 				consumes,
+				consumesInferred,
+				forkedExports: {},
+				bodies: {},
+				judging: [],
 				predicted: cmd.stub ? Object.keys(cmd.stub.exports) : [],
 				generation: 0,
 				diagnosis: null,
@@ -668,7 +839,11 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			// live entry then occupies the earliest live position.
 			if (pos <= ix.headCursor) ix.headCursor = pos;
 			if (pinned.length) state._internal.predConsumed[id] = pinned;
-			if (cmd.stub) state._internal.sigs[id] = { ...cmd.stub.sigs };
+			if (cmd.stub) {
+				const stubMaps = splitSigs(cmd.stub.sigs);
+				state._internal.sigs[id] = stubMaps.sigs;
+				state._internal.files[id] = stubMaps.files;
+			}
 			const fromRepo = producer ? producer.repo : state.trunk.repo;
 			const repo = forkEffect(state, effects, entry, fromRepo, now);
 			entry.repo = repo;
@@ -684,6 +859,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 					repo,
 					exports: entry.exports,
 					consumes: entry.consumes,
+					consumesInferred: entry.consumesInferred,
 					predicted: entry.predicted,
 				},
 			});
@@ -708,22 +884,31 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			e.remote = cmd.remote;
 			e.baseCommit = cmd.baseCommit;
 			e.headCommit = cmd.baseCommit;
+			// A fresh base makes every pending judgment moot (generation moved).
+			clearJudging(state, e);
+			e.bodies = cmd.bodies ?? {};
+			const newSigs = splitSigs(cmd.sigs);
 			// A stubbed producer's fork carries its pre-push base: keep the
 			// declared (predicted) hashes and signatures for predicted symbols
 			// until the first real push resolves them against reality.
 			if (e.predicted.length) {
 				const keep: SymbolHashes = {};
 				const keepSig: SymbolSignatures = {};
+				const keepFile: SymbolHashes = {};
 				const curSigs = state._internal.sigs[e.id] ?? {};
+				const curFiles = state._internal.files[e.id] ?? {};
 				for (const sym of e.predicted) {
 					keep[sym] = e.exports[sym];
 					keepSig[sym] = curSigs[sym] ?? "";
+					if (curFiles[sym]) keepFile[sym] = curFiles[sym];
 				}
 				e.exports = { ...cmd.exports, ...keep };
-				state._internal.sigs[e.id] = { ...(cmd.sigs ?? {}), ...keepSig };
+				state._internal.sigs[e.id] = { ...newSigs.sigs, ...keepSig };
+				state._internal.files[e.id] = { ...newSigs.files, ...keepFile };
 			} else {
 				e.exports = cmd.exports;
-				state._internal.sigs[e.id] = cmd.sigs ?? {};
+				state._internal.sigs[e.id] = newSigs.sigs;
+				state._internal.files[e.id] = newSigs.files;
 			}
 			// Consumes pinned to a producer's stub prediction keep the declared
 			// hash, not the fork's (pre-push) content; unpinned ones fill in.
@@ -747,6 +932,9 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			// instead of handing out its token. Pinned stub symbols are skipped:
 			// they resolve on the producer's first push (prediction verdicts).
 			const producer = e.producerId ? find(state, e.producerId) : undefined;
+			// (V2) Snapshot the producer's exports at (re-)fork time: the
+			// baseline every import-inferred consumes value is pinned to.
+			e.forkedExports = producer ? { ...producer.exports } : {};
 			if (
 				producer &&
 				live(producer) &&
@@ -827,7 +1015,14 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const predictedSyms = cmd.exports ? target.predicted.slice() : [];
 			const predSigs = { ...(state._internal.sigs[target.id] ?? {}) };
 			if (cmd.exports) target.exports = cmd.exports;
-			if (cmd.sigs) state._internal.sigs[target.id] = cmd.sigs;
+			if (cmd.sigs) {
+				const maps = splitSigs(cmd.sigs);
+				state._internal.sigs[target.id] = maps.sigs;
+				state._internal.files[target.id] = maps.files;
+			}
+			const oldBodies = { ...(target.bodies ?? {}) };
+			if (cmd.bodies) target.bodies = cmd.bodies;
+			const newBodies = target.bodies ?? {};
 			if (predictedSyms.length) target.predicted = [];
 			target.diagnosis = null;
 			if (target.status === "squashed" || target.status === "failed" || target.status === "ready" || target.status === "checking") {
@@ -843,6 +1038,112 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				entryId: target.id,
 				data: { repo: cmd.repo, commit: cmd.commit },
 			});
+			// (V2) Dependency inference: an entry registered without `consumes`
+			// fills it from imports of the producer's declaring files, pinned to
+			// the hashes its last (re-)fork carried (`forkedExports`). A newly
+			// inferred name that already drifted squashes immediately.
+			let inferredDrift: Diagnosis["changed"] = [];
+			const pushProducer = target.producerId ? find(state, target.producerId) : undefined;
+			if (cmd.imports && target.consumesInferred && pushProducer) {
+				const prodFiles = state._internal.files[pushProducer.id] ?? {};
+				const symsByFile = new Map<string, string[]>();
+				for (const [sym, f] of Object.entries(prodFiles)) {
+					const list = symsByFile.get(f) ?? [];
+					list.push(sym);
+					symsByFile.set(f, list);
+				}
+				const inferred: SymbolHashes = {};
+				for (const imp of cmd.imports) {
+					const here = symsByFile.get(imp.from);
+					if (!here) continue;
+					for (const n of imp.names.includes("*") ? here : imp.names) {
+						if (!here.includes(n) || n in target.consumes) continue;
+						target.consumes[n] = inferred[n] = target.forkedExports[n] ?? "";
+					}
+				}
+				if (Object.keys(inferred).length) {
+					state.stats.inferredDeps += Object.keys(inferred).length;
+					emit(state, effects, now, {
+						type: "deps.inferred",
+						entryId: target.id,
+						data: { producerId: pushProducer.id, symbols: inferred },
+					});
+					inferredDrift = consumedDiff(
+						inferred,
+						pushProducer.exports,
+						state._internal.sigs[target.id] ?? {},
+						state._internal.sigs[pushProducer.id] ?? {},
+					);
+				}
+			}
+			// (V2, best effort) Report imports of files another live,
+			// non-ancestor entry owns — i.e. declaring one of ITS exports that
+			// no ancestor of `target` provides. Reported once per (entry, file).
+			if (cmd.imports) {
+				const ancestors = new Set<string>();
+				for (let p: string | null = target.producerId; p; ) {
+					ancestors.add(p);
+					p = find(state, p)?.producerId ?? null;
+				}
+				const ancExports = new Set<string>();
+				for (const a of ancestors) {
+					for (const s of Object.keys(find(state, a)?.exports ?? {})) ancExports.add(s);
+				}
+				const fileOwner = new Map<string, { entryId: string; syms: string[] }>();
+				for (const o of state.entries) {
+					if (o.id === target.id || !live(o) || ancestors.has(o.id)) continue;
+					for (const [sym, f] of Object.entries(state._internal.files[o.id] ?? {})) {
+						if (!f || ancExports.has(sym)) continue;
+						const rec = fileOwner.get(f) ?? { entryId: o.id, syms: [] };
+						rec.syms.push(sym);
+						fileOwner.set(f, rec);
+					}
+				}
+				const reported = (state._internal.depsReported[target.id] ??= []);
+				const byOwner = new Map<string, { paths: Set<string>; symbols: Set<string> }>();
+				for (const imp of cmd.imports) {
+					const o = fileOwner.get(imp.from);
+					if (!o) continue;
+					const key = `${o.entryId}|${imp.from}`;
+					if (reported.includes(key)) continue;
+					reported.push(key);
+					const g = byOwner.get(o.entryId) ?? { paths: new Set<string>(), symbols: new Set<string>() };
+					for (const n of imp.names.includes("*") ? o.syms : imp.names) g.symbols.add(n);
+					g.paths.add(imp.from);
+					byOwner.set(o.entryId, g);
+				}
+				for (const [fromEntryId, g] of byOwner) {
+					emit(state, effects, now, {
+						type: "deps.undeclared",
+						entryId: target.id,
+						data: { fromEntryId, paths: [...g.paths], symbols: [...g.symbols] },
+					});
+				}
+			}
+			if (inferredDrift.length && pushProducer) {
+				const producerCommit = pushProducer.headCommit ?? "";
+				emit(state, effects, now, {
+					type: "hash.changed",
+					entryId: target.id,
+					data: { producerId: pushProducer.id, commit: producerCommit, changed: inferredDrift },
+				});
+				target.generation += 1;
+				target.status = "squashed";
+				target.diagnosis = { reason: "interface-changed", changed: inferredDrift, producerCommit };
+				clearJudging(state, target);
+				state.stats.squashes += 1;
+				const newRepo = forkEffect(state, effects, target, pushProducer.repo, now);
+				emit(state, effects, now, {
+					type: "squash",
+					entryId: target.id,
+					data: { reason: "interface-changed", changed: inferredDrift, generation: target.generation, repo: newRepo },
+				});
+				squashTree(
+					state, effects, now, target, "producer-squashed", newRepo,
+					pushProducer.exports, state._internal.sigs[pushProducer.id] ?? {}, producerCommit, undefined,
+				);
+				break;
+			}
 			// Compare each live consumer's recorded hashes against the new exports.
 			const exports = target.exports;
 			const sigs = state._internal.sigs[target.id] ?? {};
@@ -908,6 +1209,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 						c.generation += 1;
 						c.status = "squashed";
 						c.diagnosis = { reason: "prediction-miss", changed: diagChanged, producerCommit: cmd.commit };
+						clearJudging(state, c);
 						state.stats.squashes += 1;
 						const newRepo = forkEffect(state, effects, c, target.repo, now);
 						emit(state, effects, now, {
@@ -929,6 +1231,34 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 						entryId: c.id,
 						data: { producerId: target.id, commit: cmd.commit },
 					});
+					// (V2) A body-only change on a consumed symbol is behavior
+					// territory the interface diff cannot see: keep the cutoff,
+					// mark `judging`, and emit ONE judge effect per consumer.
+					// A newer push re-marks the symbol for a fresh judgment.
+					if (cmd.bodies && c.status !== "squashed") {
+						c.judging ??= [];
+						const marks = (state._internal.judgeMarks[c.id] ??= {});
+						const pending: string[] = [];
+						for (const s of Object.keys(c.consumes)) {
+							const ob = oldBodies[s];
+							// A first-recorded bodyHash is the baseline, not a
+							// change: only a known prior body can have changed.
+							if (ob === undefined || ob === newBodies[s]) continue;
+							if (!c.judging.includes(s)) c.judging.push(s);
+							marks[s] = { at: now, commit: cmd.commit, producerId: target.id, oldBody: ob, newBody: newBodies[s] ?? "" };
+							pending.push(s);
+						}
+						if (pending.length) {
+							effects.push({
+								type: "judge",
+								consumerId: c.id,
+								producerId: target.id,
+								symbols: pending,
+								commit: cmd.commit,
+								generation: c.generation,
+							});
+						}
+					}
 					continue;
 				}
 				emit(state, effects, now, {
@@ -945,6 +1275,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				c.generation += 1;
 				c.status = "squashed";
 				c.diagnosis = { reason: "interface-changed", changed, producerCommit: cmd.commit };
+				clearJudging(state, c);
 				state.stats.squashes += 1;
 				const newRepo = forkEffect(state, effects, c, target.repo, now);
 				emit(state, effects, now, {
@@ -954,6 +1285,93 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				});
 				squashTree(state, effects, now, c, "producer-squashed", newRepo, exports, sigs, cmd.commit, undefined);
 			}
+			break;
+		}
+
+		case "judge.done": {
+			const c = find(state, cmd.consumerId);
+			if (!c) break;
+			// Clear the marks THIS verdict answered — but only marks still
+			// pointing at the judged commit: a newer push re-marked the symbol
+			// for a fresh judgment and must keep it gated.
+			const marks = state._internal.judgeMarks[c.id] ?? {};
+			const captured: Record<string, JudgeMark> = {};
+			for (const v of cmd.verdicts) {
+				const m = marks[v.symbol];
+				if (m && m.commit === cmd.commit) {
+					captured[v.symbol] = m;
+					delete marks[v.symbol];
+					c.judging = (c.judging ?? []).filter((s) => s !== v.symbol);
+				}
+			}
+			const producer = find(state, cmd.producerId);
+			// Stale verdict (contract): the producer's head moved past the
+			// judged commit, or the consumer re-forked (generation changed) —
+			// drop it.
+			if (!producer || producer.headCommit !== cmd.commit || c.generation !== cmd.generation) break;
+			const prodSigs = state._internal.sigs[producer.id] ?? {};
+			const changed: Diagnosis["changed"] = [];
+			let top: { model: string; probability: number } | undefined;
+			for (const v of cmd.verdicts) {
+				if (v.probability === null || v.probability === undefined) {
+					emit(state, effects, now, {
+						type: "jev.unavailable",
+						entryId: c.id,
+						data: { producerId: cmd.producerId, symbol: v.symbol, reason: v.reason ?? "unavailable" },
+					});
+					continue;
+				}
+				const verdict = v.probability >= 0.7 ? "squash" : v.probability >= 0.4 ? "warn" : "clear";
+				const model = v.model ?? "jev-latest";
+				state.stats.judgments += 1;
+				emit(state, effects, now, {
+					type: "jev.judged",
+					entryId: c.id,
+					data: {
+						producerId: cmd.producerId,
+						symbol: v.symbol,
+						probability: v.probability,
+						verdict,
+						commit: cmd.commit,
+						model,
+					},
+				});
+				if (verdict === "squash") {
+					if (!top || v.probability > top.probability) top = { model, probability: v.probability };
+					const m = captured[v.symbol];
+					changed.push({
+						symbol: v.symbol,
+						oldHash: m?.oldBody ?? "",
+						newHash: m?.newBody ?? "",
+						oldSignature: prodSigs[v.symbol] ?? "",
+						newSignature: prodSigs[v.symbol] ?? "",
+					});
+				}
+			}
+			if (!changed.length || !live(c) || c.status === "squashed") break;
+			if (state._internal.pending[c.id]) {
+				c.diagnosis = { reason: "behavior-changed", changed, producerCommit: cmd.commit, judgment: top };
+				break;
+			}
+			c.generation += 1;
+			c.status = "squashed";
+			c.diagnosis = { reason: "behavior-changed", changed, producerCommit: cmd.commit, judgment: top };
+			clearJudging(state, c);
+			state.stats.squashes += 1;
+			state.stats.semanticSquashes += 1;
+			const newRepo = forkEffect(state, effects, c, producer.repo, now);
+			emit(state, effects, now, {
+				type: "squash",
+				entryId: c.id,
+				data: {
+					reason: "behavior-changed",
+					changed,
+					generation: c.generation,
+					repo: newRepo,
+					judgment: top,
+				},
+			});
+			squashTree(state, effects, now, c, "producer-squashed", newRepo, producer.exports, prodSigs, cmd.commit, undefined);
 			break;
 		}
 
@@ -1132,6 +1550,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			e.generation += 1;
 			e.status = "squashed";
 			e.diagnosis = { reason: "trunk-overlap", changed: [], producerCommit: state.trunk.commit ?? e.baseCommit };
+			clearJudging(state, e);
 			state.stats.squashes += 1;
 			const newRepo = forkEffect(state, effects, e, fromRepo, now);
 			emit(state, effects, now, {
@@ -1195,6 +1614,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				return err(409, `entry ${e.id} is retiring; retry after the cycle lands`);
 			}
 			e.status = "vetoed";
+			clearJudging(state, e);
 			clearPending(state, e.id);
 			delete state._internal.forkFails[e.id];
 			delete state._internal.forkRetryAt[e.id];
@@ -1256,6 +1676,24 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const ii = state._internal;
 			for (const e of state.entries) {
 				if (!live(e)) continue;
+				// (V2) Jev marks older than the marker TTL are presumed lost
+				// (the judge effect threw or the DO restarted): clear them as
+				// unavailable so the entry can retire.
+				const jm = ii.judgeMarks?.[e.id];
+				if (jm && e.judging?.length) {
+					for (const sym of [...e.judging]) {
+						const m = jm[sym];
+						if (m && now - m.at > STALE_MARKER_MS) {
+							delete jm[sym];
+							e.judging = e.judging.filter((x) => x !== sym);
+							emit(state, effects, now, {
+								type: "jev.unavailable",
+								entryId: e.id,
+								data: { producerId: m.producerId, symbol: sym, reason: "stale" },
+							});
+						}
+					}
+				}
 				const planned = ii.pending[e.id];
 				if (planned) {
 					const pendAt = ii.pendingStart[e.id];

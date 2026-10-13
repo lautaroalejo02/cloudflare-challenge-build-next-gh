@@ -12,7 +12,7 @@ Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
   the DO. Internal bookkeeping (`_internal`: signature texts, in-flight
   forks, check/retire dedupe, push dedupe, event log) is persisted but
   stripped from `GET /api/state` via `publicState()`.
-- `test/` — 92 node:test cases (54 before T19; see "Review fixes (T19)") (run with `node --experimental-strip-types`,
+- `test/` — 124 node:test cases (92 before V3; see "V2 (inference + Jev)") (run with `node --experimental-strip-types`,
   Node 22.15): `rob.test.ts` state machine (forwarding, early cutoff, squash
   + diagnosis, transitive squash, in-order retirement, failing check +
   retry, robSize 409, veto + transitive dependents, veto non-head 409,
@@ -76,7 +76,7 @@ Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
 
 ```sh
 npm install
-npm test                 # 92 unit tests (state machine + splice + git + atomic + effects + auth), no CF needed
+npm test                 # 124 unit tests (state machine + splice + git + atomic + effects + auth + v2/jev), no CF needed
 npx tsc --noEmit         # typecheck (also compiles app/hasher + app/checker sources)
 npx wrangler types       # regenerate worker-configuration.d.ts
 scripts/setup.sh         # queue + subscription + deploy (Wrangler >= 4.149)
@@ -483,6 +483,101 @@ Local: `--scenario multi` against the mock (`npm run mock -- --port <p>
 --root <dir outside app/demo/tmp>`) exits 0 now that the mock serves
 `GET /api/events` (the scenario wipes `app/demo/tmp`, so the mock root must
 live elsewhere).
+
+## V2 (inference + Jev)
+
+Control-plane half of ARB v2 (Task V3): dependency inference so entries can
+register without `consumes`, and TypeSafe Jev semantic squashes for body-only
+producer changes. The other half (`extractImports`, `SymbolSignature
+file`/`bodyHash`/`source`) lands in `app/hasher` (V1) — coded against the
+contract only; everything degrades to v1 behavior while it is absent or the
+`TYPESAFE_API_KEY` secret is unset. NOT deployed (V4 does integration).
+
+| finding | design | test |
+|---|---|---|
+| `consumes` hand-written everywhere; contracts already declare `consumes` optional | `entry.create` sets `consumesInferred` when `consumes` is omitted and `producerId` is set; every push of that entry maps imports onto the producer's declaring files (`_internal.files[id][sym]`, fed by per-symbol `file` on `sigs`) and pins `consumes[name] = forkedExports[name]` (producer's exports snapshotted at each `fork.done`); `"*"` expands to the file's producer exports | `v2.test.ts` named / `*` / not-exported / `deps.inferred` only-new |
+| inferred deps must still respect drift | newly inferred names that already differ from the producer's current exports go through the ordinary `interface-changed` squash path (hash.changed → squash → refork → `producer-squashed` cascade) | `v2.test.ts` "immediate squash on drift" |
+| interface hashing cannot see body-only changes | `push` gains `bodies` (export → bodyHash); a consumed symbol whose interface hash is unchanged but whose KNOWN prior bodyHash changed marks `entry.judging` and emits one `judge` effect per consumer (early cutoff + `hash.unchanged` unchanged) | `v2.test.ts` judge trigger ×3 (body-only / interface / non-consumed) |
+| verdicts arrive asynchronously and can be stale | `judge.done` clears marks for its own commit, then applies only when `producer.headCommit === commit` and the consumer generation is unchanged; thresholds squash ≥0.7 / warn ≥0.4 / clear; null → `jev.unavailable`; squash is `behavior-changed` + `judgment{model,probability}`, `changed[]` carries body hashes + the unchanged signature; `stats.judgments`/`semanticSquashes` | `v2.test.ts` judge.done ×6 incl. stale commit / stale generation / grandchild cascade |
+| pending judgments must not retire a body-stale consumer | `cascade` gates check+retire on `judging.length`; sweep clears marks older than 60 s as `jev.unavailable` (reason `stale`) | `v2.test.ts` gate + sweep |
+| first push carrying `bodies` would judge every consumed symbol | only a KNOWN prior bodyHash counts as a change (`oldBodies[s]` undefined = baseline); a newer push re-marks a judged symbol for a fresh judgment | `v2.test.ts` forward-fill + stale-commit tests |
+| Jev I/O must never leak the key or wedge the queue | `src/jev.ts` `judgeBehavior`: POST `/v1/systemone`, `{state, model:"jev-latest", questions}` one `noul` question per symbol (`s0…` ids, safe for any symbol name), contract question/criteria verbatim; retry 429/529/5xx (0.5 s, 1 s) with per-attempt 8 s `AbortController`; 401/422/no-key/exhausted → `probability:null` + fixed short reason; `sleep` is an injectable test seam | `jev.test.ts` ×7: exact body, one-request multi-symbol, retry/backoff, 401/422/exhausted, timeout, no key, key never in output |
+| judge needs before/after sources and the consumer's usage | DO-side `SourceStorePort` (key `src/<entryId>`, outside `BufferState`): every push/fork-done persists `{file, bodyHash, source→4000c}` + `prev` (last different declaration). The judge effect reads the consumer tree at `headCommit ?? baseCommit`, selects files importing the symbol's file (usage, 6000c each), calls the port, applies `judge.done`; any throw → `judge.done` nulls inside the existing per-effect try/catch | `effects.test.ts` judge effect + missing-port/failure → nulls, `pushCommand` forwards imports/bodies/sigs+files |
+
+**How `TYPESAFE_API_KEY` is set (value never committed):**
+
+```sh
+# app/control-plane — once per environment:
+echo "$KEY" > .secret-typesafe-key          # gitignored by the root .secret* rule
+npx wrangler secret put TYPESAFE_API_KEY < .secret-typesafe-key
+```
+
+- `Env.TYPESAFE_API_KEY?: string` (optional). Absent = `judgeBehavior`
+  returns `no-api-key` null verdicts → `jev.unavailable` events, v1 otherwise.
+- Local dev reads the same secret mechanism as `ARB_ADMIN_KEY`; the contract's
+  `.secret-typesafe-key` file is already covered by `.gitignore`.
+
+**Run / test / deploy:** `npm test` (124), `npx tsc --noEmit`,
+`npx wrangler deploy --dry-run --outdir tmp/v3-dry` — no deploy for this task.
+
+**Decisions:**
+- `sigs` on `push`/`fork.done`/`stub` widened to `SigField` (`string |
+  {signature, file}`): per-symbol `file` arrives through `sigs` per the
+  contract, so `_internal.sigs`/`_internal.files` split them with
+  `splitSigs()`. Old string-form sigs still work (files map just stays
+  sparse → inference/undeclared simply see no files).
+- `forkedExports` is a plain `{...producer.exports}` snapshot at each
+  `fork.done` (predicted-stub values included — the pin bookkeeping is
+  separate). Trunk-forked entries get `{}`.
+- Question ids are positional (`s${i}`): symbol names can be arbitrary and
+  need no escaping. With >1 symbol, `state.producer` is an array (the
+  contract's single-object shape only covers one symbol); each question's
+  `instructions` carries that symbol's own `{producer, consumer.usage}` so
+  backtick refs resolve per-question.
+- Verdict staleness matches the contract literally: producer head + consumer
+  generation. Marks are cleared only when `mark.commit === verdict.commit`,
+  so a stale verdict cannot un-gate a newer pending judgment.
+- `deps.undeclared` is O(imports × entries): each live non-ancestor entry's
+  OWN files (declaring a symbol no ancestor of the pusher exports) is the
+  owner map; reported once per (owner, file) via `_internal.depsReported`.
+  Well under the contract's ~300 ms budget — no timing gate needed.
+- Every squash/terminal path clears `judging` + marks (`clearJudging`):
+  interface/prediction/behavior squashes, `squashTree` dependents,
+  trunk-overlap, veto, and `fork.done` (a fresh base makes verdicts moot).
+- `interfaceToMaps` reads `file`/`bodyHash`/`source` defensively so a pre-V1
+  hasher still deploys; `realHasher()` exposes `extractImports` only when
+  the module actually exports it.
+
+**Contract issues:**
+- `Cmd.sigs` shape for `file` was unspecified; chose the `SigField` union so
+  legacy string sigs keep working (documented above).
+- Contract says `state.producer` is a single object but mandates one request
+  per consumer for multiple symbols — the array form for N>1 is a documented
+  extension.
+- `state.consumer.usage` for multi-symbol requests is the union of all
+  symbols' usage files (per-question usage stays exact in `instructions`).
+
+**Resources:** none — nothing deployed for this task (V4). The only new
+config is the optional `TYPESAFE_API_KEY` Worker secret (setup above).
+
+**Known gaps:**
+- `npx tsc --noEmit` currently fails inside `app/hasher/src/index.ts`
+  (3 errors, `includeBodies` callback vs `.map` index param — V1 agent's
+  in-flight work, not this surface). Control-plane files typecheck clean.
+  `wrangler deploy --dry-run` builds regardless (esbuild, no typecheck).
+- `prev` sources only retain the last DIFFERENT declaration per symbol; a
+  judge effect for an older commit still sees the latest pair (the machine
+  drops stale verdicts anyway).
+- `deps.undeclared` sees only what `files` knows: an entry whose files map
+  is empty (e.g. its pushes carried no sigs) is invisible as an owner —
+  best-effort per contract.
+- A judge effect reads the consumer tree at the CURRENT headCommit, which
+  can differ from the tree the body diff was computed on; stale verdicts are
+  still dropped producer-side by the commit check.
+- Usage file matching compares `ImportRef.from` to the declaring file;
+  symbols re-exported through a barrel file resolve to the barrel, not the
+  declaration — inference is then exact by contract (producer exports from
+  the imported file), but Jev usage matching follows the same path.
 
 ## Cloudflare resources created
 

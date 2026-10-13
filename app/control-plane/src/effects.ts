@@ -11,20 +11,44 @@
 
 import type { InterfaceHash } from "../../hasher/src/index.ts";
 import { errorText, withRetry } from "../../checker/src/retry.ts";
-import type { ArbEvent, CheckResult, Cmd, Effect, RobState, SymbolHashes, SymbolSignatures } from "./rob.ts";
-import type { ArtifactsPort, CreatedRepo, Ports } from "./ports.ts";
+import type { ArbEvent, CheckResult, Cmd, Effect, JudgeVerdict, RobState, SigField, SymbolHashes } from "./rob.ts";
+import type { ArtifactsPort, CreatedRepo, Ports, SourceInput, SourceRecord } from "./ports.ts";
+import type { JudgeInput, JudgeSymbolInput } from "./jev.ts";
 
 /** Write-token lifetime minted for agents. */
 export const TOKEN_TTL_S = 3600;
 /** A minted token is handed out again for this long (it stays valid for at
  * least TOKEN_TTL_S - TOKEN_REUSE_MS afterwards). */
 export const TOKEN_REUSE_MS = 30 * 60_000;
+/** (V2) Usage files sent to Jev are truncated to this many chars (contract). */
+const JEV_USAGE_LIMIT = 6000;
 
-export function interfaceToMaps(ih: InterfaceHash): { exports: SymbolHashes; sigs: SymbolSignatures } {
-	return {
-		exports: Object.fromEntries(ih.symbols.map((s) => [s.name, s.hash])),
-		sigs: Object.fromEntries(ih.symbols.map((s) => [s.name, s.signature])),
-	};
+/** (V2) The hasher's additive SymbolSignature fields (file/bodyHash/source)
+ * arrive with its V1; read them defensively so a v1 hasher still works. */
+interface V2Symbol {
+	file?: string;
+	bodyHash?: string;
+	source?: string;
+}
+
+export function interfaceToMaps(ih: InterfaceHash): {
+	exports: SymbolHashes;
+	sigs: SigField;
+	bodies: SymbolHashes;
+	sources: Record<string, SourceInput>;
+} {
+	const exports: SymbolHashes = {};
+	const sigs: SigField = {};
+	const bodies: SymbolHashes = {};
+	const sources: Record<string, SourceInput> = {};
+	for (const s of ih.symbols) {
+		const v2 = s as typeof s & V2Symbol;
+		exports[s.name] = s.hash;
+		sigs[s.name] = v2.file ? { signature: s.signature, file: v2.file } : s.signature;
+		if (v2.bodyHash) bodies[s.name] = v2.bodyHash;
+		if (v2.source) sources[s.name] = { file: v2.file ?? "", bodyHash: v2.bodyHash ?? "", source: v2.source };
+	}
+	return { exports, sigs, bodies, sources };
 }
 
 export interface TokenCache {
@@ -117,7 +141,18 @@ export async function execEffects(
 			await runEffect(host, eff, out, follow);
 		} catch (e) {
 			const reason = errorText(e);
-			if (eff.type === "fork") {
+			if (eff.type === "judge") {
+				// (V2) A judge failure is an unavailable judgment, never a wedge:
+				// the machine clears the marks and treats them as `clear`.
+				follow({
+					type: "judge.done",
+					consumerId: eff.consumerId,
+					producerId: eff.producerId,
+					commit: eff.commit,
+					generation: eff.generation,
+					verdicts: eff.symbols.map((symbol) => ({ symbol, probability: null, reason })),
+				});
+			} else if (eff.type === "fork") {
 				follow({ type: "fork.failed", entryId: eff.entryId, planned: eff.toRepo, reason });
 			} else if (eff.type === "retire") {
 				follow({ type: "retire.failed", entryId: eff.entryId, reason });
@@ -148,8 +183,11 @@ async function runEffect(host: EffectHost, eff: Effect, out: EffectResults, foll
 			const retry = { sleep: host.sleep };
 			const head = (await withRetry(() => ports.artifacts.log(created.name, 1), retry))[0]?.hash ?? "";
 			const files = head ? await withRetry(() => ports.artifacts.readTree(created.name, head), retry) : {};
-			const { exports, sigs } = interfaceToMaps(await ports.hasher.hashInterface(files));
+			const { exports, sigs, bodies, sources } = interfaceToMaps(await ports.hasher.hashInterface(files));
 			host.registerRepo(created.name);
+			// (V2) Store the forked declarations as Jev `before`/`after` inputs;
+			// storage failures degrade to unavailable judgments, never a wedge.
+			await ports.sources?.merge(eff.entryId, sources, head).catch(() => {});
 			follow({
 				type: "fork.done",
 				entryId: eff.entryId,
@@ -158,7 +196,20 @@ async function runEffect(host: EffectHost, eff: Effect, out: EffectResults, foll
 				baseCommit: head,
 				exports,
 				sigs,
+				bodies,
 				planned: eff.toRepo,
+			});
+			return;
+		}
+		case "judge": {
+			const verdicts = await runJudge(host, eff);
+			follow({
+				type: "judge.done",
+				consumerId: eff.consumerId,
+				producerId: eff.producerId,
+				commit: eff.commit,
+				generation: eff.generation,
+				verdicts,
 			});
 			return;
 		}
@@ -213,6 +264,50 @@ async function runEffect(host: EffectHost, eff: Effect, out: EffectResults, foll
 	}
 }
 
+/** (V2) Execute a judge effect: pair each symbol's stored `before`/`after`
+ * declaration sources, collect the consumer files importing the symbols'
+ * declaring files (usage), and ask the Jev port. Missing pieces degrade to
+ * `probability: null` verdicts — the machine treats them as `clear`. */
+async function runJudge(host: EffectHost, eff: Extract<Effect, { type: "judge" }>): Promise<JudgeVerdict[]> {
+	const st = host.state();
+	const consumer = st.entries.find((e) => e.id === eff.consumerId);
+	const recs = (await host.ports.sources?.get(eff.producerId).catch(() => ({} as Record<string, SourceRecord>))) ?? {};
+	const pairs = eff.symbols.map((symbol) => {
+		const rec = recs[symbol];
+		return rec?.prev ? { symbol, file: rec.file, before: rec.prev.source, after: rec.source } : null;
+	});
+	// Usage: files in the consumer's tree (at its pushed head, or its fork
+	// base when it never pushed) whose imports reach a judged symbol's file.
+	const usageByFile = new Map<string, { file: string; code: string }[]>();
+	if (consumer) {
+		const commit = consumer.headCommit ?? consumer.baseCommit;
+		const files = commit ? await withRetry(() => host.ports.artifacts.readTree(consumer.repo, commit), { sleep: host.sleep }) : {};
+		const imports = (await host.ports.hasher.extractImports?.(files).catch(() => [])) ?? [];
+		for (const i of imports) {
+			const list = usageByFile.get(i.from) ?? [];
+			list.push({ file: i.file, code: (files[i.file] ?? "").slice(0, JEV_USAGE_LIMIT) });
+			usageByFile.set(i.from, list);
+		}
+	}
+	const need = pairs.map((p): JudgeSymbolInput | null =>
+		p === null ? null : { symbol: p.symbol, before: p.before, after: p.after, usage: usageByFile.get(p.file) ?? [] },
+	);
+	const bySymbol = new Map<string, JudgeVerdict>();
+	const judgeable = need.filter((x): x is JudgeSymbolInput => x !== null);
+	if (judgeable.length && host.ports.jev) {
+		const input: JudgeInput = {
+			producer: judgeable,
+			consumer: { agent: consumer?.agent ?? "", lane: consumer?.lane ?? "" },
+		};
+		for (const v of await host.ports.jev.judge(input)) bySymbol.set(v.symbol, v);
+	}
+	return eff.symbols.map((symbol, i) =>
+		pairs[i] === null
+			? { symbol, probability: null, reason: "no-base" }
+			: (bySymbol.get(symbol) ?? { symbol, probability: null, reason: host.ports.jev ? "missing-answer" : "unavailable" }),
+	);
+}
+
 /**
  * Build the machine `push` command for a queue/alarm push event, or null when
  * it is a no-op. Entry pushes are hashed here (rob.ts stays pure). Events can
@@ -231,8 +326,14 @@ export async function pushCommand(host: EffectHost, repo: string, commit: string
 	if (!entry || entry.headCommit === commit) return null;
 	const retry = { sleep: host.sleep };
 	const files = await withRetry(() => host.ports.artifacts.readTree(repo, commit), retry);
-	const { exports, sigs } = interfaceToMaps(await host.ports.hasher.hashInterface(files));
+	const { exports, sigs, bodies, sources } = interfaceToMaps(await host.ports.hasher.hashInterface(files));
+	// (V2) Imports drive dependency inference; an absent/throwing extractor
+	// leaves the push import-less (v1 behavior).
+	const imports = await host.ports.hasher.extractImports?.(files).catch(() => undefined);
 	const head = (await withRetry(() => host.ports.artifacts.log(repo, 1), retry))[0]?.hash;
 	if (head && head !== commit) return null;
-	return { type: "push", repo, commit, exports, sigs };
+	// (V2) Persist the pushed declarations for Jev `before`/`after`; a
+	// storage failure degrades to unavailable judgments, never a lost push.
+	await host.ports.sources?.merge(entry.id, sources, commit).catch(() => {});
+	return { type: "push", repo, commit, exports, sigs, bodies, imports };
 }

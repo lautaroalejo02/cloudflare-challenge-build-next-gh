@@ -81,6 +81,9 @@ export function mergeStates(
 		pushesSeen: 0,
 		predictionHits: 0,
 		predictionMisses: 0,
+		judgments: 0,
+		semanticSquashes: 0,
+		inferredDeps: 0,
 	};
 	let retiredCount = 0;
 	for (const p of parts) {

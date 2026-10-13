@@ -9,6 +9,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
 	apply,
+	entryDefaults,
 	initialState,
 	publicState,
 	type ArbEvent,
@@ -16,7 +17,17 @@ import {
 	type Effect,
 	type RobState,
 } from "./rob.ts";
-import { realArtifacts, realChecker, realHasher, type Ports, type TrunkRetirerPort } from "./ports.ts";
+import {
+	mergeSourceMap,
+	realArtifacts,
+	realChecker,
+	realHasher,
+	realJev,
+	type Ports,
+	type SourceRecord,
+	type SourceStorePort,
+	type TrunkRetirerPort,
+} from "./ports.ts";
 import {
 	execEffects,
 	interfaceToMaps,
@@ -47,6 +58,23 @@ export interface Env {
 	/** Admin key for destructive / token-minting endpoints (T19, review F1).
 	 * Worker secret; checked in src/index.ts before any routing. */
 	ARB_ADMIN_KEY?: string;
+	/** (V2) TypeSafe API key for Jev semantic judgments. Optional Worker
+	 * secret; absent = judgments report `jev.unavailable` (v1 behavior). */
+	TYPESAFE_API_KEY?: string;
+}
+
+/** (V2) Per-entry declaration-source store for Jev `before`/`after` pairs,
+ * kept in DO storage outside BufferState (the machine stays pure). */
+function doSourceStore(ctx: DurableObjectState): SourceStorePort {
+	const key = (entryId: string) => `src/${entryId}`;
+	return {
+		get: async (entryId) => (await ctx.storage.get<Record<string, SourceRecord>>(key(entryId))) ?? {},
+		merge: async (entryId, map, commit) => {
+			const k = key(entryId);
+			const cur = (await ctx.storage.get<Record<string, SourceRecord>>(k)) ?? {};
+			await ctx.storage.put(k, mergeSourceMap(cur, map, commit));
+		},
+	};
 }
 
 /** The component DO's "retirer" is the shared ArbTrunk DO: every component
@@ -76,12 +104,16 @@ export class ReorderBuffer extends DurableObject<Env> {
 			hasher: realHasher(),
 			checker: realChecker({ ARTIFACTS: env.ARTIFACTS, LOADER: env.LOADER }),
 			retirer: stubRetirer(env),
+			sources: doSourceStore(ctx),
+			jev: realJev(env.TYPESAFE_API_KEY),
 		};
 		this.tokens = tokenCache((repo) => this.ports.artifacts.token(repo, TOKEN_TTL_S));
 		ctx.blockConcurrencyWhile(async () => {
 			this.state = (await ctx.storage.get<RobState>(STATE_KEY)) ?? initialState();
 			// Forward-fill internal fields added after the state was persisted.
 			this.state._internal = { ...initialState()._internal, ...(this.state._internal ?? {}) };
+			this.state.stats = { ...initialState().stats, ...(this.state.stats ?? {}) };
+			this.state.entries = (this.state.entries ?? []).map((e) => ({ ...entryDefaults(), ...e }));
 		});
 	}
 

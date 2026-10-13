@@ -3,9 +3,13 @@
 // interfaces. Hasher, checker and retirer are the real implementations
 // (T8): app/hasher, app/checker and src/retire.ts.
 
-import type { CheckResult, SymbolHashes, SymbolSignatures } from "./rob.ts";
+import type { CheckResult, ImportRef, JudgeVerdict, SymbolHashes, SymbolSignatures } from "./rob.ts";
+import * as hasherModule from "../../hasher/src/index.ts";
 import { hashInterface, type InterfaceHash } from "../../hasher/src/index.ts";
 import { runChecks, type CheckerEnv } from "../../checker/src/index.ts";
+import { judgeBehavior, type JudgeInput } from "./jev.ts";
+
+export type { JudgeInput, JudgeSymbolInput } from "./jev.ts";
 
 // --- Artifacts --------------------------------------------------------------
 
@@ -40,6 +44,68 @@ export type { InterfaceHash };
 
 export interface HasherPort {
 	hashInterface(files: Record<string, string>): Promise<InterfaceHash>;
+	/** (V2) Import edges of the tree, for dependency inference. Optional:
+	 * until the hasher's V1 lands, the port omits it and pushes carry no
+	 * imports (v1 behavior, nothing inferred). */
+	extractImports?(files: Record<string, string>): Promise<ImportRef[]>;
+}
+
+// --- Producer declaration sources + Jev (V2) -----------------------------------
+
+/** What a push/fork stores per exported symbol: the declaration `source`
+ * (Jev input) at `commit`, paired with its interface-file and bodyHash. */
+export interface SourceInput {
+	file: string;
+	bodyHash: string;
+	source: string;
+}
+
+/** Stored record: the symbol's latest declaration plus the most recent
+ * DIFFERENT declaration before it (the `before`/`after` Jev needs). */
+export interface SourceRecord extends SourceInput {
+	commit: string;
+	prev: { bodyHash: string; source: string; commit: string } | null;
+}
+
+/** Per-entry store of exported-symbol declaration sources, held in DO
+ * storage outside BufferState (the machine stays pure). */
+export interface SourceStorePort {
+	get(entryId: string): Promise<Record<string, SourceRecord>>;
+	merge(entryId: string, map: Record<string, SourceInput>, commit: string): Promise<void>;
+}
+
+/** Pure merge step: the new declaration becomes current; `prev` keeps the
+ * last DIFFERENT declaration (unchanged symbols carry their old prev). */
+export function mergeSourceMap(
+	cur: Record<string, SourceRecord>,
+	map: Record<string, SourceInput>,
+	commit: string,
+): Record<string, SourceRecord> {
+	const next = { ...cur };
+	for (const [sym, s] of Object.entries(map)) {
+		const prev = cur[sym];
+		next[sym] = {
+			file: s.file,
+			bodyHash: s.bodyHash,
+			source: s.source.slice(0, 4000),
+			commit,
+			prev:
+				prev && prev.bodyHash !== s.bodyHash
+					? { bodyHash: prev.bodyHash, source: prev.source, commit: prev.commit }
+					: (prev?.prev ?? null),
+		};
+	}
+	return next;
+}
+
+export interface JevPort {
+	judge(input: JudgeInput): Promise<JudgeVerdict[]>;
+}
+
+/** Real Jev port. A missing key does not throw: `judgeBehavior` returns
+ * `no-api-key` null verdicts and the machine treats them as `clear`. */
+export function realJev(apiKey: string | undefined): JevPort {
+	return { judge: (input) => judgeBehavior(input, { apiKey, fetch: globalThis.fetch }) };
 }
 
 // --- Checker / Retirer -------------------------------------------------------
@@ -116,6 +182,10 @@ export interface Ports {
 	hasher: HasherPort;
 	checker: CheckerPort;
 	retirer: TrunkRetirerPort;
+	/** (V2) Per-entry declaration sources for Jev `before`/`after`. */
+	sources?: SourceStorePort;
+	/** (V2) Semantic judge; absent = unavailable (v1 behavior). */
+	jev?: JevPort;
 }
 
 // --- Real Artifacts port ------------------------------------------------------
@@ -240,7 +310,10 @@ export { interfaceToMaps } from "./effects.ts";
 // app/checker: runChecks in a Dynamic Worker (needs the LOADER binding).
 
 export function realHasher(): HasherPort {
-	return { hashInterface };
+	// extractImports arrives with the hasher's V1 (contract). Until it lands
+	// the module lacks it — expose the port without it rather than crashing.
+	const extractImports = (hasherModule as { extractImports?: HasherPort["extractImports"] }).extractImports;
+	return { hashInterface, ...(extractImports ? { extractImports } : {}) };
 }
 
 export function realChecker(env: CheckerEnv): CheckerPort {
