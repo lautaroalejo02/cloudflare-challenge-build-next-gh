@@ -19,11 +19,9 @@
       entries: [],
       stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0 },
       log: [],
-      // local-only timing tracking: last entry push vs last squash event
-      _lastPushAt: 0,
-      _lastPushEntry: null,
-      _lastSquashAt: 0,
-      _lastSquashDelta: null
+      // local-only timing tracking: latest squash -> refork latency
+      _lastReforkAt: 0,
+      _lastReforkDelta: null
     };
   }
 
@@ -171,8 +169,6 @@
           }
         }
         bump = 'pushesSeen';
-        state._lastPushAt = now;
-        state._lastPushEntry = entry ? entry.id : (ev.entryId || null);
         pushLog(state, ev, 'push ' + (entry ? entry.id : ev.entryId || '?') + ' @ ' + shortCommit(entry && entry.headCommit));
         break;
       }
@@ -224,8 +220,6 @@
           else if (!isEntry(data.entry)) entry.generation += 1;
         }
         bump = 'squashes';
-        state._lastSquashAt = now;
-        state._lastSquashDelta = state._lastPushAt ? Math.max(0, now - state._lastPushAt) : null;
         pushLog(state, ev, 'SQUASH ' + (entry ? entry.id : '?') + (entry && entry.diagnosis && entry.diagnosis.changed[0]
           ? ' · ' + entry.diagnosis.changed[0].symbol + ' ' + shortHash(entry.diagnosis.changed[0].oldHash) + '→' + shortHash(entry.diagnosis.changed[0].newHash)
           : (entry && entry.diagnosis && entry.diagnosis.reason === 'trunk-overlap' ? ' · trunk overlap' : '')));
@@ -234,6 +228,13 @@
       case 'refork': {
         if (entry) {
           entry.status = 'speculating';
+          // Honest latency metric: squash event -> refork event, both stamped
+          // server-side (replaces the synthetic push->squash delta, which was
+          // ~0ms live because push and squash share a timestamp).
+          if (entry._squashAt) {
+            state._lastReforkAt = now;
+            state._lastReforkDelta = Math.max(0, now - entry._squashAt);
+          }
           if (data.repo) entry.repo = data.repo;
           if (data.remote) entry.remote = data.remote;
           if (typeof data.generation === 'number') entry.generation = data.generation;
@@ -332,10 +333,8 @@
         state.entries = [];
         state.stats = createState().stats;
         state.trunk.retiredCount = 0;
-        state._lastPushAt = 0;
-        state._lastPushEntry = null;
-        state._lastSquashAt = 0;
-        state._lastSquashDelta = null;
+        state._lastReforkAt = 0;
+        state._lastReforkDelta = null;
         if (data.trunk) state.trunk.commit = data.trunk.commit || null;
         pushLog(state, ev, 'reset · buffer cleared');
         return;
@@ -402,11 +401,13 @@
     return { ok: true, squashed: deps.map(function (d) { return d.id; }) };
   }
 
-  /* Timing of the latest squash relative to the most recent entry push, in ms.
-   * Returns null until a squash has been seen. */
-  function squashTiming(state) {
-    if (!state._lastSquashAt) return null;
-    return { at: state._lastSquashAt, deltaMs: state._lastSquashDelta };
+  /* Latency of the latest re-fork: squash event -> refork event for that
+   * entry, in ms. Both events carry the control plane's own timestamp, so the
+   * value is real (the old push->squash delta collapsed to ~0ms live because
+   * the DO stamps both in one apply). Returns null until the first refork. */
+  function reforkTiming(state) {
+    if (!state._lastReforkAt) return null;
+    return { at: state._lastReforkAt, deltaMs: state._lastReforkDelta };
   }
 
   /* Map an entry status onto the 5-stage pipeline track (index into STAGES,
@@ -436,7 +437,7 @@
     dependentsOf: dependentsOf,
     localVeto: localVeto,
     stageIndex: stageIndex,
-    squashTiming: squashTiming,
+    reforkTiming: reforkTiming,
     shortHash: shortHash,
     shortCommit: shortCommit
   };

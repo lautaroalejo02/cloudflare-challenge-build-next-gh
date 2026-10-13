@@ -35,7 +35,7 @@
       '  <div class="stat"><span class="stat-num" id="s-retired">0</span><span class="stat-label">retired</span></div>' +
       '  <div class="stat"><span class="stat-num" id="s-checks">0</span><span class="stat-label">checks run</span></div>' +
       '  <div class="stat"><span class="stat-num" id="s-pushes">0</span><span class="stat-label">pushes seen</span></div>' +
-      '  <div class="stat"><span class="stat-num" id="s-squasht">—</span><span class="stat-label">squash after push</span></div>' +
+      '  <div class="stat"><span class="stat-num" id="s-reforkt">—</span><span class="stat-label">re-fork ready</span></div>' +
       '  <div class="controls">' +
       '    <label for="robsize">robSize</label>' +
       '    <input type="range" id="robsize" min="1" max="16" step="1" value="8">' +
@@ -76,7 +76,7 @@
       checksRun: document.getElementById('s-checks'),
       pushesSeen: document.getElementById('s-pushes')
     };
-    el.squashT = document.getElementById('s-squasht');
+    el.reforkT = document.getElementById('s-reforkt');
 
     el.robsize.addEventListener('input', function () {
       el.robsizeVal.textContent = el.robsize.value;
@@ -121,8 +121,8 @@
     Object.keys(el.stats).forEach(function (k) {
       el.stats[k].textContent = state.stats[k];
     });
-    var sq = A.squashTiming(state);
-    el.squashT.textContent = !sq ? '—' : (sq.deltaMs == null ? 'n/a' : (sq.deltaMs / 1000).toFixed(1) + ' s');
+    var rf = A.reforkTiming(state);
+    el.reforkT.textContent = !rf ? '—' : (rf.deltaMs / 1000).toFixed(1) + ' s';
     if (document.activeElement !== el.robsize) {
       el.robsize.value = state.robSize;
       el.robsizeVal.textContent = state.robSize;

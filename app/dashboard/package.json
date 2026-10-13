@@ -4,6 +4,10 @@
   "version": "0.1.0",
   "description": "ARB live pipeline UI — static files, no build step, served by arb-control-plane",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "capture:live": "node scripts/capture-live.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.0"
   }
 }

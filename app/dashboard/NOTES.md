@@ -27,7 +27,13 @@ control-plane Worker serves this directory at `/` later.
 - `test/state.test.js` — 24 node:test cases over the state core and the full
   mock script.
 - `screenshots/` — playwright captures of the mock (squash scene + final,
-  1920x1080), a 1280x720 check, and the deployed page (`live-check.png`).
+  1920x1080), a 1280x720 check, the deployed page (`live-check.png`), and the
+  live T9c demo run (`live-squash.png` at the squash moment,
+  `live-final.png` after all three retirements).
+- `scripts/capture-live.mjs` — headless-Edge capture used for the live shots:
+  `waitForSelector('.log-line.t-squash')` for the squash moment and
+  `[data-chip="e3"]` for the final state. `npm run capture:live` — start it
+  before `npm run demo` so the run streams over `/api/ws`.
 
 ## Run
 
@@ -63,10 +69,11 @@ control-plane Worker serves this directory at `/` later.
 - Retirement mode (`data.mode`: `fast-forward` | `splice`, added by the
   integration agent) is stored on the entry as `_retireMode` and rendered as a
   small badge inside the retired trunk chip.
-- "Squash after push" stat: `state._lastSquashDelta = squash.ts − lastPush.ts`.
-  For `interface-changed` squashes this is the producer push that caused them;
-  for `trunk-overlap` squashes it is the latest entry push overall
-  (approximation — the triggering event is a trunk push, not an entry push).
+- "Re-fork ready" stat: `state._lastReforkDelta = refork.ts − squash.ts` for
+  the entry's latest squash. Both events carry the control plane's own
+  timestamp, so the value is an honest server-side latency (replaces the
+  synthetic "squash after push" delta, which collapsed to ~0 ms live because
+  the DO stamps the producer push and the consumer squashes in one `apply`).
 - Forwarding connectors are orthogonal elbows: out of the producer row's left
   rail, into a 3-channel gutter between lane labels and cards (one channel per
   producer), then right into the consumer rail. Trunk-sourced rows get a

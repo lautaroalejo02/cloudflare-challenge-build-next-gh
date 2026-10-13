@@ -175,16 +175,17 @@ test('retired folds the real payload and records the mode', () => {
   assert.equal(s.trunk.retiredCount, 1);
 });
 
-test('squashTiming reports the delta from the last push', () => {
+test('reforkTiming reports the squash-to-refork latency', () => {
   const s = A.createState();
   A.applyEvent(s, { type: 'entry.created', entryId: 'e2', ts: 1, data: {
     agent: 'u', lane: 'ui', seq: 2, producerId: 'e1', repo: 'r' } });
-  assert.equal(A.squashTiming(s), null);
-  A.applyEvent(s, { type: 'push', entryId: 'e2', ts: 1000, data: { commit: 'c1' } });
+  assert.equal(A.reforkTiming(s), null);
   A.applyEvent(s, { type: 'squash', entryId: 'e2', ts: 2200, data: { reason: 'interface-changed', changed: [] } });
-  const t = A.squashTiming(s);
-  assert.equal(t.at, 2200);
-  assert.equal(t.deltaMs, 1200);
+  assert.equal(A.reforkTiming(s), null); // not re-forked yet
+  A.applyEvent(s, { type: 'refork', entryId: 'e2', ts: 5100, data: { repo: 'r1', generation: 1 } });
+  const t = A.reforkTiming(s);
+  assert.equal(t.at, 5100);
+  assert.equal(t.deltaMs, 2900);
 });
 
 test('retired moves entry to trunk and updates trunk commit', () => {
