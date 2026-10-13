@@ -74,6 +74,14 @@ Concretely, per `app/CONTRACTS.md`:
   `trunk-overlap` and re-forks *from trunk*. There is never a textual merge —
   see the Decision section of `odd/tasks/agent-reorder-buffer.md`; implemented
   in `app/control-plane/src/retire.ts` + `src/splice.ts`.
+- **Retirement is atomic.** The whole cycle — head read, mode decision,
+  candidate build, candidate check, `main` move — runs as one serialized
+  slot inside the `ArbTrunk` DO (`retireAtomic`), so no component can land
+  mid-cycle. A rejected move rebuilds from the new head inside the same
+  slot, bounded at 3 attempts (`retire.retry` `{attempt, reason}`);
+  exhaustion emits `retire.failed` `{reason, strike, exhausted}` and clears
+  `retiring` instead of wedging the component
+  (`app/control-plane/NOTES.md` "Trunk race fix (T17)").
 - **Interface hashes only decide *when to squash early*.** Behavior is still
   verified at retirement: an unchanged signature does not prove unchanged
   behavior.
@@ -119,7 +127,9 @@ DO that owns global sequence numbers, the entry→component table and
 `/api/state`·`/api/ws` aggregation. Retirement onto the shared trunk is
 serialized by a dedicated `ArbTrunk` DO — the trunk is the one shared
 resource, so all fast-forward/splice decisions pass through a single promise
-queue. Inside `rob.ts`, index maps (`byId`, `byRepo`, `childrenOf`,
+queue, and each retirement attempt is one atomic slot: head read →
+ff/splice/overlap → candidate → check → `main` move, with bounded rebuilds
+on rejection (T17). Inside `rob.ts`, index maps (`byId`, `byRepo`, `childrenOf`,
 `pendingRepo`) and a monotone head cursor replaced the per-event full-array
 scans.
 
@@ -252,6 +262,7 @@ with Artifacts** that Wrangler is authenticated to.
 cd app/control-plane
 npm install
 scripts/setup.sh        # creates queue + push subscription + wrangler deploy
+                        # (POSIX shell — use Git Bash on Windows)
 ```
 
 `setup.sh` runs the one subscription the system needs — a namespace-wide push
@@ -285,19 +296,30 @@ agent registers with a declared stub, its first push resolves the predictions
 per consumer (hit → keep working; miss → `prediction-miss` squash), a body-only
 API refactor is an early cutoff, then a breaking `createOrder` signature change
 (two squashes, re-forks, diagnoses), then in-order retirement e1 → e2 → e3.
+Two more scenarios against the deployed plane: `--scenario failing-check`
+adds a failed check that blocks retirement until a scripted fix lands (the
+last entry then retires via splice), and `--scenario multi` runs two
+independent chains — five entries across two component DOs — retiring onto
+the shared trunk.
+
 Fully offline alternative — a local mock control plane with no Cloudflare at
 all:
 
 ```sh
 npm run mock -- --port 8899 --root tmp-mock/live   # terminal 1
 npm run demo -- --base http://127.0.0.1:8899        # terminal 2
+npm run demo -- --base http://127.0.0.1:8899 --scenario failing-check
 ```
 
-Tests per package: `npm test` (control-plane 33 cases — state machine +
-splice + git-level retire + declared-stub prediction; demo scenario cases
-incl. a full-run prediction case asserting 2 hits / 1 miss, dashboard 27
-event-folding cases, hasher 24 hash checks, checker and retirer-spike unit
-suites).
+The mock serves the `main` and `failing-check` scenarios; `multi` needs the
+deployed plane (the runner verifies component isolation via `GET
+/api/events`, which the mock does not implement).
+
+Tests per package: `npm test` (control-plane 54 cases — state machine +
+splice + git-level retire + declared-stub prediction + atomic retire;
+demo 13 scenario/unit cases incl. a full-run prediction case asserting
+2 hits / 1 miss, dashboard 27 event-folding cases, hasher 25 hash checks,
+checker and retirer-spike unit suites).
 
 ## What is real vs mocked
 
@@ -342,6 +364,7 @@ Every figure was measured in a real run; source file per row.
 | Live end-to-end, failing-check scenario | 43.8 s wall — 2 squashes, 2 early cutoffs, 3 retired (e3 via splice), 5 checks run, 7 pushes seen | `app/control-plane/NOTES.md` |
 | Live end-to-end with declared stubs (T11) | ~52 s wall — predictionHits 2 / misses 1, 3 squashes, 3 retired, 4 checks run, 7 pushes seen | `app/control-plane/NOTES.md` |
 | Live failing-check with declared stubs (T11) | ~50 s wall — same 2/1 verdicts; failing check still blocked retirement (5 checks run) | `app/control-plane/NOTES.md` |
+| Live end-to-end, multi scenario under atomic retire (T17) | 63–77 s wall over 5 runs — 4 squashes, 5 retired, 8 checks run, 12 pushes seen, 2/1 verdicts, `retire.retry` 0 / `retire.failed` 0 | `app/control-plane/NOTES.md` |
 | Reorder-buffer scale bench (state machine) | median per event 30 µs → 394 µs → 16 ms at N = 1k / 10k / 100k single buffer; flat 3–17 µs with per-component buffers; 3,803 pushes, 0 squash-oracle mismatches | `app/control-plane/bench/RESULTS.md` |
 | Full 3-agent scenario, local mock | 2 squashes, 4 early cutoffs, 3 retired in ~23 s | `app/demo/NOTES.md` |
 
@@ -354,19 +377,20 @@ Every figure was measured in a real run; source file per row.
   flight must be redone (`app/control-plane/NOTES.md` known gaps).
 - **Vetoed entries hold buffer slots** until `POST /api/reset` (contract
   semantics: `robSize` counts non-retired entries).
-- **Scale-out is now partially measured — and still unfinished.** The
-  in-process benchmark shows the single buffer's per-event cost growing with N
-  (16 ms median at 100k) while per-component buffers stay flat — but the
-  deployed plane still runs one DO, and cross-component routing, real DO
-  latency and DO storage limits (~740 B/entry; 74 MB serialized at 100k) are
-  unmeasured (`app/control-plane/bench/RESULTS.md`). Index maps + per-component
-  sharding (T14) is the tracked next step.
-- **Next steps:** index maps and a head cursor in `rob.ts`, then one
-  `ReorderBuffer` DO per connected component (T14); Grace Period hand-off
-  for breaking changes with readers outside the buffer; LLM-driven agents;
-  per-fork event subscriptions; veto confirmation in the UI. (Declared-stub
-  value prediction — the T11 item — shipped: `predictionHits` /
-  `predictionMisses` are live counters.)
+- **Scale-out is measured on the state machine, verified live for
+  correctness — but real-DO cost is unmeasured.** The deployed plane runs
+  one `ReorderBuffer` DO per component (verified by `--scenario multi`),
+  yet the flat per-event numbers come from the in-process benchmark:
+  cross-component dependency edges, real multi-DO latency and DO storage
+  limits (~740 B/entry; 74 MB serialized at 100k single-buffer) are
+  unmeasured (`app/control-plane/bench/RESULTS.md`). Per-entry-key
+  persistence inside a DO is future work — each component still writes its
+  whole (much smaller) state per mutation.
+- **Next steps:** Grace Period hand-off for breaking changes with readers
+  outside the buffer; LLM-driven agents; per-fork event subscriptions; veto
+  confirmation in the UI; per-entry-key DO persistence. (Declared-stub
+  value prediction — T11 —, index maps + per-component sharding — T14 —,
+  and atomic trunk retirement — T17 — all shipped.)
 - Prior art and the "why not just stacked PRs" answer: `research/top10.md`
   Idea 3 — stacks are linear chains restacked by humans after the producer
   pushes; the buffer is a DAG over in-progress work with automatic

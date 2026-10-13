@@ -64,8 +64,9 @@ three retired).
 > "Everything you just saw runs on Cloudflare primitives. Artifacts gives
 > each buffer entry its own repo — fork-of-fork is the forwarding path.
 > `repo.pushed` events stream through a Queue into the control-plane Worker.
-> A single Durable Object is the reorder buffer: it rehashes exported
-> interfaces with tree-sitter WASM, decides squashes, and retires in order.
+> One Durable Object per connected component is the reorder buffer: it
+> rehashes exported interfaces with tree-sitter WASM, decides squashes, and
+> retires in order — serialized onto the trunk by a dedicated DO.
 > Retirement checks run inside a Dynamic Worker, and the git fast-forward
 > or splice is isomorphic-git inside a Worker. This dashboard is the same
 > Worker's static assets, fed by one WebSocket."
@@ -106,7 +107,11 @@ plus the failed-check/fix beats (its per-beat timeline below is from the
 earlier recorded run — re-pull from `GET /api/events` when re-recording).
 For the fuller story on camera (a check that fails and blocks retirement,
 then a splice instead of a fast-forward), run
-`npm run demo -- --base <url> --scenario failing-check`.
+`npm run demo -- --base <url> --scenario failing-check`. A third scenario,
+`--scenario multi`, runs two independent chains (orders `api→ui+tests`,
+payments `api→ui`) in separate component DOs retiring onto the shared trunk —
+~63–77 s measured live under atomic retirement (`app/control-plane/NOTES.md`,
+"Trunk race fix (T17)") — useful B-roll for the sharding story.
 
 [STAGE] Do not lean on the dashboard's "squash after push" stat: live, the
 squash is emitted in the same poll tick as the push detection, so it reads
@@ -240,10 +245,11 @@ curl -X POST <base>/api/entries/<head-id>/veto
 > with declared stubs — the prediction counter read 2 hits, 1 miss live.
 > And two honest caveats on scale: the state-machine benchmark measured the
 > single buffer's per-event cost rising to ~16 ms at 100,000 entries —
-> whole-list scans — while per-component buffers stayed flat. The deployed
-> control plane still runs ONE Durable Object today; per-component sharding
-> plus index maps is the tracked next step, and cross-component routing and
-> real multi-DO latency are unmeasured."
+> whole-list scans — while per-component buffers stayed flat. That fix is
+> deployed: one reorder-buffer Durable Object per connected component, with
+> trunk retirement serialized atomically on a dedicated DO — verified live
+> by the multi scenario. What's still unmeasured is real multi-DO latency,
+> cross-component dependencies and Durable Object storage limits."
 
 [STAGE] All figures above are from the 2026-10-13 live runs recorded in
 `app/control-plane/NOTES.md` ("Live E2E results" and "Value prediction
@@ -257,9 +263,9 @@ never improvise one.
 
 > "Cost scales with the edges of the in-flight dependency graph, not the
 > number of agents — the benchmark confirmed a push squashes exactly its
-> transitive dependents, zero escapes in 3,803 pushes. Next: one
-> reorder-buffer Durable Object per connected component with index maps —
-> the benchmark shows that's what holds per-event cost flat — and a grace
+> transitive dependents, zero escapes in 3,803 pushes. That scaling design
+> is already live: one reorder-buffer Durable Object per connected
+> component. Next: per-entry-key Durable Object persistence and a grace
 > period for breaking changes with readers outside the buffer.
 > This project was built using Cloudflare Workers and Artifacts."
 
@@ -293,7 +299,8 @@ In order of preference:
    Disclosure: the mock is a local stand-in — bare git repos, poll-based
    push detection, regex hashing, and a `-X theirs` merge instead of real
    retirement (`app/demo/NOTES.md`). It demonstrates the protocol, not the
-   platform.
+   platform. `--scenario multi` is live-only: the runner verifies component
+   isolation via `GET /api/events`, which the mock does not implement.
 
 3. **Degraded live** — if the queue subscription lags, the DO alarm poll
    (~3 s cadence) still detects pushes; point at the event arriving via the

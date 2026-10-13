@@ -9,14 +9,14 @@ types live in `app/CONTRACTS.md`; this document explains how the pieces move.
 |---|---|---|
 | `rob.ts` | `app/control-plane/src/rob.ts` | Pure reorder-buffer state machine. `apply(state, cmd, now)` returns `{state, effects}`; no Cloudflare imports, unit-tested with `node:test` (incl. index-map, splice decision, git-level retire and declared-stub prediction tests). Per-component state is O(1)-indexed: `byId`, `byRepo`, `childrenOf`, `pendingRepo` maps and a monotone `headCursor` under `_internal.idx`. |
 | Ports | `app/control-plane/src/ports.ts` | `ArtifactsPort` (real, wraps the `ARTIFACTS` binding), `HasherPort`, `CheckerPort`, `RetirerPort` — the state machine's only I/O surface, so integration swaps interfaces not logic. |
-| Component DO | `app/control-plane/src/do.ts` | `ReorderBuffer` Durable Object, **one instance per connected component** (`comp-<rootEntryId>`). Executes effects, persists state, relays ArbEvents to `ArbRouter` for `/api/ws` fan-in, alarms poll only its own live entry repos. Retire effects call `ArbTrunk` through `RetirerPort`. |
+| Component DO | `app/control-plane/src/do.ts` | `ReorderBuffer` Durable Object, **one instance per connected component** (`comp-<rootEntryId>`). Executes effects, persists state, relays ArbEvents to `ArbRouter` for `/api/ws` fan-in, alarms poll only its own live entry repos. Retire effects call `ArbTrunk.retireAtomic` through `RetirerPort`. |
 | Router DO | `app/control-plane/src/router.ts` | `ArbRouter` (`router-t14`): global seq allocation, `entryId→comp` / `repo→comp` routing tables, `POST /api/entries` orchestration with global `robSize`, `/api/state` + `/api/events` aggregation, `/api/ws` hub, config/reset fan-out. |
-| Trunk DO | `app/control-plane/src/trunk.ts` | `ArbTrunk` (`trunk-t14`): serializes every `retire`/`moveBranch` on `arb-trunk` through an in-memory promise queue (DO handlers interleave on `await`), owns trunk init + the sole trunk alarm poll + the authoritative `trunk.commit`. |
+| Trunk DO | `app/control-plane/src/trunk.ts` | `ArbTrunk` (`trunk-t17`): serializes every trunk mutation on `arb-trunk` through an in-memory promise queue (DO handlers interleave on `await`). Each retirement runs as one atomic `retireAtomic` slot spanning head-read → ff/splice/overlap → candidate build → candidate check → `main` move, with bounded in-slot rebuilds (`src/atomic.ts`, `MAX_ATOMIC_ATTEMPTS=3`); the legacy `retire`/`moveBranch` RPCs remain but are unused. Owns trunk init + the sole trunk alarm poll + the authoritative `trunk.commit`. |
 | Shard helpers | `app/control-plane/src/shard.ts` | Pure: `componentName(rootId)`, `repoToEntryId(repo)`, `mergeStates`, `mergeEvents`. |
 | Worker | `app/control-plane/src/index.ts` | `POST /api/trunk/init` → `ArbTrunk` (+ router inform); other `/api/*` → `ArbRouter`; queue consumer → repo-routed `onPush`; everything else → static assets. |
 | Hasher | `app/hasher/` | `hashInterface(files)` — web-tree-sitter + TypeScript grammar WASM, normalizes signatures so formatting/comments/bodies/reordering never move a hash. |
 | Checker | `app/checker/` | `runChecks(env, repo, commit)` — walks the commit tree, strips TS (sucrase), loads a Dynamic Worker via the Worker Loader, calls each `tests/**/*.test.ts` module's `run()`. |
-| Retirer | `app/control-plane/src/retire.ts` + pure `src/splice.ts` (grown out of `app/retirer-spike`) | isomorphic-git on `MemFs` inside the DO: fast-forward when the trunk head is an ancestor of the entry head; otherwise the path-disjoint splice — candidate commit pushed to `refs/heads/arb-candidate` on the trunk repo, checked, then `main` moved via `moveBranch`. `P ∩ Q ≠ ∅` → `trunk-overlap` squash. |
+| Retirer | `app/control-plane/src/retire.ts` + pure `src/splice.ts` (grown out of `app/retirer-spike`) | isomorphic-git on `MemFs` inside the DO: fast-forward when the trunk head is an ancestor of the entry head; otherwise the path-disjoint splice — candidate commit pushed to `refs/heads/arb-candidate` on the trunk repo, checked, then `main` moved via `moveBranch` — all inside the single `ArbTrunk` atomic slot. `P ∩ Q ≠ ∅` → `trunk-overlap` squash. |
 | Dashboard | `app/dashboard/` | Static UI; folds `ArbEvent`s into a `BufferState`-shaped model (`state.js`, DOM-free, Node-testable). |
 | Demo | `app/demo/` | Fixture repo, five scripted agents across two chains (`api`/`ui`/`tests` + `pay-api`/`pay-ui`), `scenario.ts` runner (`main`, `failing-check`, `multi`), and `mock-server.ts` (local control-plane stand-in for offline tests). |
 
@@ -131,8 +131,10 @@ outside the contract's union (contract issue noted in
 | `prediction.hit` / `prediction.miss` | the producer's first push resolved a consumer's pinned symbol (hit: actual == declared; miss: diverged — the consumer is also squashed `prediction-miss`) | `entryId` = consumer, `data.producerId`, `symbol`, `hash` (hit) / `predictedHash`, `actualHash`, `predictedSignature`, `actualSignature`, `commit` (miss) |
 | `refork` | new fork minted for a squashed entry | repo, generation |
 | `ready` | agent POSTs ready | commit |
-| `check.started` / `check.passed` / `check.failed` | head entry's `runChecks` | commit, durationMs, results; on a splice candidate they carry `splice: true` and the candidate commit on the trunk repo |
+| `check.started` / `check.passed` / `check.failed` | head entry's `runChecks` | commit, durationMs, results; on a splice candidate they carry `splice: true` and the candidate commit on the trunk repo (replayed into the log after the atomic cycle lands rather than streamed live) |
 | `retired` | head entry landed on trunk | commit, `mode: "fast-forward" \| "splice"`, durationMs |
+| `retire.retry` | an atomic retire attempt was rejected (e.g. non-fast-forward) and rebuilt from the new head inside the same slot | `attempt`, `reason` |
+| `retire.failed` | a retire cycle exhausted its bounded rebuilds or failed outright; clears `retiring` so the next cascade can retry (`strike` counts consecutive failures) | `reason`, `strike`, `exhausted` |
 | `veto` | head-entry veto | entryId, squashed[] |
 | `config` | `POST /api/config` | robSize |
 | `reset` | `POST /api/reset` | — |
@@ -159,9 +161,19 @@ producer's final head after an early-cutoff push):
    theory), so the splice is order-independent. The candidate is pushed to
    `refs/heads/arb-candidate` on the trunk repo, `runChecks` executes on
    that candidate (check events carry `splice: true`), and only on pass is
-   `main` moved to it. Live: 1085 ms end-to-end for e3 (diff + overlay +
-   candidate push + branch move), candidate check 90 ms
-   (`app/control-plane/NOTES.md`).
+   `main` moved to it. Since T17 this whole cycle — head-read, decision,
+   candidate build, candidate check, `main` move — runs as **one serialized
+   slot inside `ArbTrunk`** (`retireAtomic`), so no other component can land
+   mid-cycle; a rejected move rebuilds from the new head in the same slot
+   (bounded at `MAX_ATOMIC_ATTEMPTS=3`, surfaced as `retire.retry`), while
+   `overlap` and `check-failed` return immediately since rebuilding the same
+   paths cannot change the verdict. A cycle that still cannot land emits
+   `retire.failed` and clears `retiring` instead of wedging the component —
+   the exact wedge the pre-T17 two-phase protocol produced when a sibling
+   component landed between candidate build and branch move
+   (`app/control-plane/NOTES.md` "Trunk race fix (T17)"). Live: 1085 ms
+   end-to-end for e3 (diff + overlay + candidate push + branch move),
+   candidate check 90 ms (`app/control-plane/NOTES.md`).
 3. **`trunk-overlap` squash** — P ∩ Q ≠ ∅. The entry is squashed so its
    agent re-applies on a fresh fork *from trunk* (the collision is with
    trunk; re-forking from the producer would livelock once the producer has
@@ -175,7 +187,7 @@ producer's final head after an early-cutoff push):
 | Interface mispredict | consumed symbol hash changed | squash dependents transitively; refork + diagnosis; `generation+1` |
 | Body-only push | aggregate hash unchanged | early cutoff — no work, `hash.unchanged`, `stats.earlyCutoffs++` |
 | Failed check at retirement | `check.failed` | entry → `failed`, blocks retirement; next push → `speculating`; ready retries |
-| Trunk moved under an entry | FF ancestry check fails | path-disjoint splice, or `trunk-overlap` squash |
+| Trunk moved under an entry | FF ancestry check fails, or the `main` move rejects non-fast-forward | rebuild from the new head inside the same atomic slot (`retire.retry`, bounded ×3): path-disjoint splice, `trunk-overlap` squash, or `retire.failed` on exhaustion |
 | Queue event lost/delayed | alarm poll every ~3 s over trunk + live repos | dedupe by `repo:commit` (`seenPushes`, cap 500) + `headCommit` equality; spike-measured poll detection median 0.70 s, live push→`push` event observed 1–3 s (queue lands inside the poll cadence; sources aren't tagged in the log) |
 | Duplicate push (queue + alarm both fire) | same dedupe keys | second delivery is a no-op |
 | Push during in-flight refork | pushes to the stale repo name are ignored | known gap: work on the stale fork must be redone |
@@ -231,7 +243,7 @@ producer's final head after an early-cutoff push):
   body-only pushes, `entry.ready`, and interpreter-style `fork.done` /
   `check.done` / `retire.done` fed back from emitted effects. 4,000 / 2,500 /
   1,200 timed events per mode (+150 warmup). Not exercised: `entry.create`,
-  veto, `retire.planned`, `retire.overlap`.
+  veto, `retire.overlap`.
 - **Modes:** (a) `single` — one state with all N entries; (b) `sharded` —
   C states of 40 entries, each event routed to its component.
 - **"scan":** callback evaluations in `entries.find/filter/map/sort/reduce`
@@ -273,7 +285,9 @@ pre-index revision; "indexed" is the same rerun after `byId`/`byRepo`/
 
 T14 implemented the fix the benchmark recommended — index maps in `rob.ts`
 plus the three-role DO split (`ArbRouter` + `ArbTrunk` + one `ReorderBuffer`
-per connected component). Verified live
+per connected component), and T17 made each trunk retirement one atomic
+`ArbTrunk` slot, closing the cross-component splice-candidate race that
+could wedge a component at `ready`. Verified live
 (`https://arb-control-plane.lautitomasalejo.workers.dev`, all scenarios exit
 0): `main` and `failing-check` behave as before, and the new `multi`
 scenario runs two independent chains in separate component DOs — squashes
