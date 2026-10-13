@@ -33,7 +33,7 @@ Build the hackathon entry for Cloudflare "Build the next GitHub" (deadline 2026-
 Route legend: D = delegated (Devin SWE-2 writer, own directory), I = inline (orchestrator).
 
 - [x] T0 (I) Research council + 8 platform spikes. Commit `f62b940`.
-- [ ] T1 (I) Write `app/CONTRACTS.md` and this document.
+- [x] T1 (I) Write `app/CONTRACTS.md` and this document. Commit `dfe4704`.
 - [ ] T2 (D) `app/hasher`: tree-sitter TS exported-interface hash for Workers, with tests (reuses spike 4 rules + spike 6 wasm).
 - [ ] T3 (D) `app/checker`: run commit tests in a Dynamic Worker with TS stripping, with a deployed proof.
 - [ ] T4 (D) `app/demo`: fixture app + scripted agents + scenario runner + mock control plane for its own tests.
@@ -49,5 +49,7 @@ Route declaration: T2-T7 are delegated because each package is non-trivial and t
 ## Progress / evidence
 - 2026-10-13: T0 done (`f62b940`). RDD is on by default; candidate-review consent requires the user, so reviews are queued for the morning.
 
+- 2026-10-13: T1 done (`dfe4704`). T2-T7 were dispatched in parallel to six SWE-2 writers (devin -p, permission-mode dangerous, 2h time box). Logs: `odd/logs/T*.out` (gitignored).
+
 ## Next step
-Dispatch T2-T7 in parallel.
+Review each writer's result and spot-check one verification command per package. Commit each package as its own work unit, then dispatch T8 integration.
