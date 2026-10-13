@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ApiClient } from "./lib/http.ts";
+import { resolveAdminKey } from "./lib/admin-key.ts";
 import { authUrl, cloneRepo, commitAll, git, hasChanges, head, push } from "./lib/git.ts";
 import { syncFixture } from "./lib/fixture.ts";
 import { createTimeline, scoped } from "./lib/timeline.ts";
@@ -98,7 +99,11 @@ async function main(): Promise<void> {
   }
   const tl = createTimeline();
   const log = scoped(tl, "scenario");
-  const api = new ApiClient(base);
+  // Protected endpoints need the admin key (T19): ARB_ADMIN_KEY env var, else
+  // app/control-plane/.secret-admin-key. The local mock ignores it.
+  const adminKey = resolveAdminKey();
+  const api = new ApiClient(base, adminKey);
+  log(adminKey ? "admin key loaded (x-arb-key)" : "no admin key found - protected endpoints will 403 on the real plane");
 
   // Clean stale clone dirs from earlier runs, then work under the
   // run-unique root.

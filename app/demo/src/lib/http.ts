@@ -10,14 +10,19 @@ export class ApiError extends Error {
 
 export class ApiClient {
   base: string;
-  constructor(base: string) {
+  /** Admin key for protected endpoints (T19): sent as `x-arb-key`. */
+  private adminKey: string | undefined;
+  constructor(base: string, adminKey?: string) {
     this.base = base.replace(/\/+$/, "");
+    this.adminKey = adminKey || undefined;
   }
 
   private async req(method: string, path: string, body?: unknown): Promise<any> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.adminKey) headers["x-arb-key"] = this.adminKey;
     const r = await fetch(`${this.base}${path}`, {
       method,
-      headers: { "content-type": "application/json" },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const text = await r.text();

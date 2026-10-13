@@ -84,7 +84,9 @@ export function startAgent(opts: AgentOptions): AgentHandle {
       // avoids cloning the stale fork in the window where the generation has
       // bumped but the re-fork has not landed yet (real plane reforks are
       // async — the mock was fast enough to hide this).
-      if (e.repo !== lastRepo) {
+      // `remote` is empty until the entry's first fork lands (T19: a failed
+      // fork is now retried by the control plane instead of failing create).
+      if (e.repo !== lastRepo && e.remote && lastToken) {
         lastRepo = e.repo;
         gen = e.generation;
         readySha = null;

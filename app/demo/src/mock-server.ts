@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { git } from "./lib/git.ts";
 import type {
+  ArbEvent,
   BufferState,
   CheckResult,
   Diagnosis,
@@ -87,6 +88,13 @@ export async function startMockServer(
   let robSize = 8;
   const trunk = { repo: "arb-trunk", commit: null as string | null, retiredCount: 0 };
   const stats = { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0 };
+  // Bounded event log served at GET /api/events, same shape as the real
+  // control plane's `{ events: ArbEvent[] }` (T19: `--scenario multi` reads it).
+  const events: ArbEvent[] = [];
+  const emit = (type: string, entryId?: string, data?: Record<string, unknown>) => {
+    events.push({ type, ts: Date.now(), ...(entryId ? { entryId } : {}), ...(data ? { data } : {}) });
+    if (events.length > 500) events.shift();
+  };
 
   // Single-flight mutation queue: all state changes (push detection, squashes,
   // ready/check transitions, retirement) serialize through it so concurrent
@@ -159,6 +167,8 @@ export async function startMockServer(
     consumeSigs.set(c.id, cs);
     stats.squashes++;
     internals.squashes.push({ entryId: c.id, generation: c.generation, reason });
+    emit("squash", c.id, { reason, changed, generation: c.generation, repo: name });
+    emit("refork", c.id, { repo: name, baseCommit: c.baseCommit, generation: c.generation });
     log(`squash ${c.id} -> gen ${c.generation} (${reason})`);
   }
 
@@ -187,6 +197,7 @@ export async function startMockServer(
     e.diagnosis = null;
     if (!terminal(e)) e.status = "speculating";
     stats.pushesSeen++;
+    emit("push", e.id, { repo: e.repo, commit: sha });
     const prevHashes = e.exports;
     // A push with real hashes resolves this entry's declared-stub predictions
     // exactly once: each pinned consumer symbol gets a hit/miss verdict.
@@ -208,9 +219,11 @@ export async function startMockServer(
           const actual = hashes[sym] ?? "missing";
           if (c.consumes[sym] === actual) {
             stats.predictionHits++;
+            emit("prediction.hit", c.id, { producerId: e.id, symbol: sym, hash: actual, commit: sha });
             log(`prediction hit ${c.id} ${sym}`);
           } else {
             stats.predictionMisses++;
+            emit("prediction.miss", c.id, { producerId: e.id, symbol: sym, predictedHash: c.consumes[sym], actualHash: actual, commit: sha });
             missed.push({
               symbol: sym,
               oldHash: c.consumes[sym],
@@ -230,8 +243,11 @@ export async function startMockServer(
         if (changed.length === 0) continue; // pure hit: not a cutoff
       }
       if (changed.length > 0) {
+        emit("hash.changed", c.id, { producerId: e.id, commit: sha, changed });
         await squashEntry(c, repoPath(e.repo), sha, "interface-changed", changed);
         squashedAny = true;
+      } else {
+        emit("hash.unchanged", c.id, { producerId: e.id, commit: sha });
       }
     }
     const exportsUnchanged = Object.keys(hashes).length === Object.keys(prevHashes).length
@@ -302,6 +318,7 @@ export async function startMockServer(
     trunk.retiredCount++;
     stats.retired++;
     e.status = "retired";
+    emit("retired", e.id, { commit: newCommit, seq: e.seq, mode: "mock-merge" });
     log(`retired ${e.id} seq=${e.seq} -> trunk ${newCommit.slice(0, 8)}`);
   }
 
@@ -385,6 +402,10 @@ export async function startMockServer(
     entries.push(e);
     sigsByEntry.set(e.id, new Map([...exp.sigs, ...stubSigs]));
     consumeSigs.set(e.id, cs);
+    emit("entry.created", e.id, {
+      agent: e.agent, lane: e.lane, seq: e.seq, producerId: e.producerId, repo: name,
+      exports: e.exports, consumes: e.consumes, predicted: e.predicted,
+    });
     log(`created ${e.id} (${e.lane}) repo=${name} base=${(srcHead ?? "none").slice(0, 8)}`);
     return { entry: pub(e), token: `mock-token-${e.id}-g0` };
   }
@@ -396,6 +417,7 @@ export async function startMockServer(
     const headEntry = open[open.length - 1];
     if (!headEntry || headEntry.id !== id) throw httpError(409, "veto applies to the head entry only");
     e.status = "vetoed";
+    emit("veto", e.id, { seq: e.seq });
     const squashed: string[] = [];
     const queue = entries.filter((x) => x.producerId === id && !terminal(x));
     const seen = new Set(queue.map((x) => x.id));
@@ -439,6 +461,8 @@ export async function startMockServer(
     }
     trunk.commit = await revHead(trunkPath());
     trunk.retiredCount = 0;
+    events.length = 0;
+    emit("reset");
   }
 
   function stateResponse(): BufferState {
@@ -506,12 +530,17 @@ export async function startMockServer(
             if (e.headCommit !== body.commit) {
               throw httpError(409, `stale commit: head is ${e.headCommit ?? "none"}`);
             }
+            emit("ready", e.id, { commit: body.commit });
             e.status = "checking";
             stats.checksRun++;
+            emit("check.started", e.id, { commit: body.commit });
             const result = await runChecks(repoPath(e.repo), body.commit);
             e.checks = result;
             internals.checks.push(result);
             e.status = result.failed === 0 ? "ready" : "failed";
+            emit(result.failed === 0 ? "check.passed" : "check.failed", e.id, {
+              commit: result.commit, durationMs: result.durationMs, failed: result.failed,
+            });
             await tryRetire();
             return pub(e);
           }),
@@ -525,11 +554,15 @@ export async function startMockServer(
         if (typeof body.robSize !== "number" || body.robSize < 1) return send(400, { error: "robSize must be >= 1" });
         await enqueue(async () => {
           robSize = body.robSize;
+          emit("config", undefined, { robSize });
         });
         return send(200, { robSize });
       }
       if (p === "/api/state" && req.method === "GET") {
         return send(200, stateResponse());
+      }
+      if (p === "/api/events" && req.method === "GET") {
+        return send(200, { events: [...events] });
       }
       if (p === "/api/ws") {
         return send(501, { error: "mock: websocket events not implemented" });
