@@ -16,12 +16,12 @@ import {
 import {
 	interfaceToMaps,
 	realArtifacts,
-	stubChecker,
-	stubHasher,
-	stubRetirer,
+	realChecker,
+	realHasher,
 	type ArtifactsPort,
 	type Ports,
 } from "./ports.ts";
+import { realRetirer, type ArtifactsBinding } from "./retire.ts";
 
 function isAlreadyExists(e: unknown): boolean {
 	const code = (e as { code?: string })?.code;
@@ -31,11 +31,12 @@ function isAlreadyExists(e: unknown): boolean {
 
 const TRUNK_REPO = "arb-trunk";
 const STATE_KEY = "state";
-const SEEN_GEN_KEY = "seenGen";
+const SEEN_REPO_KEY = "seenRepo";
 const TOKEN_TTL_S = 3600;
 
 export interface Env {
 	ARTIFACTS: unknown;
+	LOADER: unknown;
 	ROB: DurableObjectNamespace<ReorderBuffer>;
 	ASSETS?: Fetcher;
 	POLL_FALLBACK?: string;
@@ -49,21 +50,25 @@ interface EffectResults {
 export class ReorderBuffer extends DurableObject<Env> {
 	private ports: Ports;
 	private state!: RobState;
-	private seenGen: Record<string, number> = {};
+	/** entryId -> repo the last minted token was scoped to. A fresh token is
+	 * handed out whenever the repo changes (create, re-fork): Artifacts tokens
+	 * are per-repo, so keying on generation instead would mint stale-repo
+	 * tokens in the squash->refork gap. */
+	private seenRepo: Record<string, string> = {};
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.ports = {
 			artifacts: realArtifacts(env.ARTIFACTS as Parameters<typeof realArtifacts>[0]),
-			hasher: stubHasher(),
-			checker: stubChecker(),
-			retirer: stubRetirer(),
+			hasher: realHasher(),
+			checker: realChecker({ ARTIFACTS: env.ARTIFACTS, LOADER: env.LOADER }),
+			retirer: realRetirer(env.ARTIFACTS as ArtifactsBinding),
 		};
 		ctx.blockConcurrencyWhile(async () => {
 			this.state = (await ctx.storage.get<RobState>(STATE_KEY)) ?? initialState();
 			// Forward-fill internal fields added after the state was persisted.
 			this.state._internal = { ...initialState()._internal, ...(this.state._internal ?? {}) };
-			this.seenGen = (await ctx.storage.get<Record<string, number>>(SEEN_GEN_KEY)) ?? {};
+			this.seenRepo = (await ctx.storage.get<Record<string, string>>(SEEN_REPO_KEY)) ?? {};
 		});
 	}
 
@@ -80,7 +85,7 @@ export class ReorderBuffer extends DurableObject<Env> {
 
 	private async persist(): Promise<void> {
 		await this.ctx.storage.put(STATE_KEY, this.state);
-		await this.ctx.storage.put(SEEN_GEN_KEY, this.seenGen);
+		await this.ctx.storage.put(SEEN_REPO_KEY, this.seenRepo);
 		await this.ensureAlarm();
 	}
 
@@ -140,12 +145,18 @@ export class ReorderBuffer extends DurableObject<Env> {
 					const fromRepo = this.state._internal.repoAlias?.[eff.fromRepo] ?? eff.fromRepo;
 					let created: Awaited<ReturnType<ArtifactsPort["fork"]>> | null = null;
 					let toRepo = eff.toRepo;
-					for (let attempt = 0; attempt < 10 && !created; attempt++) {
+					for (let attempt = 0; attempt < 30 && !created; attempt++) {
 						try {
 							created = await this.ports.artifacts.fork(fromRepo, toRepo);
 						} catch (e) {
 							if (isAlreadyExists(e)) {
-								toRepo = `${eff.toRepo}-x${attempt + 1}`;
+								// Repos accumulate across runs (reset doesn't delete
+								// them): after the deterministic -xN space, fall back
+								// to random suffixes.
+								toRepo =
+									attempt < 19
+										? `${eff.toRepo}-x${attempt + 1}`
+										: `${eff.toRepo}-${Math.random().toString(36).slice(2, 8)}`;
 							} else if (attempt < 1) {
 								continue; // one retry for transient platform errors
 							} else {
@@ -177,13 +188,43 @@ export class ReorderBuffer extends DurableObject<Env> {
 					break;
 				}
 				case "retire": {
-					const r0 = await this.ports.retirer.fastForward({
+					const res = await this.ports.retirer.retire({
 						fromRepo: eff.fromRepo,
 						commit: eff.commit,
+						baseCommit: eff.baseCommit,
 						toRepo: eff.toRepo,
 						branch: eff.branch,
 					});
-					const r = this.applyCmd({ type: "retire.done", entryId: eff.entryId, commit: r0.commit });
+					let r;
+					if (res.outcome === "fast-forward") {
+						r = this.applyCmd({
+							type: "retire.done",
+							entryId: eff.entryId,
+							commit: res.commit,
+							entryCommit: eff.commit,
+							mode: "fast-forward",
+						});
+					} else if (res.outcome === "splice") {
+						r = this.applyCmd({ type: "retire.planned", entryId: eff.entryId, candidate: res.candidate });
+					} else {
+						r = this.applyCmd({ type: "retire.overlap", entryId: eff.entryId, overlap: res.overlap });
+					}
+					if (r.ok) queue.push(...r.effects);
+					break;
+				}
+				case "retire.commit": {
+					// The splice candidate passed its checks: land it on trunk.
+					await this.ports.retirer.moveBranch({
+						toRepo: eff.toRepo,
+						branch: eff.branch,
+						commit: eff.candidate,
+					});
+					const r = this.applyCmd({
+						type: "retire.done",
+						entryId: eff.entryId,
+						commit: eff.candidate,
+						mode: "splice",
+					});
 					if (r.ok) queue.push(...r.effects);
 					break;
 				}
@@ -273,7 +314,7 @@ export class ReorderBuffer extends DurableObject<Env> {
 				const out: EffectResults = { tokens: {} };
 				await this.execEffects(r.effects, out);
 				const entry = this.state.entries.find((e) => e.id === createdEv?.event.entryId)!;
-				this.seenGen[entry.id] = entry.generation;
+				this.seenRepo[entry.id] = entry.repo;
 				await this.persist();
 				return json({ entry, token: out.tokens[entry.id] ?? null });
 			}
@@ -284,9 +325,9 @@ export class ReorderBuffer extends DurableObject<Env> {
 				if (!entry) return json({ error: `entry ${id} not found` }, 404);
 				if (request.method === "GET" && !mEntry[2]) {
 					let token: string | undefined;
-					if (entry.generation > (this.seenGen[id] ?? entry.generation)) {
+					if (entry.repo && entry.repo !== this.seenRepo[id]) {
 						token = await this.ports.artifacts.token(entry.repo, TOKEN_TTL_S);
-						this.seenGen[id] = entry.generation;
+						this.seenRepo[id] = entry.repo;
 						await this.persist();
 					}
 					return json(token ? { entry, token } : { entry });
@@ -324,10 +365,15 @@ export class ReorderBuffer extends DurableObject<Env> {
 			if (request.method === "GET" && pathname === "/api/state") {
 				return json(publicState(this.state));
 			}
+			if (request.method === "GET" && pathname === "/api/events") {
+				// Debug/measurement aid (not in the contract): the internal
+				// ArbEvent log with server timestamps.
+				return json({ events: this.state._internal.eventLog });
+			}
 			if (request.method === "POST" && pathname === "/api/reset") {
 				const r = this.applyCmd({ type: "reset" });
 				if (!r.ok) return json({ error: r.error }, r.status);
-				this.seenGen = {};
+				this.seenRepo = {};
 				await this.execEffects(r.effects);
 				await this.persist();
 				return json({ ok: true });

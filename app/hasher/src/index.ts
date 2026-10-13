@@ -36,13 +36,27 @@ export function initHasher(
   grammarWasm: WasmModule,
 ): Promise<void> {
   parserPromise ??= (async () => {
-    await Parser.init({
-      instantiateWasm: (imports, cb) => {
-        WebAssembly.instantiate(runtimeWasm, imports).then((inst) =>
-          cb(inst as never, runtimeWasm as never),
-        );
-      },
-    });
+    // workerd + nodejs_compat: process.versions.node exists, so web-tree-
+    // sitter's emscripten glue takes its Node branch and runs
+    // createRequire(import.meta.url) — but import.meta.url is undefined in a
+    // bundled Worker, which crashes init. Pretending to be an Electron
+    // renderer keeps it on the web/worker branch (instantiateWasm bypasses
+    // all binary loading, so no other difference). Real Node has a defined
+    // import.meta.url and is left alone.
+    const proc = (globalThis as { process?: { type?: string } }).process;
+    const shim = proc?.type === undefined && import.meta.url === undefined;
+    if (shim) proc!.type = "renderer";
+    try {
+      await Parser.init({
+        instantiateWasm: (imports: WebAssembly.Imports, cb: (inst: WebAssembly.Instance, mod: WebAssembly.Module) => void) => {
+          WebAssembly.instantiate(runtimeWasm, imports).then((inst) =>
+            cb(inst as never, runtimeWasm as never),
+          );
+        },
+      });
+    } finally {
+      if (shim) delete proc!.type;
+    }
     const lang = Language.loadSync(grammarWasm);
     const parser = new Parser();
     parser.setLanguage(lang);
@@ -509,7 +523,7 @@ function collectExports(
   if (visiting.has(path)) return [];
   visiting.add(path);
   const tree = parser.parse(files[path]);
-  const top = tree.rootNode.children;
+  const top = tree!.rootNode.children;
 
   const locals = new Map<string, Node>();
   for (const node of top) {

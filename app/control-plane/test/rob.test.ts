@@ -426,3 +426,108 @@ test("squash pending dedupe: second producer push updates diagnosis, no double f
 	assert.equal(d.producerCommit, "p3");
 	assert.equal(d.changed[0].newHash, "h3");
 });
+
+/** Drive a single entry through push -> ready -> check pass -> retire effect. */
+function retiring(state: RobState, id: string, commit: string): { state: RobState; effects: Effect[] } {
+	const e = entry(state, id);
+	let s = run(state, { type: "push", repo: e.repo, commit, exports: {} });
+	s = run(s, { type: "entry.ready", entryId: id, commit });
+	const r = runEff(s, {
+		type: "check.done",
+		entryId: id,
+		result: { commit, passed: 1, failed: 0, durationMs: 5, results: [] },
+	});
+	return { state: r.state, effects: r.effects };
+}
+
+test("splice candidate: planned -> check on trunk -> pass -> retire.commit", () => {
+	let s = trunked("t0");
+	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+	const r = retiring(s, "e1", "c1");
+	s = r.state;
+	const re = r.effects.filter((e) => e.type === "retire");
+	assert.equal(re.length, 1);
+	assert.equal(re[0].baseCommit, "t0");
+
+	// Retirer reports a splice candidate -> check effect targets the trunk repo
+	s = run(s, { type: "retire.planned", entryId: "e1", candidate: "cand1" });
+	const r2 = runEff(s, {
+		type: "check.done",
+		entryId: "e1",
+		result: { commit: "cand1", passed: 2, failed: 0, durationMs: 7, results: [] },
+	});
+	s = r2.state;
+	const rc = r2.effects.filter((e) => e.type === "retire.commit");
+	assert.equal(rc.length, 1);
+	assert.equal(rc[0].candidate, "cand1");
+	assert.equal(rc[0].toRepo, "arb-trunk");
+	assert.equal(broadcasts(r2.effects, "check.passed").length, 1);
+
+	s = run(s, { type: "retire.done", entryId: "e1", commit: "cand1", mode: "splice" });
+	assert.equal(entry(s, "e1").status, "retired");
+	assert.equal(s.trunk.commit, "cand1");
+	const retiredEv = s._internal.eventLog.find((ev) => ev.type === "retired")!;
+	assert.equal((retiredEv.data as { mode: string }).mode, "splice");
+});
+
+test("splice candidate: failed candidate check -> failed, no retire.commit", () => {
+	let s = trunked("t0");
+	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+	s = retiring(s, "e1", "c1").state;
+	s = run(s, { type: "retire.planned", entryId: "e1", candidate: "cand1" });
+	const { state, effects } = runEff(s, {
+		type: "check.done",
+		entryId: "e1",
+		result: { commit: "cand1", passed: 0, failed: 1, durationMs: 7, results: [{ name: "t", ok: false }] },
+	});
+	s = state;
+	assert.equal(entry(s, "e1").status, "failed");
+	assert.equal(effects.filter((e) => e.type === "retire.commit").length, 0);
+	assert.equal(s._internal.retireCandidate["e1"], undefined);
+
+	// A new push clears the failed state and allows a later re-retire.
+	s = run(s, { type: "push", repo: "arb-e1-api-0", commit: "c2", exports: {} });
+	assert.equal(entry(s, "e1").status, "speculating");
+});
+
+test("trunk-overlap: retire.overlap squashes the entry with reason", () => {
+	let s = trunked("t9");
+	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+	s = retiring(s, "e1", "c1").state;
+	const { state, effects } = runEff(s, { type: "retire.overlap", entryId: "e1", overlap: ["src/api/order.ts"] });
+	s = state;
+	const e = entry(s, "e1");
+	assert.equal(e.status, "squashed");
+	assert.equal(e.generation, 1);
+	assert.deepEqual(e.diagnosis, { reason: "trunk-overlap", changed: [], producerCommit: "t9" });
+	assert.equal(s.stats.squashes, 1);
+	const fe = forkEffects(effects);
+	assert.equal(fe.length, 1);
+	assert.equal(fe[0].fromRepo, "arb-trunk"); // producerId null -> trunk
+	assert.equal(fe[0].toRepo, "arb-e1-api-1");
+	const sq = broadcasts(effects, "squash");
+	assert.equal(sq.length, 1);
+	assert.equal((sq[0].data as { reason: string }).reason, "trunk-overlap");
+});
+
+test("retire.done: entryCommit staleness ignored when head moved", () => {
+	let s = trunked("t0");
+	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+	s = retiring(s, "e1", "c1").state;
+	// a push lands mid-retire: entry goes back to speculating at c2
+	s = run(s, { type: "push", repo: "arb-e1-api-0", commit: "c2", exports: {} });
+	const r = runEff(s, { type: "retire.done", entryId: "e1", commit: "c1", entryCommit: "c1", mode: "fast-forward" });
+	s = r.state;
+	assert.equal(entry(s, "e1").status, "speculating"); // not retired
+	assert.equal(s.trunk.retiredCount, 0);
+	assert.equal(broadcasts(r.effects, "retired").length, 0);
+});
+
+test("retire.planned: stale plan (entry no longer retiring) is dropped", () => {
+	let s = trunked("t0");
+	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+	// never marked ready -> not retiring
+	const { state, effects } = runEff(s, { type: "retire.planned", entryId: "e1", candidate: "candX" });
+	assert.equal(state._internal.retireCandidate["e1"], undefined);
+	assert.equal(effects.filter((e) => e.type === "check").length, 0);
+});

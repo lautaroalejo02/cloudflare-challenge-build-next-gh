@@ -16,7 +16,7 @@ export type EntryStatus =
 	| "vetoed";
 
 export interface Diagnosis {
-	reason: "interface-changed" | "producer-vetoed" | "producer-squashed";
+	reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap";
 	changed: Array<{
 		symbol: string;
 		oldHash: string;
@@ -98,6 +98,11 @@ export interface RobInternal {
 	checking: Record<string, string>;
 	/** entryId -> a retire effect is in flight. */
 	retiring: Record<string, true>;
+	/** entryId -> splice candidate commit pushed to the candidate ref,
+	 * awaiting its check before trunk moves. */
+	retireCandidate: Record<string, string>;
+	/** entryId -> ts when the retire effect was emitted (durationMs). */
+	retireStart: Record<string, number>;
 	/** "repo:commit" push dedupe (queue + alarm poll may both fire). */
 	seenPushes: string[];
 	/** Planned repo name -> actual name when a fork had to use a suffix
@@ -117,7 +122,17 @@ export function initialState(): RobState {
 		robSize: 8,
 		entries: [],
 		stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0 },
-		_internal: { sigs: {}, pending: {}, checking: {}, retiring: {}, seenPushes: [], repoAlias: {}, eventLog: [] },
+		_internal: {
+			sigs: {},
+			pending: {},
+			checking: {},
+			retiring: {},
+			retireCandidate: {},
+			retireStart: {},
+			seenPushes: [],
+			repoAlias: {},
+			eventLog: [],
+		},
 	};
 }
 
@@ -144,7 +159,18 @@ export type Cmd =
 	| { type: "push"; repo: string; commit: string; exports?: SymbolHashes; sigs?: SymbolSignatures }
 	| { type: "entry.ready"; entryId: string; commit: string }
 	| { type: "check.done"; entryId: string; result: CheckResult }
-	| { type: "retire.done"; entryId: string; commit: string }
+	/** Retirer pushed a splice candidate for the entry; checks must run on it. */
+	| { type: "retire.planned"; entryId: string; candidate: string }
+	/** P ∩ Q ≠ ∅ at retire time: squash the entry (trunk-overlap). */
+	| { type: "retire.overlap"; entryId: string; overlap: string[] }
+	| {
+			type: "retire.done";
+			entryId: string;
+			commit: string;
+			/** Entry head that was retired; ignored if head moved since. */
+			entryCommit?: string;
+			mode?: "fast-forward" | "splice";
+	  }
 	| { type: "entry.veto"; entryId: string }
 	| { type: "config.set"; robSize: number }
 	| { type: "reset" };
@@ -153,7 +179,8 @@ export type Effect =
 	| { type: "fork"; entryId: string; fromRepo: string; toRepo: string }
 	| { type: "token"; entryId: string; repo: string }
 	| { type: "check"; entryId: string; repo: string; commit: string }
-	| { type: "retire"; entryId: string; fromRepo: string; commit: string; toRepo: string; branch: string }
+	| { type: "retire"; entryId: string; fromRepo: string; commit: string; baseCommit: string; toRepo: string; branch: string }
+	| { type: "retire.commit"; entryId: string; toRepo: string; branch: string; candidate: string }
 	| { type: "broadcast"; event: ArbEvent };
 
 export type ApplyResult =
@@ -286,11 +313,13 @@ function cascade(state: RobState, effects: Effect[], now: number): void {
 		}
 		if (h.checks.failed === 0 && !state._internal.retiring[h.id]) {
 			state._internal.retiring[h.id] = true;
+			state._internal.retireStart[h.id] = now;
 			effects.push({
 				type: "retire",
 				entryId: h.id,
 				fromRepo: h.repo,
 				commit: h.headCommit!,
+				baseCommit: h.baseCommit,
 				toRepo: state.trunk.repo,
 				branch: "main",
 			});
@@ -388,7 +417,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			if (cmd.repo === state.trunk.repo && cmd.commit === state.trunk.commit) {
 				return { ok: true, state, effects };
 			}
-			const e = state.entries.find((x) => x.repo === cmd.repo && x.status !== "vetoed");
+			const e = state.entries.find((x) => x.repo === cmd.repo && x.status !== "vetoed" && x.status !== "retired");
 			const pendingId = state._internal.pending
 				? Object.keys(state._internal.pending).find((k) => state._internal.pending[k] === cmd.repo)
 				: undefined;
@@ -415,6 +444,8 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				target.status = "speculating";
 				delete state._internal.checking[target.id];
 				delete state._internal.retiring[target.id];
+				delete state._internal.retireCandidate[target.id];
+				delete state._internal.retireStart[target.id];
 			}
 			state.stats.pushesSeen += 1;
 			emit(state, effects, now, {
@@ -468,7 +499,12 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
 			if (e.status === "retired" || e.status === "vetoed") return err(409, `entry ${e.id} is ${e.status}`);
 			if (state._internal.pending[e.id]) return err(409, `entry ${e.id} refork in progress`);
-			if (e.status === "squashed") return err(409, `entry ${e.id} is squashed; push to the new fork first`);
+			// Squashed entries must re-push — unless the refork already landed
+			// (head === base) and the agent found nothing to re-apply, in which
+			// case readying the fork base is a legitimate no-op retire.
+			if (e.status === "squashed" && !(e.headCommit && e.headCommit === e.baseCommit)) {
+				return err(409, `entry ${e.id} is squashed; push to the new fork first`);
+			}
 			if (cmd.commit !== e.headCommit) return err(409, `commit ${cmd.commit} is not head ${e.headCommit}`);
 			e.status = "ready";
 			emit(state, effects, now, { type: "ready", entryId: e.id, data: { commit: cmd.commit } });
@@ -479,9 +515,51 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const e = find(state, cmd.entryId);
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
 			delete state._internal.checking[e.id];
-			e.checks = cmd.result;
 			state.stats.checksRun += 1;
+			// Checks are issued from "ready"/"checking" (head) or while retiring
+			// (splice candidate). Any other status means the check is stale —
+			// applying it could resurrect a retired/squashed entry (observed:
+			// a head check completing after retirement flipped e3 back to ready
+			// and triggered a phantom trunk-overlap loop).
+			if (e.status !== "ready" && e.status !== "checking") break;
+			// A splice candidate check runs on the trunk repo, not the fork.
+			if (state._internal.retireCandidate[e.id] === cmd.result.commit) {
+				delete state._internal.retireCandidate[e.id];
+				if (cmd.result.failed === 0) {
+					emit(state, effects, now, {
+						type: "check.passed",
+						entryId: e.id,
+						data: { commit: cmd.result.commit, durationMs: cmd.result.durationMs, splice: true },
+					});
+					effects.push({
+						type: "retire.commit",
+						entryId: e.id,
+						toRepo: state.trunk.repo,
+						branch: "main",
+						candidate: cmd.result.commit,
+					});
+				} else {
+					e.status = "failed";
+					delete state._internal.retiring[e.id];
+					delete state._internal.retireStart[e.id];
+					emit(state, effects, now, {
+						type: "check.failed",
+						entryId: e.id,
+						data: {
+							commit: cmd.result.commit,
+							durationMs: cmd.result.durationMs,
+							failed: cmd.result.failed,
+							splice: true,
+						},
+					});
+				}
+				break;
+			}
 			if (cmd.result.commit !== e.headCommit) break; // stale check; a push moved head
+			// Record only head checks: a splice-candidate result must not
+			// clobber entry.checks (its commit never equals the fork head, which
+			// would make cascade re-check the head mid-retire).
+			e.checks = cmd.result;
 			if (cmd.result.failed === 0) {
 				e.status = "ready";
 				emit(state, effects, now, {
@@ -500,10 +578,56 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			break;
 		}
 
-		case "retire.done": {
+		case "retire.planned": {
+			const e = find(state, cmd.entryId);
+			if (!e) return err(404, `entry ${cmd.entryId} not found`);
+			if (!state._internal.retiring[e.id]) break; // stale plan: a push moved the entry on
+			state._internal.retireCandidate[e.id] = cmd.candidate;
+			emit(state, effects, now, {
+				type: "check.started",
+				entryId: e.id,
+				data: { commit: cmd.candidate, splice: true },
+			});
+			effects.push({ type: "check", entryId: e.id, repo: state.trunk.repo, commit: cmd.candidate });
+			break;
+		}
+
+		case "retire.overlap": {
 			const e = find(state, cmd.entryId);
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
 			delete state._internal.retiring[e.id];
+			delete state._internal.retireCandidate[e.id];
+			delete state._internal.retireStart[e.id];
+			// Squash the entry itself: its agent re-applies the change on a
+			// fresh fork of TRUNK. The collision is with trunk content, so the
+			// retry must be based on the trunk head — reforking from the
+			// producer's repo would keep Q non-empty forever (livelock:
+			// observed e3 squash-looped 20+ times on the same overlap).
+			// Dependents are left alone — if the re-applied work moves their
+			// consumed hashes, the normal push path squashes them.
+			const fromRepo = state.trunk.repo;
+			e.generation += 1;
+			e.status = "squashed";
+			e.diagnosis = { reason: "trunk-overlap", changed: [], producerCommit: state.trunk.commit ?? e.baseCommit };
+			state.stats.squashes += 1;
+			const newRepo = forkEffect(state, effects, e, fromRepo);
+			emit(state, effects, now, {
+				type: "squash",
+				entryId: e.id,
+				data: { reason: "trunk-overlap", overlap: cmd.overlap, generation: e.generation, repo: newRepo },
+			});
+			break;
+		}
+
+		case "retire.done": {
+			const e = find(state, cmd.entryId);
+			if (!e) return err(404, `entry ${cmd.entryId} not found`);
+			if (cmd.entryCommit && e.headCommit !== cmd.entryCommit) break; // stale: head moved mid-retire
+			const startedAt = state._internal.retireStart[e.id];
+			const durationMs = startedAt === undefined ? undefined : now - startedAt;
+			delete state._internal.retiring[e.id];
+			delete state._internal.retireCandidate[e.id];
+			delete state._internal.retireStart[e.id];
 			e.status = "retired";
 			state.trunk.commit = cmd.commit;
 			state.trunk.retiredCount += 1;
@@ -511,7 +635,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			emit(state, effects, now, {
 				type: "retired",
 				entryId: e.id,
-				data: { commit: cmd.commit, seq: e.seq },
+				data: { commit: cmd.commit, seq: e.seq, mode: cmd.mode ?? "fast-forward", durationMs },
 			});
 			break;
 		}
@@ -525,6 +649,8 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			delete state._internal.pending[e.id];
 			delete state._internal.checking[e.id];
 			delete state._internal.retiring[e.id];
+			delete state._internal.retireCandidate[e.id];
+			delete state._internal.retireStart[e.id];
 			emit(state, effects, now, { type: "veto", entryId: e.id, data: { seq: e.seq } });
 			// Dependents rebase onto the vetoed entry's own base and are
 			// reparented to the vetoed entry's producer.

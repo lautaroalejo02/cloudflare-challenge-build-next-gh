@@ -7,7 +7,7 @@ Out-of-order CPU execution applied to coding agents. Every agent change is a **b
 
 - **Forwarding:** a consumer entry (e.g. UI) does not wait for its producer (e.g. API) to land. It forks the producer's *unfinished* fork and starts immediately against the producer's current interface.
 - **Squash:** when the producer pushes, the control plane recomputes the producer's exported-interface hash per symbol. If a symbol a consumer depends on changed, the consumer is **squashed**: it is re-forked from the producer's new head and its agent gets a diagnosis (old vs new signature) to redo its work. If no consumed symbol changed (body-only edit), nothing happens (early cutoff).
-- **Retirement:** entries retire onto the trunk in order (lowest `seq` first). An entry retires when its producer has retired, its agent has marked it ready, and its checks pass on its head commit.
+- **Retirement:** entries retire onto the trunk in order (lowest `seq` first). An entry retires when its producer has retired, its agent has marked it ready, and its checks pass on its head commit. Retirement is a **fast-forward** when the trunk head is an ancestor of the entry head. Otherwise it is a **path-disjoint splice**: with P = paths the entry changed vs its `baseCommit` and Q = paths trunk changed since that base, a disjoint P ∩ Q produces a new commit on the trunk head (trunk tree + P overlaid from the entry head) which is pushed to a candidate ref, checked, and only then landed on `main`. An overlapping P ∩ Q squashes the entry with reason `trunk-overlap`. There is never a textual merge.
 - **The human** sets the buffer size (speculation depth) and can veto the head entry. A veto squashes exactly its transitive dependents.
 
 ## Packages and ownership
@@ -53,7 +53,7 @@ interface Entry {
 }
 
 interface Diagnosis {
-  reason: "interface-changed" | "producer-vetoed" | "producer-squashed";
+  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap";
   changed: Array<{ symbol: string; oldHash: string; newHash: string; oldSignature: string; newSignature: string }>;
   producerCommit: string;
 }
@@ -77,11 +77,12 @@ All JSON. Errors: `{ "error": string }` with a 4xx/5xx status.
   - `token` is a write token for `entry.repo`, valid 1 hour.
   - Rejected with 409 when non-retired entries are already `>= robSize`.
 - `GET /api/entries/:id` → `{ entry: Entry, token?: string }`. Includes a fresh write `token` when the entry was re-forked since the agent last fetched it, so the agent can clone the new fork.
-- `POST /api/entries/:id/ready` `{ commit: string }` → `{ entry }`. The agent declares its work done at `commit`.
+- `POST /api/entries/:id/ready` `{ commit: string }` → `{ entry }`. The agent declares its work done at `commit`. Rejected with 409 while squashed, except once the re-fork has landed (`headCommit === baseCommit`) — readying the fork base is then accepted and retires as a no-op when the base already contains the entry's intent.
 - `POST /api/entries/:id/veto` → `{ entry, squashed: string[] }`. Head entry only (409 otherwise).
 - `POST /api/config` `{ robSize: number }` → `{ robSize }`.
 - `GET /api/state` → `BufferState`.
 - `POST /api/reset` → clears buffer state. Does not delete repos.
+- `GET /api/events` → `{ events: ArbEvent[] }`, the internal event log (debug/measurement aid; not part of the public contract surface).
 - `GET /api/ws` → WebSocket upgrade. The server sends `ArbEvent` JSON messages; the client sends nothing.
 
 ## Events (WebSocket messages and the internal log)
@@ -95,6 +96,7 @@ interface ArbEvent {
 }
 ```
 On connect, the server first sends `{ type: "snapshot", ts, data: BufferState }`.
+The `retired` event's `data` includes `mode: "fast-forward" | "splice"` and `durationMs`; `squash` events for `trunk-overlap` carry `data.overlap: string[]` (the intersecting paths). `check.started`/`check.passed`/`check.failed` on a splice candidate carry `data.splice: true` and the candidate `commit` (which lives on the trunk repo, not the fork).
 
 ## Library interfaces (in-process, imported by control-plane via relative paths)
 
@@ -118,7 +120,28 @@ export function runChecks(env: CheckerEnv, repo: string, commit: string): Promis
 ```
 The `CheckResult` shape is defined above.
 
+### Retirer (inside `app/control-plane/src/retire.ts`, port shape in `src/ports.ts`)
+```ts
+interface RetireArgs { fromRepo: string; commit: string; baseCommit: string; toRepo: string; branch: string; candidateBranch?: string }
+type RetireOutcome =
+  | { outcome: "fast-forward"; commit: string; ms: Record<string, number> }
+  | { outcome: "splice"; candidate: string; ms: Record<string, number> }   // candidate pushed to candidateBranch on toRepo; check then moveBranch
+  | { outcome: "overlap"; overlap: string[]; p: string[]; q: string[]; ms: Record<string, number> };
+interface RetirerPort {
+  retire(args: RetireArgs): Promise<RetireOutcome>;
+  moveBranch(args: { toRepo: string; branch: string; commit: string }): Promise<void>;
+}
+```
+
 ## Fixture convention (`app/demo/fixture/`)
 - `src/api/order.ts` (producer: exports `createOrder` and its types), `src/ui/checkout.ts` (consumer), and `tests/order.test.ts`.
 - Plain TypeScript with no runtime dependencies. Relative imports must include the `.ts` extension (`import { createOrder } from "../api/order.ts"`), so type-stripped modules resolve in a Dynamic Worker without rewriting.
 - Tests self-export `run()` per the checker convention.
+
+## Changelog
+- 2026-10-13 (T8): `Diagnosis.reason` gains `"trunk-overlap"` — squash reason when an entry's changed paths intersect trunk's changed paths at retire time.
+- 2026-10-13 (T8): Retirement semantics documented (fast-forward vs path-disjoint splice vs trunk-overlap squash); `RetirerPort` interface added.
+- 2026-10-13 (T8): `retired` event `data.mode`/`durationMs`, `splice` flags on candidate check events and `data.overlap` on trunk-overlap squashes documented.
+- 2026-10-13 (T8): `GET /api/events` debug endpoint added.
+- 2026-10-13 (T8): `entry.ready` accepts a squashed entry's re-forked base (`headCommit === baseCommit`), enabling a no-op retirement when the base already contains the entry's intent.
+- 2026-10-13 (T8): `GET /api/entries/:id` fresh-token trigger changed from "generation bumped" to "repo changed" — Artifacts tokens are per-repo, and generation bumps precede re-fork completion.

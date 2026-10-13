@@ -1,8 +1,20 @@
 name = "arb-control-plane"
 main = "src/index.ts"
 compatibility_date = "2026-10-12"
+compatibility_flags = ["nodejs_compat"]
 account_id = "f3adabb2e83104cf7b9c244077547991"
 workers_dev = true
+
+# app/hasher lazy-init: .wasm imports resolve to WebAssembly.Module (spike 6).
+rules = [
+  { type = "CompiledWasm", globs = ["**/*.wasm"] },
+]
+
+# nodejs_compat: isomorphic-git (src/retire.ts) uses Buffer.
+# CompiledWasm: tree-sitter hasher. worker_loaders: app/checker dynamic workers.
+worker_loaders = [
+  { binding = "LOADER" },
+]
 
 [[artifacts]]
 binding = "ARTIFACTS"
@@ -29,3 +41,7 @@ run_worker_first = true
 [vars]
 POLL_FALLBACK = "on"
 POLL_INTERVAL_MS = "3000"
+
+# Retirement runs git fetches + Dynamic-Worker checks inside one DO call.
+[limits]
+cpu_ms = 30000
