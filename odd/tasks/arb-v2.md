@@ -49,6 +49,7 @@ Route legend: D = delegated writer, I = inline (orchestrator), A = audit (Sonnet
   - Done `6c1b760`, Worker `e72a037b-6c00-4edd-a933-d160f84d78e1`, tag `demo-stable-7`, pushed to `main`.
   - Live: main x2, failing-check and multi all exit 0. The UI infers only `createOrder` and `Cart` (no `charge`). Jev: refactor 0.02 (clear), VAT 0.94/0.97 (squash). Diff cost median 134 ms, max 166 ms.
   - Parent re-ran the control-plane tests: 161/161.
+- [ ] V9 (D, Codex gpt-6.1-sol) Silent 1080p demo video (5:30-6:30) recorded from live scenarios, with burned-in captions and a cue sheet so the user narrates. The user asked for this on 2026-10-13. Prompt `odd/prompts/V9-video.md`. Output in `video/out/` (gitignored).
 - [ ] V6 (A) Sonnet audit per landed unit (V1, V2, V3, V4).
 - [ ] V7 (D) Docs: README, `docs/architecture.md`, `docs/demo-script.md`.
 - [ ] S1 (stretch) Jev producer routing from `task` text.

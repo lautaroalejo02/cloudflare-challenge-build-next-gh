@@ -9,3 +9,5 @@ spikes/_logs/
 *.log
 odd/logs/
 app/dashboard/recordings/*.webm
+video/out/
+video/tmp/
