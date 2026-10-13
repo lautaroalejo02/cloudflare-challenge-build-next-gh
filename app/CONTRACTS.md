@@ -47,6 +47,10 @@ interface Entry {
   headCommit: string | null;      // latest pushed commit on this entry's fork
   exports: SymbolHashes;          // this entry's exported-interface hashes at headCommit
   consumes: SymbolHashes;         // producer symbols this entry depends on, with the hashes it forked against
+  consumesInferred: boolean;      // (V2) true when `consumes` was omitted at registration and is derived from imports
+  forkedExports: SymbolHashes;    // (V2) producer's `exports` snapshot at this entry's latest (re-)fork ({} when forked from trunk)
+  bodies: SymbolHashes;           // (V2) this entry's exported symbol -> bodyHash at headCommit (see hasher)
+  judging: string[];              // (V2) consumed symbols with a pending Jev judgment; blocks retirement while non-empty
   predicted: string[];            // exported symbols whose `exports` values are unconfirmed stub predictions;
                                   // cleared when the entry's first real push resolves them against reality
   generation: number;             // 0 at creation, +1 per squash/re-fork
@@ -55,9 +59,12 @@ interface Entry {
 }
 
 interface Diagnosis {
-  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap" | "prediction-miss";
+  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap" | "prediction-miss"
+        | "behavior-changed";   // (V2) signature unchanged, body changed, Jev judged the consumer now incorrect
   changed: Array<{ symbol: string; oldHash: string; newHash: string; oldSignature: string; newSignature: string }>;
+                                  // for "behavior-changed": oldHash/newHash are bodyHashes, signatures are equal
   producerCommit: string;
+  judgment?: { model: string; probability: number }; // (V2) present only for "behavior-changed"
 }
 
 interface CheckResult { commit: string; passed: number; failed: number; durationMs: number; results: Array<{ name: string; ok: boolean; error?: string }>;
@@ -68,7 +75,9 @@ interface BufferState {
   robSize: number;                // max non-retired entries (speculation depth), default 8
   entries: Entry[];               // all entries, sorted by seq
   stats: { squashes: number; earlyCutoffs: number; retired: number; checksRun: number; pushesSeen: number;
-           predictionHits: number; predictionMisses: number }; // per (consumer, symbol) stub-prediction verdicts
+           predictionHits: number; predictionMisses: number;  // per (consumer, symbol) stub-prediction verdicts
+           judgments: number; semanticSquashes: number;      // (V2) Jev judgments completed / squashes they caused
+           inferredDeps: number };                           // (V2) consumed symbols derived from imports
 }
 ```
 
@@ -80,6 +89,8 @@ All JSON. Errors: `{ "error": string }` with a 4xx/5xx status.
 - `POST /api/entries` `{ agent, lane, producerId?: string, consumes?: string[], stub?: Record<path, string> }` → `{ entry: Entry, token: string }`.
   - Forks from the producer's fork at its current head (forwarding), or from trunk if there is no producer.
   - `consumes` lists the producer symbol names this entry depends on. Their current hashes are recorded in `entry.consumes`.
+  - (V2) `consumes` is optional. When it is omitted and `producerId` is set, `entry.consumesInferred = true` and `entry.consumes` starts as `{}`. On every push of the entry, the control plane extracts its imports (`extractImports`) and sets `consumes[name] = forkedExports[name]` for every imported name that the producer exports from the imported file. Newly added names emit `deps.inferred`. If a newly inferred name already differs between `forkedExports` and the producer's current `exports`, the entry is squashed immediately with reason `interface-changed`.
+  - (V2, best effort) Imports of files that another non-retired entry (not the producer, not an ancestor) has changed emit `deps.undeclared`. They are reported only; there is no automatic re-fork. Emitted only when the control plane knows that entry's changed paths cheaply; if computing them costs more than about 300 ms per push, it is skipped and documented in NOTES.
   - `stub` (value prediction) is TypeScript source declaring the entry's *intended* exported signatures. The control plane hashes it with the real hasher; `entry.exports` starts as these predicted hashes and `entry.predicted` lists the predicted symbols until the entry's first real push resolves them. Consumers registering while `producer.predicted` is non-empty forward against the predicted hashes, and get a `prediction.hit` (no squash) or `prediction.miss` (squash with reason `prediction-miss`) verdict per consumed symbol on that first push.
   - `token` is a write token for `entry.repo`, valid 1 hour.
   - Rejected with 409 when non-retired entries are already `>= robSize`.
@@ -97,13 +108,20 @@ All JSON. Errors: `{ "error": string }` with a 4xx/5xx status.
 interface ArbEvent {
   type: "entry.created" | "push" | "hash.unchanged" | "hash.changed" | "squash" | "refork" | "ready"
       | "check.started" | "check.passed" | "check.failed" | "prediction.hit" | "prediction.miss"
-      | "retired" | "veto" | "config" | "reset" | "retire.retry" | "retire.failed" | "recover";
+      | "retired" | "veto" | "config" | "reset" | "retire.retry" | "retire.failed" | "recover"
+      | "deps.inferred" | "deps.undeclared" | "jev.judged" | "jev.unavailable"; // (V2)
   ts: number;          // Date.now() on the server
   entryId?: string;
   data?: unknown;      // type-specific; include enough for the UI (e.g. symbol, oldHash, newHash, commit, durationMs)
 }
 ```
 On connect, the server first sends `{ type: "snapshot", ts, data: BufferState }`.
+(V2) Event payloads (`entryId` is always the consumer):
+- `deps.inferred` `data: { producerId, symbols: Record<name, hash> }` (only the newly inferred names).
+- `deps.undeclared` `data: { fromEntryId, paths: string[], symbols: string[] }`.
+- `jev.judged` `data: { producerId, symbol, probability, verdict: "squash" | "warn" | "clear", commit, model }`.
+- `jev.unavailable` `data: { producerId, symbol, reason }` (no key, timeout, HTTP error); treated as `clear`.
+
 The `retired` event's `data` includes `mode: "fast-forward" | "splice"` and `durationMs`; `squash` events for `trunk-overlap` carry `data.overlap: string[]` (the intersecting paths). `check.started`/`check.passed`/`check.failed` on a splice candidate carry `data.splice: true` and the candidate `commit` (which lives on the trunk repo, not the fork).
 
 ## Library interfaces (in-process, imported by control-plane via relative paths)
@@ -115,8 +133,33 @@ export interface InterfaceHash { hash: string; symbols: SymbolSignature[]; }
 // files: path -> TypeScript source. Only exported declarations count.
 // Normalization: comments, formatting and declaration order do not change the hash; function bodies are ignored.
 export function hashInterface(files: Record<string, string>): Promise<InterfaceHash>;
+
+// (V2) additive fields on SymbolSignature:
+//   file: string;      // repo-relative path of the declaring file, e.g. "src/api/order.ts"
+//   bodyHash: string;  // 12 hex of sha256 over the normalized FULL declaration (signature + body/initializer).
+//                      // Same normalization as `hash` (comments/formatting ignored), but bodies count.
+//   source: string;    // raw declaration text as written, truncated to 4000 chars (input for Jev)
+// `hash` (interface hash) is unchanged by V2.
+
+// (V2) Imports, for dependency inference.
+export interface ImportRef {
+  file: string;      // importing file, repo-relative
+  from: string;      // relative specifiers resolved to a repo-relative path ("../api/order.ts" from
+                     // "src/ui/checkout.ts" -> "src/api/order.ts"); bare specifiers kept as written
+  names: string[];   // imported binding names as exported by `from`; "default" for default, "*" for namespace;
+                     // `import type` names included; re-exports (`export { x } from`) count as imports
+}
+export function extractImports(files: Record<string, string>): Promise<ImportRef[]>;
 ```
 `hash` and `SymbolSignature.hash` are the first 12 hex characters of sha256 over the normalized signature text.
+
+### (V2) Jev semantic judgment (inside `app/control-plane/src/jev.ts`)
+- TypeSafe System One API: `POST https://api.typesafe.ai/v1/systemone`, header `Authorization: Bearer <TYPESAFE_API_KEY>` (Worker secret; local copy only in gitignored `app/control-plane/.secret-typesafe-key`), body `{ state, model: "jev-latest", questions }`. A Noul answer is `answers[id].noul` in [0,1]. Errors: 401, 422, 429, 529; retry 429/529/5xx with backoff (0.5 s, 1 s), timeout 8 s per attempt.
+- Trigger: a producer push where a symbol consumed by a non-retired consumer keeps its interface `hash` but its `bodyHash` changed. One request per consumer, one Noul question per affected symbol.
+- State sent: `{ producer: { symbol, before, after }, consumer: { agent, lane, usage: [{ file, code }] } }`, where `before`/`after` are the declaration `source` texts and `usage` holds the consumer files at its headCommit that import the symbol (each truncated to 6000 chars).
+- Question: "The change from `producer.before` to `producer.after` alters behavior that the code in `consumer.usage` relies on, so that code would now be incorrect or produce different results." Criteria true: "The consumer's observable results or correctness change." False: "Pure refactor or an internal change the consumer cannot observe."
+- Policy: probability >= 0.7 → squash with reason `behavior-changed`; 0.4 <= p < 0.7 → `warn` (event only); p < 0.4 → `clear` (nothing happens). The push itself still emits `hash.unchanged` and counts the early cutoff exactly as before V2; a later `squash` verdict overrides it. Unavailable → `clear` plus `jev.unavailable`. Jev never blocks retirement for longer than the judgment itself; the 60 s sweep clears stale `judging` markers as unavailable.
+- A verdict is applied only if the producer's headCommit still equals the judged commit and the consumer's generation is unchanged; otherwise it is dropped.
 
 ### `app/checker` exports, from `app/checker/src/index.ts`
 ```ts
@@ -166,3 +209,6 @@ interface RetirerPort {
 - 2026-10-13 (T19): `GET /api/entries/:id` returns a write token on every authenticated call (was: once per repo change, to whoever asked first).
 - 2026-10-13 (T19): `POST /api/reset` restores the default `robSize`; entry ids/seqs keep increasing across resets (fresh fork names, no `-xN` collisions).
 - 2026-10-13 (T19): Splice overlap also counts file/dir prefix conflicts (`src/a` vs `src/a/b.ts`), mode-only changes, and keeps gitlinks.
+- 2026-10-13 (V2): Dependency inference: `POST /api/entries` `consumes` is optional; omitted + `producerId` derives `consumes` from imports on each push. `Entry` gains `consumesInferred`, `forkedExports`, `bodies`, `judging`. Events `deps.inferred`, `deps.undeclared`.
+- 2026-10-13 (V2): Hasher gains `extractImports` and `SymbolSignature.file`/`bodyHash`/`source`.
+- 2026-10-13 (V2): Jev semantic squash: body-only changes to consumed symbols are judged by TypeSafe Jev; `Diagnosis.reason` gains `"behavior-changed"` and `Diagnosis.judgment`. Events `jev.judged`, `jev.unavailable`. `stats` gains `judgments`, `semanticSquashes`, `inferredDeps`.
