@@ -44,6 +44,13 @@
       headCommit: e.headCommit || null,
       exports: e.exports || {},
       consumes: e.consumes || {},
+      consumesInferred: e.consumesInferred === true,
+      forkedExports: e.forkedExports || {},
+      bodies: e.bodies || {},
+      judging: Array.isArray(e.judging) ? e.judging : [],
+      _inferredAt: e._inferredAt || {},
+      _undeclared: e._undeclared || [],
+      _judgments: e._judgments || {},
       predicted: Array.isArray(e.predicted) ? e.predicted : [],
       generation: typeof e.generation === 'number' ? e.generation : 0,
       diagnosis: e.diagnosis || null,
@@ -75,7 +82,8 @@
         cutoffs: existing.cutoffs, _squashAt: existing._squashAt,
         _retireAt: existing._retireAt, _cutoffAt: existing._cutoffAt, _hashAt: existing._hashAt,
         _retireMode: existing._retireMode, _hcCommit: existing._hcCommit,
-        _predTicks: existing._predTicks
+        _inferredAt: existing._inferredAt, _undeclared: existing._undeclared,
+        _judgments: existing._judgments, _predTicks: existing._predTicks
       };
       Object.assign(existing, e);
       Object.assign(existing, keep);
@@ -108,6 +116,11 @@
     }
     if (s.stats) state.stats = Object.assign(createState().stats, s.stats);
     return state.entries.length;
+  }
+
+  function probabilityText(p) { return typeof p === 'number' && isFinite(p) ? p.toFixed(2) : '—'; }
+  function behaviorDiagnosis(d, symbol) {
+    return [symbol, 'signature unchanged · behavior changed', 'Jev p=' + probabilityText(d.judgment && d.judgment.probability)];
   }
 
   function shortCommit(c) { return c ? String(c).slice(0, 7) : '—'; }
@@ -149,6 +162,10 @@
             repo: data.repo || '',
             exports: data.exports || {},
             consumes: data.consumes || {},
+            consumesInferred: data.consumesInferred,
+            forkedExports: data.forkedExports,
+            bodies: data.bodies,
+            judging: data.judging,
             predicted: data.predicted || [],
             status: data.status || 'speculating'
           });
@@ -209,6 +226,40 @@
           (entry && producer && entry !== producer ? ' · consumed by ' + entry.id : ''));
         break;
       }
+      case 'deps.inferred': {
+        var inferred = data.symbols || {};
+        if (entry) {
+          entry.consumesInferred = true;
+          Object.keys(inferred).forEach(function (symbol) {
+            entry.consumes[symbol] = inferred[symbol];
+            entry._inferredAt[symbol] = now;
+          });
+        }
+        state.stats.inferredDeps = (state.stats.inferredDeps || 0) + Object.keys(inferred).length;
+        pushLog(state, ev, 'dependencies inferred ' + (ev.entryId || '?') + ' · ' + Object.keys(inferred).join(', '));
+        break;
+      }
+      case 'deps.undeclared': {
+        if (entry) {
+          var warning = { fromEntryId: data.fromEntryId, paths: data.paths || [], symbols: data.symbols || [] };
+          entry._undeclared = entry._undeclared.filter(function (w) { return w.fromEntryId !== warning.fromEntryId; });
+          entry._undeclared.push(warning);
+        }
+        pushLog(state, ev, 'undeclared dependency ' + (ev.entryId || '?') + ' ← ' + (data.fromEntryId || '?') + ' · ' + (data.symbols || []).join(', '));
+        break;
+      }
+      case 'jev.judged':
+      case 'jev.unavailable': {
+        var unavailable = ev.type === 'jev.unavailable';
+        if (entry && data.symbol) {
+          entry.judging = entry.judging.filter(function (symbol) { return symbol !== data.symbol; });
+          entry._judgments[data.symbol] = Object.assign({}, data, { verdict: unavailable ? 'unavailable' : data.verdict });
+        }
+        if (!unavailable) bump = 'judgments';
+        pushLog(state, ev, unavailable ? 'semantic check unavailable · ' + (data.symbol || '?') :
+          'Jev ' + data.verdict + ' · ' + (ev.entryId || '?') + ' · ' + data.symbol + ' p=' + probabilityText(data.probability));
+        break;
+      }
       case 'prediction.hit':
       case 'prediction.miss': {
         // entryId is the CONSUMER; data carries the producer + verdict fields.
@@ -238,13 +289,18 @@
             entry.diagnosis = {
               reason: data.reason || 'interface-changed',
               changed: Array.isArray(data.changed) ? data.changed : [],
-              producerCommit: data.producerCommit || entry._hcCommit || ''
+              producerCommit: data.producerCommit || entry._hcCommit || '',
+              judgment: data.judgment
             };
           }
           if (data.repo) entry.repo = data.repo;
           if (typeof data.generation === 'number') entry.generation = data.generation;
           else if (!isEntry(data.entry)) entry.generation += 1;
         }
+        if (entry && entry.diagnosis && entry.diagnosis.reason === 'behavior-changed') {
+          state.stats.semanticSquashes = (state.stats.semanticSquashes || 0) + 1;
+        }
+        if (entry) entry.judging = [];
         bump = 'squashes';
         pushLog(state, ev, 'SQUASH ' + (entry ? entry.id : '?') + (entry && entry.diagnosis && entry.diagnosis.changed[0]
           ? ' · ' + entry.diagnosis.changed[0].symbol + ' ' + shortHash(entry.diagnosis.changed[0].oldHash) + '→' + shortHash(entry.diagnosis.changed[0].newHash)
@@ -266,13 +322,16 @@
           if (typeof data.generation === 'number') entry.generation = data.generation;
           if (data.baseCommit) entry.baseCommit = data.baseCommit;
           // Server-side fork.done records the new producer hashes in consumes.
-          if (entry.diagnosis && Array.isArray(entry.diagnosis.changed)) {
+          if (entry.diagnosis && entry.diagnosis.reason !== 'behavior-changed' && Array.isArray(entry.diagnosis.changed)) {
             entry.diagnosis.changed.forEach(function (c) {
               if (c && c.symbol && c.newHash) entry.consumes[c.symbol] = c.newHash;
             });
           }
           // New generation forwards against actual hashes: verdict ticks reset.
           entry._predTicks = {};
+          entry._judgments = {};
+          entry._undeclared = [];
+          entry.judging = [];
         }
         pushLog(state, ev, 'refork ' + (entry ? entry.id : '?') + (entry ? ' → ' + entry.repo + ' · gen ' + entry.generation : ''));
         break;
@@ -387,7 +446,7 @@
     }
 
     if (data.stats) state.stats = Object.assign(createState().stats, data.stats);
-    else if (bump) state.stats[bump] += 1;
+    else if (bump) state.stats[bump] = (state.stats[bump] || 0) + 1;
     if (entry) sortEntries(state);
   }
 
@@ -483,6 +542,8 @@
 
   return {
     STAGES: STAGES,
+    probabilityText: probabilityText,
+    behaviorDiagnosis: behaviorDiagnosis,
     adminKeyFromSearch: adminKeyFromSearch,
     adminHeaders: adminHeaders,
     LOG_CAP: LOG_CAP,

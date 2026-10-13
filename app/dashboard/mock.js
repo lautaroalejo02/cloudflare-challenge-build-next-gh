@@ -1,8 +1,9 @@
 /* Mock replay of the Idea-3 demo scene: the API agent declares a stub at
  * registration and consumers forward against it before it writes anything.
  * Its first real push scores the predictions — createOrder hits, Order misses
- * and squashes the UI agent. A later breaking change squashes consumers as an
- * ordinary interface change, a body-only push early-cuts-off, entries retire
+ * and squashes the UI agent. A body-only push early-cuts-off, then Jev catches
+ * a same-signature behavior change. A later breaking change squashes consumers
+ * as an ordinary interface change. Entries retire
  * onto trunk by fast-forward and splice, and a docs entry is squashed on
  * trunk overlap. Payloads mirror what the deployed control plane emits on
  * /api/ws (app/control-plane/src/rob.ts): flat per-event fields, no data.entry.
@@ -45,7 +46,7 @@
     at(0, ev('snapshot', null, {
       trunk: { repo: 'arb-trunk', commit: 'aa00bb11cc22', retiredCount: 0 },
       robSize: 8, entries: [],
-      stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0 }
+      stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0, judgments: 0, semanticSquashes: 0, inferredDeps: 0 }
     }));
 
     // t≈0: the API agent registers WITH a declared stub — its exports are
@@ -54,7 +55,7 @@
     at(400, ev('entry.created', 'e1', { agent: 'api-agent', lane: 'api', seq: 1, producerId: null, repo: 'arb-e1-api-0',
       exports: { createOrder: P1, Order: P2 }, consumes: {}, predicted: ['createOrder', 'Order'] }));
     at(1000, ev('entry.created', 'e2', { agent: 'ui-agent', lane: 'ui', seq: 2, producerId: 'e1', repo: 'arb-e2-ui-0',
-      exports: { CheckoutForm: 'b21c8f440e55' }, consumes: { createOrder: P1, Order: P2 } }));
+      exports: { CheckoutForm: 'b21c8f440e55' }, consumesInferred: true, forkedExports: { createOrder: P1, Order: P2 } }));
     at(1600, ev('entry.created', 'e3', { agent: 'test-agent', lane: 'tests', seq: 3, producerId: 'e1', repo: 'arb-e3-tests-0',
       exports: {}, consumes: { createOrder: P1 } }));
     at(2200, ev('entry.created', 'e4', { agent: 'docs-agent', lane: 'docs', seq: 4, producerId: null, repo: 'arb-e4-docs-0' }));
@@ -73,7 +74,7 @@
         { id: 'e2', seq: 2, agent: 'ui-agent', lane: 'ui', status: 'speculating',
           repo: 'arb-e2-ui-0', remote: 'https://artifacts.example/arb/arb-e2-ui-0',
           producerId: 'e1', baseCommit: 'aa00bb11cc22', headCommit: 'aa00bb11cc22',
-          exports: { CheckoutForm: 'b21c8f440e55' }, consumes: { createOrder: P1, Order: P2 }, predicted: [],
+          exports: { CheckoutForm: 'b21c8f440e55' }, consumes: {}, consumesInferred: true, forkedExports: { createOrder: P1, Order: P2 }, predicted: [],
           generation: 0, diagnosis: null, checks: null },
         { id: 'e3', seq: 3, agent: 'test-agent', lane: 'tests', status: 'speculating',
           repo: 'arb-e3-tests-0', remote: 'https://artifacts.example/arb/arb-e3-tests-0',
@@ -86,11 +87,13 @@
           exports: {}, consumes: {}, predicted: [],
           generation: 0, diagnosis: null, checks: null }
       ],
-      stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0 }
+      stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0, judgments: 0, semanticSquashes: 0, inferredDeps: 0 }
     }));
 
     // docs agent pushes its work early.
     at(3200, ev('push', 'e4', { repo: 'arb-e4-docs-0', commit: 'b0bacafe0004' }));
+
+    at(3300, ev('deps.inferred', 'e2', { producerId: 'e1', symbols: { createOrder: P1, Order: P2 } }));
 
     // e1's FIRST REAL PUSH resolves the declared-stub predictions per consumed
     // symbol, per consumer: createOrder lands exactly as declared (hit for
@@ -106,6 +109,8 @@
     at(4500, ev('hash.changed', 'e2', { producerId: 'e1', commit: 'c1a2b3c9d4e5', changed: clone(ORDER_MISS) }));
     at(4600, ev('squash', 'e2', { reason: 'prediction-miss', changed: clone(ORDER_MISS), generation: 1, repo: 'arb-e2-ui-1' }));
     at(5700, ev('refork', 'e2', { repo: 'arb-e2-ui-1', baseCommit: 'c1a2b3c9d4e5', generation: 1 }));
+    // The UI reapplies after its prediction miss before semantic judging starts.
+    at(6000, ev('push', 'e2', { repo: 'arb-e2-ui-1', commit: 'cafe00000002' }));
 
     // Later breaking change: createOrder flips to the options-object form —
     // an ordinary interface-changed squash for both consumers.
@@ -160,7 +165,40 @@
     at(25700, ev('check.passed', 'e4', { commit: 'd0c5f00d1234', durationMs: 154 }));
     at(26300, ev('retired', 'e4', { commit: TRUNK_C.e4, seq: 4, mode: 'splice' }));
 
-    return steps;
+    // Preserve every V1 beat, but put the breaking interface change after the
+    // V2 same-signature behavior change. The initial UI fork omitted consumes;
+    // its first import scan above supplies the inferred tags before any verdict.
+    steps.forEach(function (step) {
+      if (step.at >= 6400 && step.at <= 8400) step.at += 10000;
+      else if (step.at >= 9000 && step.at <= 9800) step.at -= 2600;
+      else if (step.at >= 10400) step.at += 9000;
+      if (step.ev.entryId === 'e2' && step.at >= 16400) {
+        if (step.ev.data.generation != null) step.ev.data.generation += 1;
+        if (step.ev.data.repo) step.ev.data.repo = step.ev.data.repo.replace('ui-2', 'ui-3');
+      }
+    });
+    at(8200, ev('push', 'e1', { repo: 'arb-e1-api-0', commit: 'beef00000001' }));
+    at(8600, ev('hash.unchanged', 'e2', { producerId: 'e1', commit: 'beef00000001' }));
+    at(8650, ev('hash.unchanged', 'e3', { producerId: 'e1', commit: 'beef00000001' }));
+    // Pending judgments are an Entry field, not a made-up event type. Simulate
+    // the state refresh used by the live dashboard while the judge is running.
+    var local = replayState();
+    steps.filter(function (step) { return step.at <= 8650; }).sort(function (a, b) { return a.at - b.at; })
+      .forEach(function (step) { local.api.applyEvent(local.state, clone(step.ev)); });
+    local.state.entries.forEach(function (entry) {
+      if (entry.id === 'e2' || entry.id === 'e3') entry.judging = ['createOrder'];
+    });
+    at(8800, ev('snapshot', null, clone(local.state)));
+    at(11200, ev('jev.judged', 'e3', { producerId: 'e1', symbol: 'createOrder', verdict: 'clear', probability: 0.12, commit: 'beef00000001', model: 'jev-latest' }));
+    at(12500, ev('jev.judged', 'e2', { producerId: 'e1', symbol: 'createOrder', verdict: 'squash', probability: 0.86, commit: 'beef00000001', model: 'jev-latest' }));
+    at(12600, ev('squash', 'e2', { reason: 'behavior-changed', changed: [{ symbol: 'createOrder', oldHash: 'body00000001', newHash: 'body00000002', oldSignature: SIG_V1_FN, newSignature: SIG_V1_FN }], judgment: { model: 'jev-latest', probability: 0.86 }, producerCommit: 'beef00000001', generation: 2, repo: 'arb-e2-ui-2' }));
+    at(15100, ev('refork', 'e2', { repo: 'arb-e2-ui-2', baseCommit: 'beef00000001', generation: 2 }));
+    return steps.sort(function (a, b) { return a.at - b.at; });
+  }
+
+  function replayState() {
+    var api = typeof module !== 'undefined' && module.exports ? require('./state.js') : window.ArbState;
+    return { api: api, state: api.createState() };
   }
 
   /* Replay the script, calling emit(ev) on schedule. Returns total duration. */

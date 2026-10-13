@@ -3,6 +3,50 @@
 Static files, no build step, no external assets (offline-safe). The
 control-plane Worker serves this directory at `/` later.
 
+## V5: V2 dependency inference and Jev judgments
+
+- Preserves the redesign's lanes, blocked-first diagnosis, muted metadata and
+  secondary statistics. Inferred consumed symbols have a subtle label and a
+  brief highlight; undeclared dependencies identify the other entry and symbols
+  without blocking the consumer.
+- Pending `entry.judging` is rendered on the affected tags and row badge.
+  `jev.judged` clear shows a quiet tick; warn shows its probability but does not
+  change status; squash waits for the separate squash event. Unavailability is
+  a dim "semantic check unavailable" note, not an error.
+- `behavior-changed` diagnosis renders the symbol, "signature unchanged ·
+  behavior changed", and `Jev p=0.86` (two decimals). Its hashes are body hashes,
+  so refork must not copy them into interface-valued `consumes`.
+- V2 statistics appear only when provided by a snapshot or V2 event. An old
+  Worker's missing counters stay hidden rather than displaying synthetic zeros.
+- Replay retains all V1 beats. UI registration omits `consumes`; its first
+  import scan infers `createOrder` and `Order` before the stub prediction beat.
+  After the original early cutoff, a second body-only API change opens judging;
+  tests clear, UI squashes at p=0.86 and reforks. The original breaking-change
+  beat then runs, followed by checks, repair, trunk overlap and four retirements.
+  Duration is now about 35 seconds. An extra UI push after the prediction miss
+  clears that old diagnosis before semantic judging.
+- Live judging has no dedicated start event in the contract. Push and
+  `hash.unchanged` therefore schedule state refreshes, as creation/refork already
+  do. The mock supplies the pending fields through a real-shaped snapshot.
+
+Run: open `mock.html` directly, or serve this directory using the control-plane
+assets binding. No build, CDN, production dependencies or deployment changes.
+
+Verification:
+- `npm test` in this directory: 44 tests passed, zero failed/skipped. Initial V2
+  RED run: 32 passed, 10 failed; implementation and replay assertions then GREEN.
+- `node scripts/capture-v2.mjs`: opens local `mock.html` in headless Edge using
+  Playwright virtual time; captures inference, judging and semantic squash at
+  1280x720 and 1920x1080; asserts diagnosis text, no horizontal page overflow,
+  four final retirements and no browser errors. Six `screenshots/v2-*.png` files.
+- `git diff --check -- app/dashboard`: no whitespace errors.
+
+Contract issues: none. Cloudflare resources created: none.
+Known gaps: no deployed V2 Worker verification in this task; transient pending
+judgments can finish before the live snapshot refresh. Event-only warnings are
+session-local because BufferState does not persist those verdicts. No commit,
+push, or edits to another agent's package were made.
+
 ## Files
 
 - `index.html` — shell; the whole DOM is built by `app.js`.

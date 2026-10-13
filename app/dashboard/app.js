@@ -56,6 +56,10 @@
       '  <div class="stat"><span class="stat-label">Checks run</span><span class="stat-num" id="s-checks">0</span></div>' +
       '  <div class="stat"><span class="stat-label">Pushes seen</span><span class="stat-num" id="s-pushes">0</span></div>' +
       '  <div class="stat"><span class="stat-label">Re-fork ready</span><span class="stat-num" id="s-reforkt">—</span></div>' +
+      ['judgments', 'semanticSquashes', 'inferredDeps'].map(function (key, i) {
+        return '<div class="stat secondary" hidden><span class="stat-label">' +
+          ['Jev judgments', 'Semantic squashes', 'Inferred deps'][i] + '</span><span class="stat-num" id="s-' + key + '"></span></div>';
+      }).join('') +
       '  <div class="controls">' +
       '    <label for="robsize">robSize</label>' +
       (CAN_CONTROL
@@ -84,6 +88,7 @@
       checksRun: document.getElementById('s-checks'),
       pushesSeen: document.getElementById('s-pushes')
     };
+    ['judgments', 'semanticSquashes', 'inferredDeps'].forEach(function (key) { el.stats[key] = document.getElementById('s-' + key); });
     el.predStat = document.getElementById('s-pred');
     el.reforkT = document.getElementById('s-reforkt');
 
@@ -131,6 +136,9 @@
   function render() {
     Object.keys(el.stats).forEach(function (k) {
       el.stats[k].textContent = state.stats[k];
+      if (['judgments', 'semanticSquashes', 'inferredDeps'].indexOf(k) >= 0) {
+        el.stats[k].parentElement.hidden = typeof state.stats[k] !== 'number';
+      }
     });
     el.predStat.textContent = state.stats.predictionHits + ' hit / ' + state.stats.predictionMisses + ' miss';
     var rf = A.reforkTiming(state);
@@ -199,6 +207,8 @@
     if (recent(e._hashAt, 1200)) cls += ' pulse-hash';
     if (isHead) cls += ' is-head';
 
+    var pendingJudgment = e.judging && e.judging.length;
+    if (pendingJudgment) cls += ' is-judging';
     var stage = A.stageIndex(e);
     var track = '<div class="track">';
     A.STAGES.forEach(function (s, i) {
@@ -217,10 +227,17 @@
       // it; the verdict tick lands on the row when the first real push scores it.
       var isPred = !!(prod && prod.predicted && prod.predicted.indexOf(sym) >= 0);
       var tick = e._predTicks && e._predTicks[sym];
-      fwd += '<span class="tag fwd' + (isPred ? ' pred' : '') + '" title="' + esc(e.consumes[sym]) +
+      var judging = e.judging && e.judging.indexOf(sym) >= 0;
+      var judgment = e._judgments && e._judgments[sym];
+      fwd += '<span class="tag fwd' + (judging ? ' judging' : '') + (recent(e._inferredAt && e._inferredAt[sym], 1800) ? ' inferred-new' : '') + (isPred ? ' pred' : '') + '" title="' + esc(e.consumes[sym]) +
         (isPred ? ' · predicted from declared stub — unconfirmed' : '') + '">' +
         'forwarded: ' + esc(sym) + '<b>' + h4(e.consumes[sym]) + '</b>' +
         (e.producerId ? '<i>← ' + esc(e.producerId) + '</i>' : '') +
+        (e.consumesInferred ? '<i class="inferred-mark">inferred</i>' : '') +
+        (judging ? '<i class="judging-mark">judging</i>' : '') +
+        (!judging && judgment && judgment.verdict === 'clear' ? '<i class="semantic-clear" title="semantic check clear">✓</i>' : '') +
+        (!judging && judgment && judgment.verdict === 'warn' ? '<i class="semantic-warn">Jev warning p=' + A.probabilityText(judgment.probability) + '</i>' : '') +
+        (!judging && judgment && judgment.verdict === 'unavailable' ? '<i class="semantic-unavailable">semantic check unavailable</i>' : '') +
         (isPred ? '<i class="pred-mark">≈ stub</i>' : '') +
         (tick ? '<i class="pred-tick ' + tick + '">' + (tick === 'hit' ? '✓ hit' : '✗ miss') + '</i>' : '') +
         '</span>';
@@ -241,13 +258,21 @@
         'producer-vetoed': 'producer vetoed',
         'producer-squashed': 'producer squashed',
         'trunk-overlap': 'trunk overlap',
-        'prediction-miss': 'stub prediction miss'
+        'prediction-miss': 'stub prediction miss',
+        'behavior-changed': 'behavior changed'
       };
       var reason = reasons[e.diagnosis.reason] || e.diagnosis.reason || 'squashed';
       var baseLabel = e.diagnosis.reason === 'trunk-overlap' ? 'trunk' : 'producer';
       diag += '<div class="diag"><div class="diag-head">SQUASHED · ' + esc(reason) +
         ' · ' + baseLabel + ' @ ' + c7(e.diagnosis.producerCommit) + '</div>';
       (e.diagnosis.changed || []).slice(0, 2).forEach(function (c) {
+        if (e.diagnosis.reason === 'behavior-changed') {
+          var lines = A.behaviorDiagnosis(e.diagnosis, c.symbol);
+          diag += '<div class="diag-sym mono">' + esc(lines[0]) + '</div>' +
+            '<div class="diag-sig mono">' + esc(lines[1]) + '</div>' +
+            '<div class="diag-sig mono">' + esc(lines[2]) + '</div>';
+          return;
+        }
         diag += '<div class="diag-sym mono">' + esc(c.symbol) + '  ' + h4(c.oldHash) + ' → ' + h4(c.newHash) + '</div>' +
           (c.oldSignature ? '<div class="diag-sig old mono"><span class="sig-label">Previous</span> ' + esc(c.oldSignature) + '</div>' : '') +
           (c.newSignature ? '<div class="diag-sig new mono"><span class="sig-label">Current</span> ' + esc(c.newSignature) + '</div>' : '');
@@ -261,6 +286,9 @@
       diag += '</div>';
     }
 
+    var warnings = (e._undeclared || []).map(function (w) {
+      return '<div class="dependency-warning">Undeclared dependency · ' + esc(w.fromEntryId) + ' · ' + esc(w.symbols.join(', ') || w.paths.join(', ')) + '</div>';
+    }).join('');
     var checks = '';
     if (e.checks) {
       var ok = e.checks.failed === 0;
@@ -278,7 +306,7 @@
       '<div class="row-head">' +
       '<span class="eid mono">' + esc(e.id) + '</span>' +
       '<span class="agent">' + esc(e.agent) + '</span>' +
-      '<span class="badge">' + esc(e.status.toUpperCase()) + '</span>' +
+      '<span class="badge">' + esc(pendingJudgment ? 'JUDGING' : e.status.toUpperCase()) + '</span>' +
       '<span class="gen mono">gen ' + e.generation + '</span>' +
       '<span class="repo mono">' + esc(e.repo) + '</span>' +
       (e.headCommit ? '<span class="commit mono" title="' + esc(e.headCommit) + '">@' + c7(e.headCommit) + '</span>' : '') +
@@ -288,6 +316,7 @@
         (CAN_CONTROL ? '<button class="btn veto" data-veto="' + esc(e.id) + '" title="squash transitive dependents">VETO</button>' : '') : '') +
       '</div>' +
       diag +
+      warnings +
       track +
       '<div class="tags">' + fwd + (fwd && exp ? '<span class="tag-sep"></span>' : '') +
       (exp ? '<span class="tag-label">exports</span>' + exp : '') + '</div>' +
@@ -481,7 +510,7 @@
     // The control plane does not broadcast fork completion: an entry's repo,
     // remote, exports and recorded consumes only appear in /api/state once the
     // fork effect lands. Pull one snapshot shortly after creation/refork.
-    if (!MOCK && (ev.type === 'entry.created' || ev.type === 'refork')) scheduleStateRefresh();
+    if (!MOCK && (ev.type === 'entry.created' || ev.type === 'refork' || ev.type === 'push' || ev.type === 'hash.unchanged')) scheduleStateRefresh();
   }
 
   var refreshT1 = null, refreshT2 = null;

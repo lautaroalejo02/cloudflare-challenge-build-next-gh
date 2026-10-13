@@ -254,3 +254,17 @@ b { font-weight: 650; }
   .row.flash-squash, .row.pulse-cutoff { animation: none; }
   .chip.retired { transition-duration: 0s !important; }
 }
+/* V2 metadata supports the blocked-first hierarchy without new panels. */
+.inferred-mark, .semantic-clear, .semantic-unavailable { color: var(--dim); font-size: 11px; }
+.tag.fwd.judging { border-color: var(--blue); }
+.judging-mark { color: var(--blue); font-size: 11px; }
+.is-judging .badge { color: var(--blue); border-color: var(--blue); }
+.semantic-warn, .dependency-warning { color: var(--amber); }
+.dependency-warning { font-size: 12px; margin-top: 10px; }
+.semantic-warn { font-size: 11px; }
+.inferred-new { animation: inferredpulse 1.8s ease-out; }
+@keyframes inferredpulse { from { background: #30404a; border-color: var(--blue); } to { background: transparent; } }
+.statsbar { flex-wrap: wrap; }
+.stat.secondary { padding: 8px 14px; }
+.stat.secondary .stat-num { color: var(--dim); font-size: 13px; font-weight: 400; }
+@media (prefers-reduced-motion: reduce) { .inferred-new { animation: none; } }

@@ -309,16 +309,19 @@ test('full mock replay lands all four entries on trunk', () => {
   assert.ok(s.entries.every(e => e.status === 'retired'));
   assert.equal(s.trunk.retiredCount, 4);
   assert.equal(s.trunk.commit, '88cc99887766');
-  assert.equal(s.stats.squashes, 4);      // e2 (prediction-miss) + e2, e3 (interface-changed) + e4 (trunk-overlap)
-  assert.equal(s.stats.earlyCutoffs, 2);  // one hash.unchanged per live consumer
+  assert.equal(s.stats.squashes, 5);      // prediction miss + semantic + two interface changes + trunk overlap
+  assert.equal(s.stats.earlyCutoffs, 4);  // two body-only pushes, two live consumers
+  assert.equal(s.stats.judgments, 2);
+  assert.equal(s.stats.semanticSquashes, 1);
+  assert.equal(s.stats.inferredDeps, 2);
   assert.equal(s.stats.retired, 4);
   assert.equal(s.stats.checksRun, 6);
-  assert.equal(s.stats.pushesSeen, 8);
+  assert.equal(s.stats.pushesSeen, 10);
   assert.equal(s.stats.predictionHits, 2);   // createOrder declared==delivered for e2 + e3
   assert.equal(s.stats.predictionMisses, 1); // Order gained an undeclared field (e2)
   const e2 = A.findEntry(s, 'e2');
-  assert.equal(e2.generation, 2);
-  assert.equal(e2.repo, 'arb-e2-ui-2');
+  assert.equal(e2.generation, 3);
+  assert.equal(e2.repo, 'arb-e2-ui-3');
   assert.equal(e2.consumes.createOrder, 'c07e55aa11bb'); // refork recorded the new hash
   assert.equal(e2.consumes.Order, 'c4d5e6f7a8b9');       // miss refork recorded the actual hash
   assert.equal(e2._retireMode, 'splice');
