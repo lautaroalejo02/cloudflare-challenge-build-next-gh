@@ -68,14 +68,20 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
   - [x] T9a: dashboard polish + real-event alignment. Commit `e77db98`. Parent spot check: `node --test` gave 24/24; the 1920x1080 squash screenshot was reviewed and the connectors are clean.
     - OPEN: the "squash after push" stat is synthetic in the mock (~1.2 s spacing). Live, squash and push share a timestamp, so the stat would read ~0 ms. Before the video, fix it (measure from the git push time) or hide it.
   - [x] T9b: README, architecture doc and video script. Commit `3967610`. Parent structural readback done. Live E2E numbers are TBD until T8.
-- [ ] T11 (D) Value prediction: declared stubs, hit/miss counter (the wow-scene element and the answer to the 'just stacked PRs' objection). Dispatched to SWE-2 max (`odd/prompts/T11-value-prediction.md`). Stretch, approved by the orchestrator while the owner sleeps.
+- [x] T11 (D) Value prediction: declared stubs, hit/miss counter. Commit `0379ee9` (resumed after the rate limit via `T11b-resume.md`).
+  - Writer: control-plane 33/33, demo 8/8, dashboard 27/27; 4 live runs exit 0 with 2 hits / 1 miss.
+  - Parent: my live run hit a transient Artifacts HTTP 500 on clone (exit 1). Prediction stats were still correct (2/1).
+  - Parent fix, inline: `60faf3a` retries transient git failures and redacts tokens in error output (the old error printed a live token). TDD: RED on missing exports, then GREEN. The next live run exited 0 with no tokens in the log.
+  - Found regressions, sent to T15: earlyCutoffs dropped to 0 in the live main scenario; `failing-check` mock test is flaky (~1/4).
 - [x] T12 (D) Scale benchmark of pure `rob.ts` at N = 1K/10K/100K, one buffer vs per-component buffers. Commit `1ab5382` (finished by a Claude subagent after the SWE-2 rate limit).
   - Single buffer: median per event 29.6 µs / 394 µs / 16.2 ms at 1k / 10k / 100k (super-linear; linear scans in `head()`, `squashTree`, lookups).
   - Sharded: per-event work flat (<20 µs).
   - Containment: 0 squashes outside transitive dependents across 3,803 pushes.
   - Parent spot check: N=1000 run reproduced (head() 23.6 µs single vs 1.3 µs sharded).
 - [ ] T14 (D) Act on T12: index maps and a head cursor in `rob.ts`, plus one ReorderBuffer DO per connected component (routing by root producer). Re-run the bench. Runs AFTER T11 (same files).
-- [ ] T13 (D) Docs refresh with T11/T12 evidence, plus recorded live dashboard footage for the video.
+- [ ] T13 (D) Docs refresh with T11/T12 evidence. Dispatched (`odd/prompts/T13-docs-refresh.md`).
+- [ ] T15 (D) Restore the early-cutoff scene; fix the flaky failing-check test (10/10 runs). Dispatched (`odd/prompts/T15-demo-fixes.md`).
+- [ ] T16 (D) Record live dashboard footage (playwright video) for the submission video, after T14/T15.
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
 Route declaration: T2-T7 are delegated because each package is non-trivial and the six run in parallel in disjoint directories. That is the writer trigger plus the user's explicit request to use many Devin agents. T8 and T9 each go to one writer, because they touch multiple packages.
