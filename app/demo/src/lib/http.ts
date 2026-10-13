@@ -1,4 +1,4 @@
-import type { BufferState, Entry } from "./types.ts";
+import type { ArbEvent, BufferState, Entry } from "./types.ts";
 
 export class ApiError extends Error {
   status: number;
@@ -67,5 +67,9 @@ export class ApiClient {
 
   state(): Promise<BufferState> {
     return this.req("GET", "/api/state");
+  }
+
+  events(): Promise<{ events: ArbEvent[] }> {
+    return this.req("GET", "/api/events");
   }
 }

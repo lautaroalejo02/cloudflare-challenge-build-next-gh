@@ -10,6 +10,8 @@ import { detectCreateOrderVersion } from "../src/lib/signatures.ts";
 import { startApiAgent, ORDER_STUB, ORDER_V2 } from "../src/agents/api.ts";
 import { startUiAgent } from "../src/agents/ui.ts";
 import { startTestsAgent } from "../src/agents/tests.ts";
+import { startPayApiAgent } from "../src/agents/payapi.ts";
+import { startPayUiAgent, detectChargeVersion } from "../src/agents/payui.ts";
 
 const DEMO_DIR = path.resolve(import.meta.dirname, "..");
 const FIXTURE_DIR = path.join(DEMO_DIR, "fixture");
@@ -187,6 +189,79 @@ test("failing-check scenario: failing test blocks retirement until fixed", { tim
     // The entry was not retired while the check was failing: two separate
     // check runs happened before retirement.
     assert.ok(testsChecks.length >= 2);
+  } finally {
+    await mock.close();
+  }
+});
+
+test("multi scenario: two independent chains, squashes stay inside their component", { timeout: 120_000 }, async () => {
+  const { api, mock, workRoot } = await boot("multi");
+  try {
+    await api.reset();
+    await pushFixture(api, workRoot);
+
+    const ordersH = startApiAgent({
+      api, workRoot, log: noop, pollMs: 120,
+      firstPushDelayMs: 400, bodyOnlyDelayMs: 300, breakingChangeDelayMs: 900,
+      stub: { "src/api/order.ts": ORDER_STUB },
+    });
+    const payH = startPayApiAgent({
+      api, workRoot, log: noop, pollMs: 120, firstPushDelayMs: 300, breakingChangeDelayMs: 700,
+    });
+    const ordersId = await ordersH.entryId;
+    const payId = await payH.entryId;
+    assert.notEqual(ordersId, payId);
+
+    const uiH = startUiAgent({ api, workRoot, log: noop, producerId: ordersId, pollMs: 120 });
+    const testsH = startTestsAgent({ api, workRoot, log: noop, producerId: ordersId, pollMs: 120 });
+    const payUiH = startPayUiAgent({ api, workRoot, log: noop, producerId: payId, pollMs: 120 });
+
+    const [oa, pa, u, t, pu] = await Promise.all([ordersH.done, payH.done, uiH.done, testsH.done, payUiH.done]);
+    for (const e of [oa, pa, u, t, pu]) assert.equal(e.status, "retired", e.id);
+
+    const s = await api.state();
+    assert.equal(s.trunk.retiredCount, 5);
+
+    // Component isolation: the payments consumer was squashed exactly once —
+    // by its own producer's breaking change — never by orders pushes.
+    const paySquashes = mock.internals.squashes.filter((x) => x.entryId === pu.id);
+    assert.equal(paySquashes.length, 1, JSON.stringify(paySquashes));
+    assert.equal(paySquashes[0].reason, "interface-changed");
+    assert.equal(pu.generation, 1);
+    // Orders consumers squashed at least once each (prediction-miss or
+    // interface change); producers never squashed.
+    assert.ok(u.generation >= 1 && t.generation >= 1);
+    assert.equal(oa.generation, 0);
+    assert.equal(pa.generation, 0);
+    // No orders-chain squash touched a payments entry and vice versa: every
+    // squashed entry's producer chain root is itself a root entry here.
+    const byId = new Map(s.entries.map((e) => [e.id, e]));
+    const rootOf = (id: string): string => {
+      let e = byId.get(id);
+      while (e?.producerId) e = byId.get(e.producerId);
+      return e?.id ?? id;
+    };
+    for (const sq of mock.internals.squashes) {
+      const root = rootOf(sq.entryId);
+      assert.ok([ordersId, payId].includes(root), `squashed ${sq.entryId} has unexpected root ${root}`);
+    }
+
+    // The re-cloned payments fork carries the v2 charge interface, and the
+    // consumer adapted to it.
+    const reclonedPay = fs.readFileSync(path.join(workRoot, `${pu.id}-g1`, "src/api/payment.ts"), "utf8");
+    assert.equal(detectChargeVersion(reclonedPay), "v2");
+    const paywall = fs.readFileSync(path.join(workRoot, `${pu.id}-g1`, "src/ui/paywall.ts"), "utf8");
+    assert.match(paywall, /renderFastPay/);
+    assert.match(paywall, /currency: "EUR"/);
+
+    // Both chains retired onto the shared trunk.
+    const trunkRepo = path.join(mock.rootDir, "repos", "arb-trunk.git");
+    const payAtTrunk = await git(["-C", trunkRepo, "show", "main:src/api/payment.ts"]);
+    assert.match(payAtTrunk, /currency: string/);
+    const paywallAtTrunk = await git(["-C", trunkRepo, "show", "main:src/ui/paywall.ts"]);
+    assert.match(paywallAtTrunk, /renderFastPay/);
+    const orderAtTrunk = await git(["-C", trunkRepo, "show", "main:src/api/order.ts"]);
+    assert.match(orderAtTrunk, /opts:\s*\{ region: string; currency: string \}/);
   } finally {
     await mock.close();
   }

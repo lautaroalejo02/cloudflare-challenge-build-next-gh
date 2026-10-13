@@ -47,6 +47,15 @@ export interface Entry {
   generation: number;
   diagnosis: Diagnosis | null;
   checks: CheckResult | null;
+  /** Sharded control plane (T14): component DO name in aggregated /api/state. */
+  component?: string;
+}
+
+export interface ArbEvent {
+  type: string;
+  ts: number;
+  entryId?: string;
+  data?: Record<string, unknown>;
 }
 
 export interface BufferState {
