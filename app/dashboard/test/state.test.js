@@ -50,6 +50,24 @@ test('push clears diagnosis and resumes speculating', () => {
   assert.equal(e.headCommit, 'c2');
 });
 
+test('entry.created folds the real flat payload (no data.entry)', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e1', ts: 1, data: {
+    agent: 'api-agent', lane: 'api', seq: 1, producerId: null, repo: 'arb-e1-api-0' } });
+  const e = A.findEntry(s, 'e1');
+  assert.ok(e);
+  assert.equal(e.agent, 'api-agent');
+  assert.equal(e.status, 'speculating');
+  assert.equal(e.repo, 'arb-e1-api-0');
+});
+
+test('trunk push updates the trunk commit without an entryId', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'push', ts: 1, data: { repo: 'arb-trunk', commit: 'deadc0de', trunk: true } });
+  assert.equal(s.trunk.commit, 'deadc0de');
+  assert.equal(s.stats.pushesSeen, 0); // trunk pushes are not entry pushes
+});
+
 test('hash.unchanged counts a cutoff tick without a squash', () => {
   const s = A.createState();
   A.applyEvent(s, { type: 'entry.created', entryId: 'e1', ts: 1, data: { entry: entry() } });
@@ -61,12 +79,112 @@ test('hash.unchanged counts a cutoff tick without a squash', () => {
   assert.equal(e.status, 'speculating');
 });
 
+test('hash.unchanged real payload lands on the consumer', () => {
+  const s = A.createState();
+  [entry({ id: 'e1', seq: 1 }), entry({ id: 'e2', seq: 2, lane: 'ui', producerId: 'e1' })]
+    .forEach(e => A.upsertEntry(s, e));
+  A.applyEvent(s, { type: 'hash.unchanged', entryId: 'e2', ts: 2, data: { producerId: 'e1', commit: 'c1' } });
+  assert.equal(A.findEntry(s, 'e2').cutoffs, 1);
+  assert.equal(A.findEntry(s, 'e1').cutoffs, 0);
+});
+
 test('hash.changed rewrites the exported hash', () => {
   const s = A.createState();
   A.applyEvent(s, { type: 'entry.created', entryId: 'e1', ts: 1, data: { entry: entry() } });
   A.applyEvent(s, { type: 'hash.changed', entryId: 'e1', ts: 2, data: {
     changed: [{ symbol: 'createOrder', oldHash: 'a91f3b2c10d4', newHash: 'c07e55aa11bb' }] } });
   assert.equal(A.findEntry(s, 'e1').exports.createOrder, 'c07e55aa11bb');
+});
+
+test('hash.changed real payload updates the producer exports', () => {
+  const s = A.createState();
+  [entry({ id: 'e1', seq: 1 }), entry({ id: 'e2', seq: 2, lane: 'ui', producerId: 'e1' })]
+    .forEach(e => A.upsertEntry(s, e));
+  A.applyEvent(s, { type: 'hash.changed', entryId: 'e2', ts: 2, data: {
+    producerId: 'e1', commit: 'd4e5',
+    changed: [{ symbol: 'createOrder', oldHash: 'a91f3b2c10d4', newHash: 'c07e55aa11bb' }] } });
+  assert.equal(A.findEntry(s, 'e1').exports.createOrder, 'c07e55aa11bb');
+  assert.equal(A.findEntry(s, 'e2')._hcCommit, 'd4e5');
+});
+
+test('squash builds the diagnosis from flat fields', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e2', ts: 1, data: {
+    agent: 'u', lane: 'ui', seq: 2, producerId: 'e1', repo: 'arb-e2-ui-0' } });
+  A.applyEvent(s, { type: 'hash.changed', entryId: 'e2', ts: 2, data: {
+    producerId: 'e1', commit: 'd4e5',
+    changed: [{ symbol: 'createOrder', oldHash: 'a91f3b2c10d4', newHash: 'c07e55aa11bb' }] } });
+  A.applyEvent(s, { type: 'squash', entryId: 'e2', ts: 3, data: {
+    reason: 'interface-changed',
+    changed: [{ symbol: 'createOrder', oldHash: 'a91f3b2c10d4', newHash: 'c07e55aa11bb' }],
+    generation: 1, repo: 'arb-e2-ui-1' } });
+  const e = A.findEntry(s, 'e2');
+  assert.equal(e.status, 'squashed');
+  assert.equal(e.generation, 1);
+  assert.equal(e.repo, 'arb-e2-ui-1');
+  assert.equal(e.diagnosis.reason, 'interface-changed');
+  assert.equal(e.diagnosis.producerCommit, 'd4e5'); // stashed from hash.changed
+  assert.equal(e.diagnosis.changed[0].newHash, 'c07e55aa11bb');
+});
+
+test('trunk-overlap squash folds reason and empty changed list', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e4', ts: 1, data: {
+    agent: 'd', lane: 'docs', seq: 4, producerId: null, repo: 'arb-e4-docs-0' } });
+  A.applyEvent(s, { type: 'squash', entryId: 'e4', ts: 2, data: {
+    reason: 'trunk-overlap', changed: [], generation: 1, repo: 'arb-e4-docs-1', producerCommit: '77ff' } });
+  const e = A.findEntry(s, 'e4');
+  assert.equal(e.diagnosis.reason, 'trunk-overlap');
+  assert.equal(e.diagnosis.producerCommit, '77ff');
+  assert.equal(s.stats.squashes, 1);
+});
+
+test('refork updates consumes to the new producer hashes', () => {
+  const s = A.createState();
+  const e2 = entry({ id: 'e2', seq: 2, lane: 'ui', producerId: 'e1', consumes: { createOrder: 'a91f3b2c10d4' } });
+  A.upsertEntry(s, e2);
+  A.applyEvent(s, { type: 'squash', entryId: 'e2', ts: 1, data: {
+    reason: 'interface-changed',
+    changed: [{ symbol: 'createOrder', oldHash: 'a91f3b2c10d4', newHash: 'c07e55aa11bb' }] } });
+  A.applyEvent(s, { type: 'refork', entryId: 'e2', ts: 2, data: {
+    repo: 'arb-e2-ui-1', baseCommit: 'd4e5', generation: 1 } });
+  const e = A.findEntry(s, 'e2');
+  assert.equal(e.consumes.createOrder, 'c07e55aa11bb');
+  assert.equal(e.status, 'speculating');
+});
+
+test('check.passed folds the real flat payload', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e1', ts: 1, data: { entry: entry({ status: 'checking' }) } });
+  A.applyEvent(s, { type: 'check.passed', entryId: 'e1', ts: 2, data: { commit: 'c9', durationMs: 241 } });
+  const e = A.findEntry(s, 'e1');
+  assert.equal(e.status, 'ready');
+  assert.equal(e.checks.failed, 0);
+  assert.equal(e.checks.durationMs, 241);
+  assert.equal(s.stats.checksRun, 1);
+});
+
+test('retired folds the real payload and records the mode', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e1', ts: 1, data: { entry: entry({ status: 'ready' }) } });
+  A.applyEvent(s, { type: 'retired', entryId: 'e1', ts: 2, data: { commit: '66aabb', seq: 1, mode: 'splice' } });
+  const e = A.findEntry(s, 'e1');
+  assert.equal(e.status, 'retired');
+  assert.equal(e._retireMode, 'splice');
+  assert.equal(s.trunk.commit, '66aabb');
+  assert.equal(s.trunk.retiredCount, 1);
+});
+
+test('squashTiming reports the delta from the last push', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e2', ts: 1, data: {
+    agent: 'u', lane: 'ui', seq: 2, producerId: 'e1', repo: 'r' } });
+  assert.equal(A.squashTiming(s), null);
+  A.applyEvent(s, { type: 'push', entryId: 'e2', ts: 1000, data: { commit: 'c1' } });
+  A.applyEvent(s, { type: 'squash', entryId: 'e2', ts: 2200, data: { reason: 'interface-changed', changed: [] } });
+  const t = A.squashTiming(s);
+  assert.equal(t.at, 2200);
+  assert.equal(t.deltaMs, 1200);
 });
 
 test('retired moves entry to trunk and updates trunk commit', () => {
@@ -139,26 +257,33 @@ test('mock script covers every required event type', () => {
    'check.passed', 'check.failed', 'retired'].forEach(t => assert.ok(types.has(t), 'missing ' + t));
 });
 
-test('full mock replay lands all three entries on trunk', () => {
+test('full mock replay lands all four entries on trunk', () => {
   const s = A.createState();
   ArbMock.build().forEach(step => {
     const ev = JSON.parse(JSON.stringify(step.ev));
     ev.ts = step.at;
     A.applyEvent(s, ev);
   });
-  assert.equal(s.entries.length, 3);
+  assert.equal(s.entries.length, 4);
   assert.ok(s.entries.every(e => e.status === 'retired'));
-  assert.equal(s.trunk.retiredCount, 3);
-  assert.equal(s.trunk.commit, '77ffee001122');
-  assert.equal(s.stats.squashes, 2);
-  assert.equal(s.stats.earlyCutoffs, 1);
-  assert.equal(s.stats.retired, 3);
-  assert.equal(s.stats.checksRun, 4);
-  assert.equal(s.stats.pushesSeen, 3);
+  assert.equal(s.trunk.retiredCount, 4);
+  assert.equal(s.trunk.commit, '88cc99887766');
+  assert.equal(s.stats.squashes, 3);      // e2, e3 (interface-changed) + e4 (trunk-overlap)
+  assert.equal(s.stats.earlyCutoffs, 2);  // one hash.unchanged per live consumer
+  assert.equal(s.stats.retired, 4);
+  assert.equal(s.stats.checksRun, 6);
+  assert.equal(s.stats.pushesSeen, 7);
   const e2 = A.findEntry(s, 'e2');
   assert.equal(e2.generation, 1);
   assert.equal(e2.repo, 'arb-e2-ui-1');
-  assert.equal(e2.consumes.createOrder, 'a91f3b2c10d4'); // hash it forked against is still shown
+  assert.equal(e2.consumes.createOrder, 'c07e55aa11bb'); // refork recorded the new hash
+  assert.equal(e2._retireMode, 'splice');
+  const e4 = A.findEntry(s, 'e4');
+  assert.equal(e4.generation, 1);
+  assert.equal(e4.repo, 'arb-e4-docs-1');
+  assert.ok(s.log.some(l => l.text.indexOf('trunk overlap') !== -1));
+  assert.equal(e4._retireMode, 'splice');
+  assert.equal(A.findEntry(s, 'e1')._retireMode, 'fast-forward');
 });
 
 test('stageIndex maps statuses onto the pipeline track', () => {

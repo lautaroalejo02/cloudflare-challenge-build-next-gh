@@ -18,7 +18,12 @@
       robSize: 8,
       entries: [],
       stats: { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0 },
-      log: []
+      log: [],
+      // local-only timing tracking: last entry push vs last squash event
+      _lastPushAt: 0,
+      _lastPushEntry: null,
+      _lastSquashAt: 0,
+      _lastSquashDelta: null
     };
   }
 
@@ -49,7 +54,9 @@
       _squashAt: e._squashAt || 0,
       _retireAt: e._retireAt || 0,
       _cutoffAt: e._cutoffAt || 0,
-      _hashAt: e._hashAt || 0
+      _hashAt: e._hashAt || 0,
+      _retireMode: e._retireMode || null,   // "fast-forward" | "splice" (retired events)
+      _hcCommit: e._hcCommit || null        // producer commit that triggered the last hash.changed
     };
   }
 
@@ -66,7 +73,8 @@
     if (existing) {
       var keep = {
         cutoffs: existing.cutoffs, _squashAt: existing._squashAt,
-        _retireAt: existing._retireAt, _cutoffAt: existing._cutoffAt, _hashAt: existing._hashAt
+        _retireAt: existing._retireAt, _cutoffAt: existing._cutoffAt, _hashAt: existing._hashAt,
+        _retireMode: existing._retireMode, _hcCommit: existing._hcCommit
       };
       Object.assign(existing, e);
       Object.assign(existing, keep);
@@ -109,9 +117,9 @@
     if (state.log.length > LOG_CAP) state.log.splice(0, state.log.length - LOG_CAP);
   }
 
-  /* Fold one ArbEvent into state. Defensive: `data` is loosely typed by the
-   * contract, so a full `data.entry` is folded whenever present and each
-   * event type additionally accepts flat fields. */
+  /* Fold one ArbEvent into state. Defensive: the deployed control plane emits
+   * flat per-type payloads (no data.entry — see app/control-plane/src/rob.ts),
+   * so each case accepts both the flat fields and a full `data.entry`. */
   function applyEvent(state, ev) {
     if (!ev || typeof ev.type !== 'string') return;
     var data = (ev.data && typeof ev.data === 'object') ? ev.data : {};
@@ -130,56 +138,97 @@
         return;
       }
       case 'entry.created': {
-        if (entry) {
-          entry.status = entry.status || 'speculating';
-          sortEntries(state);
+        // Real payload: { agent, lane, seq, producerId, repo } — no data.entry.
+        if (!entry && ev.entryId && (typeof data.seq === 'number' || data.agent || data.lane)) {
+          entry = upsertEntry(state, {
+            id: ev.entryId,
+            seq: typeof data.seq === 'number' ? data.seq : state.entries.length + 1,
+            agent: data.agent, lane: data.lane,
+            producerId: data.producerId == null ? null : data.producerId,
+            repo: data.repo || '',
+            status: data.status || 'speculating'
+          });
         }
+        if (entry) sortEntries(state);
         pushLog(state, ev, entry
           ? entry.id + ' created · lane ' + entry.lane + (entry.producerId ? ' · forks ' + entry.producerId : ' · forks trunk')
           : 'entry created');
         break;
       }
       case 'push': {
+        if (data.trunk === true || (ev.entryId == null && data.repo && data.repo === state.trunk.repo)) {
+          // Push onto the trunk repo itself (real payload: {repo, commit, trunk:true}).
+          if (data.commit) state.trunk.commit = data.commit;
+          pushLog(state, ev, 'trunk push @ ' + shortCommit(state.trunk.commit));
+          break;
+        }
         if (entry) {
           entry.headCommit = data.commit || data.headCommit || entry.headCommit;
           if (entry.diagnosis) entry.diagnosis = null; // contract: cleared when the agent pushes again
-          if (entry.status === 'squashed' || entry.status === 'failed') entry.status = 'speculating';
+          if (entry.status === 'squashed' || entry.status === 'failed' ||
+              entry.status === 'ready' || entry.status === 'checking') {
+            entry.status = 'speculating';
+          }
         }
         bump = 'pushesSeen';
+        state._lastPushAt = now;
+        state._lastPushEntry = entry ? entry.id : (ev.entryId || null);
         pushLog(state, ev, 'push ' + (entry ? entry.id : ev.entryId || '?') + ' @ ' + shortCommit(entry && entry.headCommit));
         break;
       }
       case 'hash.unchanged': {
+        // Real payload: entryId is the CONSUMER, data = { producerId, commit }.
         if (entry) { entry.cutoffs += 1; entry._cutoffAt = now; }
         bump = 'earlyCutoffs';
-        pushLog(state, ev, 'early cutoff ' + (entry ? entry.id : '?') + (data.symbol ? ' · ' + data.symbol + ' unchanged' : ' · interface unchanged'));
+        pushLog(state, ev, 'early cutoff ' + (entry ? entry.id : '?') +
+          (data.symbol ? ' · ' + data.symbol + ' unchanged' : ' · consumed interface unchanged'));
         break;
       }
       case 'hash.changed': {
+        // Real payload: entryId is the consumer, data = { producerId, commit, changed[] }.
         var changes = Array.isArray(data.changed) ? data.changed : (data.symbol ? [data] : []);
-        if (entry) {
+        var producer = data.producerId ? findEntry(state, data.producerId) : null;
+        var hashOwner = producer || entry;
+        if (hashOwner) {
           changes.forEach(function (c) {
-            if (c && c.symbol && c.newHash) entry.exports[c.symbol] = c.newHash;
+            if (c && c.symbol && c.newHash) hashOwner.exports[c.symbol] = c.newHash;
           });
+          hashOwner._hashAt = now;
+        }
+        if (entry) {
           entry._hashAt = now;
+          if (data.commit) entry._hcCommit = data.commit; // producer commit for the coming squash diagnosis
         }
         bump = null;
         var ch0 = changes[0];
-        pushLog(state, ev, 'hash.changed ' + (entry ? entry.id : '?') + (ch0 ? ' · ' + ch0.symbol + ' ' + shortHash(ch0.oldHash) + '→' + shortHash(ch0.newHash) : ''));
+        pushLog(state, ev, 'hash.changed ' + (hashOwner ? hashOwner.id : '?') + (ch0 ? ' · ' + ch0.symbol + ' ' + shortHash(ch0.oldHash) + '→' + shortHash(ch0.newHash) : '') +
+          (entry && producer && entry !== producer ? ' · consumed by ' + entry.id : ''));
         break;
       }
       case 'squash': {
         if (entry) {
           entry.status = 'squashed';
           entry._squashAt = now;
+          // Real payload: { reason, changed, generation, repo } — build the
+          // diagnosis from flat fields when data.diagnosis is absent.
           if (data.diagnosis) entry.diagnosis = data.diagnosis;
+          else if (data.reason || Array.isArray(data.changed)) {
+            entry.diagnosis = {
+              reason: data.reason || 'interface-changed',
+              changed: Array.isArray(data.changed) ? data.changed : [],
+              producerCommit: data.producerCommit || entry._hcCommit || ''
+            };
+          }
+          if (data.repo) entry.repo = data.repo;
           if (typeof data.generation === 'number') entry.generation = data.generation;
           else if (!isEntry(data.entry)) entry.generation += 1;
         }
         bump = 'squashes';
+        state._lastSquashAt = now;
+        state._lastSquashDelta = state._lastPushAt ? Math.max(0, now - state._lastPushAt) : null;
         pushLog(state, ev, 'SQUASH ' + (entry ? entry.id : '?') + (entry && entry.diagnosis && entry.diagnosis.changed[0]
           ? ' · ' + entry.diagnosis.changed[0].symbol + ' ' + shortHash(entry.diagnosis.changed[0].oldHash) + '→' + shortHash(entry.diagnosis.changed[0].newHash)
-          : ''));
+          : (entry && entry.diagnosis && entry.diagnosis.reason === 'trunk-overlap' ? ' · trunk overlap' : '')));
         break;
       }
       case 'refork': {
@@ -189,6 +238,12 @@
           if (data.remote) entry.remote = data.remote;
           if (typeof data.generation === 'number') entry.generation = data.generation;
           if (data.baseCommit) entry.baseCommit = data.baseCommit;
+          // Server-side fork.done records the new producer hashes in consumes.
+          if (entry.diagnosis && Array.isArray(entry.diagnosis.changed)) {
+            entry.diagnosis.changed.forEach(function (c) {
+              if (c && c.symbol && c.newHash) entry.consumes[c.symbol] = c.newHash;
+            });
+          }
         }
         pushLog(state, ev, 'refork ' + (entry ? entry.id : '?') + (entry ? ' → ' + entry.repo + ' · gen ' + entry.generation : ''));
         break;
@@ -208,30 +263,50 @@
       }
       case 'check.passed':
       case 'check.failed': {
+        // Real payload: { commit, durationMs, failed? } — no full CheckResult.
+        var ok = ev.type === 'check.passed';
         var result = isCheckResult(data.checks) ? data.checks : (isCheckResult(data) ? data : null);
+        if (!result && (data.commit || data.durationMs != null || data.failed != null)) {
+          result = {
+            commit: data.commit || (entry && entry.headCommit) || '',
+            passed: typeof data.passed === 'number' ? data.passed : 0,
+            failed: typeof data.failed === 'number' ? data.failed : (ok ? 0 : 1),
+            durationMs: typeof data.durationMs === 'number' ? data.durationMs : 0,
+            results: Array.isArray(data.results) ? data.results : []
+          };
+        }
         if (entry) {
           if (result) entry.checks = result;
           if (entry.status !== 'retired') {
-            entry.status = isEntry(data.entry) ? entry.status : (ev.type === 'check.failed' ? 'failed' : 'ready');
+            entry.status = isEntry(data.entry) ? entry.status : (ok ? 'ready' : 'failed');
           }
         }
         bump = 'checksRun';
-        var ok = ev.type === 'check.passed';
+        var total = result ? result.passed + result.failed : 0;
         pushLog(state, ev, 'check ' + (ok ? 'PASSED' : 'FAILED') + ' ' + (entry ? entry.id : '?') +
-          (result ? ' · ' + result.passed + '/' + (result.passed + result.failed) + ' · ' + result.durationMs + 'ms' : ''));
+          (result ? (total ? ' · ' + result.passed + '/' + total : '') + ' · ' + result.durationMs + 'ms' : ''));
         break;
       }
       case 'retired': {
-        if (entry) { entry.status = 'retired'; entry._retireAt = now; }
+        // Real payload: { commit, seq, mode? } — mode is "fast-forward" | "splice".
+        if (entry) {
+          entry.status = 'retired';
+          entry._retireAt = now;
+          if (data.mode) entry._retireMode = data.mode;
+          if (data.commit) entry.headCommit = entry.headCommit || data.commit;
+        }
         var tCommit = (data.trunk && data.trunk.commit) || data.trunkCommit || data.commit || null;
         if (tCommit) state.trunk.commit = tCommit;
         if (data.trunk && typeof data.trunk.retiredCount === 'number') state.trunk.retiredCount = data.trunk.retiredCount;
         else state.trunk.retiredCount += 1;
         bump = 'retired';
-        pushLog(state, ev, 'retired ' + (entry ? entry.id : '?') + ' → ' + state.trunk.repo + ' @ ' + shortCommit(state.trunk.commit));
+        pushLog(state, ev, 'retired ' + (entry ? entry.id : '?') + ' → ' + state.trunk.repo + ' @ ' + shortCommit(state.trunk.commit) +
+          (data.mode ? ' · ' + data.mode : ''));
         break;
       }
       case 'veto': {
+        // Real payload: { seq }; dependent squashes arrive as separate squash
+        // events with reason "producer-vetoed". data.squashed[] is a mock fallback.
         if (entry) entry.status = 'vetoed';
         var squashed = Array.isArray(data.squashed) ? data.squashed : [];
         squashed.forEach(function (id) {
@@ -257,6 +332,10 @@
         state.entries = [];
         state.stats = createState().stats;
         state.trunk.retiredCount = 0;
+        state._lastPushAt = 0;
+        state._lastPushEntry = null;
+        state._lastSquashAt = 0;
+        state._lastSquashDelta = null;
         if (data.trunk) state.trunk.commit = data.trunk.commit || null;
         pushLog(state, ev, 'reset · buffer cleared');
         return;
@@ -323,6 +402,13 @@
     return { ok: true, squashed: deps.map(function (d) { return d.id; }) };
   }
 
+  /* Timing of the latest squash relative to the most recent entry push, in ms.
+   * Returns null until a squash has been seen. */
+  function squashTiming(state) {
+    if (!state._lastSquashAt) return null;
+    return { at: state._lastSquashAt, deltaMs: state._lastSquashDelta };
+  }
+
   /* Map an entry status onto the 5-stage pipeline track (index into STAGES,
    * or -1 for off-track statuses). */
   function stageIndex(e) {
@@ -350,6 +436,7 @@
     dependentsOf: dependentsOf,
     localVeto: localVeto,
     stageIndex: stageIndex,
+    squashTiming: squashTiming,
     shortHash: shortHash,
     shortCommit: shortCommit
   };

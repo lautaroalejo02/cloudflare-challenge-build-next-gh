@@ -96,7 +96,7 @@ b { font-weight: 700; }
 
 /* ---------- lanes ---------- */
 .lanes { position: relative; display: flex; flex-direction: column; gap: 14px; min-height: 60%; }
-.lane { display: flex; gap: 12px; align-items: stretch; }
+.lane { display: flex; gap: 26px; align-items: stretch; }
 .lane-label {
   flex: 0 0 62px; display: flex; align-items: center; justify-content: center;
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
@@ -219,6 +219,12 @@ b { font-weight: 700; }
   border-radius: 5px; padding: 4px 10px; font-size: 13px; font-weight: 700;
   will-change: transform;
 }
+.retire-mode {
+  font-size: 10px; font-weight: 800; letter-spacing: .06em;
+  padding: 1px 6px; border-radius: 3px; margin-left: 2px;
+}
+.retire-mode.ff { color: #0b0e14; background: var(--green); }
+.retire-mode.splice { color: var(--violet); border: 1px solid var(--violet); }
 
 /* ---------- log panel ---------- */
 .logpanel {
@@ -244,3 +250,26 @@ b { font-weight: 700; }
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- projector-friendly: 1280x720 projectors and tighter windows ---------- */
+@media (max-width: 1400px) {
+  body.arb { font-size: 14px; }
+  .logpanel { flex-basis: 290px; }
+  .pipeline { padding: 14px 18px 18px; }
+}
+@media (max-height: 800px) {
+  .topbar { padding: 7px 16px; }
+  .brand { font-size: 16px; }
+  .stat { padding: 5px 14px; }
+  .stat-num { font-size: 18px; }
+  .pipeline { padding-top: 10px; }
+  .lanes { gap: 10px; min-height: 50%; }
+  .lane-rows { gap: 8px; }
+  .row { padding: 8px 12px; }
+  .track { margin: 6px 0 5px; }
+  .trunk { margin-top: 12px; padding: 9px 14px; }
+}
+@media (max-width: 1400px) and (max-height: 800px) {
+  .controls input[type="range"] { width: 100px; }
+  .logpanel { flex-basis: 260px; }
+}

@@ -35,6 +35,7 @@
       '  <div class="stat"><span class="stat-num" id="s-retired">0</span><span class="stat-label">retired</span></div>' +
       '  <div class="stat"><span class="stat-num" id="s-checks">0</span><span class="stat-label">checks run</span></div>' +
       '  <div class="stat"><span class="stat-num" id="s-pushes">0</span><span class="stat-label">pushes seen</span></div>' +
+      '  <div class="stat"><span class="stat-num" id="s-squasht">—</span><span class="stat-label">squash after push</span></div>' +
       '  <div class="controls">' +
       '    <label for="robsize">robSize</label>' +
       '    <input type="range" id="robsize" min="1" max="16" step="1" value="8">' +
@@ -75,6 +76,7 @@
       checksRun: document.getElementById('s-checks'),
       pushesSeen: document.getElementById('s-pushes')
     };
+    el.squashT = document.getElementById('s-squasht');
 
     el.robsize.addEventListener('input', function () {
       el.robsizeVal.textContent = el.robsize.value;
@@ -89,6 +91,10 @@
     var replay = document.getElementById('replay');
     if (replay) replay.addEventListener('click', startMock);
     window.addEventListener('resize', scheduleLinks);
+    el.pipeline.addEventListener('scroll', scheduleLinks);
+    if (typeof ResizeObserver === 'function') {
+      new ResizeObserver(scheduleLinks).observe(el.pipeline);
+    }
   }
 
   /* ---------- helpers ---------- */
@@ -115,6 +121,8 @@
     Object.keys(el.stats).forEach(function (k) {
       el.stats[k].textContent = state.stats[k];
     });
+    var sq = A.squashTiming(state);
+    el.squashT.textContent = !sq ? '—' : (sq.deltaMs == null ? 'n/a' : (sq.deltaMs / 1000).toFixed(1) + ' s');
     if (document.activeElement !== el.robsize) {
       el.robsize.value = state.robSize;
       el.robsizeVal.textContent = state.robSize;
@@ -202,16 +210,26 @@
 
     var diag = '';
     if (e.diagnosis) {
-      var reason = { 'interface-changed': 'interface changed', 'producer-vetoed': 'producer vetoed', 'producer-squashed': 'producer squashed' }[e.diagnosis.reason] || e.diagnosis.reason;
+      var reasons = {
+        'interface-changed': 'interface changed',
+        'producer-vetoed': 'producer vetoed',
+        'producer-squashed': 'producer squashed',
+        'trunk-overlap': 'trunk overlap'
+      };
+      var reason = reasons[e.diagnosis.reason] || e.diagnosis.reason || 'squashed';
+      var baseLabel = e.diagnosis.reason === 'trunk-overlap' ? 'trunk' : 'producer';
       diag += '<div class="diag"><div class="diag-head">SQUASHED · ' + esc(reason) +
-        ' · producer @ ' + c7(e.diagnosis.producerCommit) + '</div>';
+        ' · ' + baseLabel + ' @ ' + c7(e.diagnosis.producerCommit) + '</div>';
       (e.diagnosis.changed || []).slice(0, 2).forEach(function (c) {
         diag += '<div class="diag-sym mono">' + esc(c.symbol) + '  ' + h4(c.oldHash) + ' → ' + h4(c.newHash) + '</div>' +
-          '<div class="diag-sig old mono">− ' + esc(c.oldSignature) + '</div>' +
-          '<div class="diag-sig new mono">+ ' + esc(c.newSignature) + '</div>';
+          (c.oldSignature ? '<div class="diag-sig old mono">− ' + esc(c.oldSignature) + '</div>' : '') +
+          (c.newSignature ? '<div class="diag-sig new mono">+ ' + esc(c.newSignature) + '</div>' : '');
       });
       if (!(e.diagnosis.changed || []).length) {
-        diag += '<div class="diag-sig new mono">re-fork against new producer head</div>';
+        diag += '<div class="diag-sig new mono">' +
+          (e.diagnosis.reason === 'trunk-overlap'
+            ? 'changed paths overlap trunk — re-apply on a fresh trunk fork'
+            : 're-fork against new producer head') + '</div>';
       }
       diag += '</div>';
     }
@@ -219,8 +237,9 @@
     var checks = '';
     if (e.checks) {
       var ok = e.checks.failed === 0;
+      var total = (e.checks.passed || 0) + (e.checks.failed || 0);
       checks = '<span class="checks ' + (ok ? 'ok' : 'bad') + '">' +
-        (ok ? '✓' : '✗') + ' ' + e.checks.passed + '/' + (e.checks.passed + e.checks.failed) +
+        (ok ? '✓' : '✗') + (total ? ' ' + e.checks.passed + '/' + total : (ok ? ' passed' : ' ' + e.checks.failed + ' failed')) +
         ' · ' + e.checks.durationMs + 'ms</span>';
       if (!ok && Array.isArray(e.checks.results)) {
         var fail = e.checks.results.filter(function (r) { return !r.ok; })[0];
@@ -254,7 +273,9 @@
     var html = '';
     retiredEntries().forEach(function (e) {
       html += '<span class="chip retired mono" data-row-id="' + esc(e.id) + '" data-chip="' + esc(e.id) + '" title="' + esc(e.repo) + '">' +
-        esc(e.id) + ' @' + c7(e.headCommit || state.trunk.commit) + '</span>';
+        esc(e.id) + ' @' + c7(e.headCommit || state.trunk.commit) +
+        (e._retireMode ? ' <b class="retire-mode ' + (e._retireMode === 'splice' ? 'splice' : 'ff') + '">' + esc(e._retireMode) + '</b>' : '') +
+        '</span>';
     });
     el.trunkChips.innerHTML = html || '<span class="dim">nothing retired yet</span>';
   }
@@ -305,41 +326,77 @@
     requestAnimationFrame(function () { linksScheduled = false; drawLinks(); });
   }
 
+  /* Orthogonal forwarding connectors: out of the producer row's left rail,
+   * into the gutter channel between the lane labels and the cards, down/up
+   * vertically, then right into the consumer row's rail. Coordinates are in
+   * pipeline CONTENT space (scroll-corrected) so arrows stay glued to rows. */
   function drawLinks() {
     var box = el.pipeline.getBoundingClientRect();
-    el.links.setAttribute('viewBox', '0 0 ' + box.width + ' ' + box.height);
-    el.links.setAttribute('width', box.width);
-    el.links.setAttribute('height', box.height);
+    var w = Math.max(el.pipeline.scrollWidth, box.width);
+    var h = Math.max(el.pipeline.scrollHeight, box.height);
+    el.links.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    el.links.style.width = w + 'px';
+    el.links.style.height = h + 'px';
     var html = '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
       '<path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker></defs>';
 
-    function anchor(dom, side) {
+    function pt(dom) {
       var r = dom.getBoundingClientRect();
-      return { x: r.left - box.left + (side === 'r' ? r.width : 0), y: r.top - box.top + r.height / 2 };
+      return {
+        x: r.left - box.left + el.pipeline.scrollLeft,
+        y: r.top - box.top + el.pipeline.scrollTop,
+        w: r.width, h: r.height
+      };
     }
-    function path(a, b, cls) {
-      var mx = Math.min(80, Math.max(24, Math.abs(b.x - a.x) * 0.15));
-      return '<path class="' + cls + '" d="M ' + a.x + ' ' + a.y +
-        ' C ' + (a.x + mx) + ' ' + a.y + ', ' + (b.x - mx) + ' ' + b.y + ', ' + b.x + ' ' + b.y +
-        '" marker-end="url(#arr)"/>';
+    // Rounded orthogonal elbow: M ax ay -> left to channel x -> vertical -> right to bx.
+    function elbow(ax, ay, cx, bx, by, cls, arrow) {
+      var r = Math.min(7, Math.abs(by - ay) / 2, Math.abs(ax - cx) - 1);
+      if (r < 1) r = 1;
+      var dir = by >= ay ? 1 : -1;
+      var d = 'M ' + ax + ' ' + ay +
+        ' L ' + (cx + r) + ' ' + ay +
+        ' Q ' + cx + ' ' + ay + ' ' + cx + ' ' + (ay + dir * r) +
+        ' L ' + cx + ' ' + (by - dir * r) +
+        ' Q ' + cx + ' ' + by + ' ' + (cx + r) + ' ' + by +
+        ' L ' + bx + ' ' + by;
+      return '<path class="' + cls + '" d="' + d + '"' + (arrow ? ' marker-end="url(#arr)"' : '') + '/>';
     }
 
-    var trunkAnchor = document.getElementById('trunk-anchor');
+    var chanIdx = {};
+    var chanN = 0;
+    function channel(key) {
+      if (!(key in chanIdx)) chanIdx[key] = chanN++;
+      return chanIdx[key] % 3;
+    }
+
+    var trunk = document.getElementById('trunk');
+    var trunkTop = trunk ? pt(trunk).y : h;
+
     liveEntries().forEach(function (e) {
       var row = document.getElementById('row-' + e.id);
       if (!row) return;
-      var to = anchor(row, 'l');
+      var to = pt(row);
+      var toX = to.x, toY = to.y + to.h / 2;
+      var from = null, key = null;
       if (e.producerId) {
         var prow = document.getElementById('row-' + e.producerId);
-        if (!prow) return;
-        var from = anchor(prow, 'r');
-        html += path(from, to, 'link fwd-link');
-      } else if (trunkAnchor) {
-        var ta = trunkAnchor.getBoundingClientRect();
-        var from2 = { x: ta.left - box.left + ta.width / 2, y: ta.top - box.top };
-        var to2 = { x: to.x - 4, y: to.y };
-        html += path(from2, to2, 'link trunk-link');
+        if (prow) {
+          var pr = pt(prow);
+          from = { x: pr.x, y: pr.y + pr.h / 2 };
+          key = e.producerId;
+        }
       }
+      if (!from) {
+        // No live producer row: link rises out of the trunk bar.
+        var cx0 = toX - 8 - channel(e.producerId || ('trunk:' + e.id)) * 7;
+        html += '<path class="link trunk-link" d="M ' + cx0 + ' ' + trunkTop +
+          ' L ' + cx0 + ' ' + (toY + 8) +
+          ' Q ' + cx0 + ' ' + toY + ' ' + (cx0 + 8) + ' ' + toY +
+          ' L ' + toX + ' ' + toY + '" marker-end="url(#arr)"/>';
+        return;
+      }
+      var cx = toX - 8 - channel(key) * 7;
+      html += elbow(from.x, from.y, cx, toX, toY, 'link fwd-link', true);
     });
     el.links.innerHTML = html;
   }
@@ -393,6 +450,18 @@
   function apply(ev) {
     A.applyEvent(state, ev);
     render();
+    // The control plane does not broadcast fork completion: an entry's repo,
+    // remote, exports and recorded consumes only appear in /api/state once the
+    // fork effect lands. Pull one snapshot shortly after creation/refork.
+    if (!MOCK && (ev.type === 'entry.created' || ev.type === 'refork')) scheduleStateRefresh();
+  }
+
+  var refreshT1 = null, refreshT2 = null;
+  function scheduleStateRefresh() {
+    if (refreshT1) clearTimeout(refreshT1);
+    if (refreshT2) clearTimeout(refreshT2);
+    refreshT1 = setTimeout(function () { refreshT1 = null; fetchState(); }, 900);
+    refreshT2 = setTimeout(function () { refreshT2 = null; fetchState(); }, 2600);
   }
 
   function startPolling() {
