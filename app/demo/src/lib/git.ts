@@ -31,8 +31,20 @@ export async function hasChanges(dir: string): Promise<boolean> {
   return (await git(["-C", dir, "status", "--porcelain"])) !== "";
 }
 
-export async function commitAll(dir: string, message: string, author: string): Promise<string> {
+/** Stage everything and commit if the staged tree differs from HEAD.
+ * Returns the new head sha, or null when there was nothing to commit
+ * (idempotent re-apply on a base that already contains the change — the
+ * staged diff is authoritative, unlike porcelain status which can report
+ * EOL-normalized worktree noise under core.autocrlf). */
+export async function commitAll(dir: string, message: string, author: string): Promise<string | null> {
   await git(["-C", dir, "add", "-A"]);
+  let stagedEmpty = true;
+  try {
+    await git(["-C", dir, "diff", "--cached", "--quiet"]);
+  } catch {
+    stagedEmpty = false; // exit 1 = staged changes exist
+  }
+  if (stagedEmpty) return null;
   await git([
     "-C", dir,
     "-c", `user.email=${author}@arb.local`,

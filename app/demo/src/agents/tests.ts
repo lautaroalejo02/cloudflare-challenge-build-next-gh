@@ -55,7 +55,11 @@ export function startTestsAgent(opts: {
   pollMs?: number;
   timeoutMs?: number;
 }): AgentHandle {
-  let firstApplied = false;
+  // failFirst writes the FAILING variant on every apply until the scripted
+  // fix lands: retirement is in-order, so the consumer's gen-0 commit is
+  // always squashed before it can be checked — the failing check only runs
+  // on the commit that survives to be head (gen-1 on the live plane).
+  let corrected = false;
   const stepsFor = (gen: number): Step[] => [
     {
       delayMs: 300,
@@ -63,11 +67,7 @@ export function startTestsAgent(opts: {
         gen === 0
           ? "test: add createOrder feature coverage"
           : "test: reapply feature coverage for new createOrder interface",
-      apply: (dir) => {
-        const failing = !!opts.failFirst && !firstApplied;
-        firstApplied = true;
-        writeFeatureTest(dir, failing, opts.log);
-      },
+      apply: (dir) => writeFeatureTest(dir, !!opts.failFirst && !corrected, opts.log),
     },
   ];
   return startAgent({
@@ -83,7 +83,10 @@ export function startTestsAgent(opts: {
     stepsFor,
     fixForFailure: (dir) => ({
       message: "test: fix wrong expectation in feature coverage",
-      apply: (d) => writeFeatureTest(d, false, opts.log),
+      apply: (d) => {
+        corrected = true;
+        writeFeatureTest(d, false, opts.log);
+      },
     }),
   });
 }

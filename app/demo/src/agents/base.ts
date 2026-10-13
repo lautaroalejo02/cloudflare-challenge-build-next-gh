@@ -64,7 +64,9 @@ export function startAgent(opts: AgentOptions): AgentHandle {
 
     let lastToken = token;
     let gen = -1;
+    let lastRepo = "";
     let dir = "";
+    let readySha: string | null = null;
     let fixUsed = false;
     let failedPolls = 0;
     const deadline = Date.now() + timeoutMs;
@@ -73,8 +75,15 @@ export function startAgent(opts: AgentOptions): AgentHandle {
       const { entry: e, token: fresh } = await opts.api.getEntry(entry.id);
       if (fresh) lastToken = fresh;
 
-      if (e.generation !== gen) {
+      // Re-clone whenever the entry points at a different repo: the initial
+      // fork and every squash re-fork. Keying on `e.repo` (not `e.generation`)
+      // avoids cloning the stale fork in the window where the generation has
+      // bumped but the re-fork has not landed yet (real plane reforks are
+      // async — the mock was fast enough to hide this).
+      if (e.repo !== lastRepo) {
+        lastRepo = e.repo;
         gen = e.generation;
+        readySha = null;
         fixUsed = false;
         failedPolls = 0;
         dir = path.join(opts.workRoot, `${entry.id}-g${gen}`);
@@ -95,19 +104,33 @@ export function startAgent(opts: AgentOptions): AgentHandle {
             break;
           }
           step.apply(dir);
+          // Trunk may already contain this work (runs accumulate): an
+          // idempotent re-apply produces no staged diff — nothing to push.
           const sha = await commitAll(dir, step.message, opts.agent);
+          if (sha === null) {
+            opts.log(`nothing to commit for "${step.message}" - already on base`);
+            continue;
+          }
           await push(dir);
           opts.log(`pushed ${sha.slice(0, 8)} "${step.message}" (gen ${gen})`);
         }
-        if (!aborted) {
-          try {
-            await opts.api.ready(entry.id, await head(dir));
-            opts.log(`marked ready (gen ${gen})`);
-          } catch (err) {
-            opts.log(`ready rejected: ${(err as Error).message}`);
-          }
-        }
+        if (!aborted) readySha = await head(dir);
         continue;
+      }
+
+      // Ready races the push pipeline: a push takes seconds to be detected,
+      // so `entry.ready` for a just-pushed commit is 409ed until headCommit
+      // catches up. Retry while the entry head still equals our push.
+      // "squashed" is included for the no-op case: when nothing needed
+      // re-applying, the entry readies its re-forked base (head === base).
+      if (readySha && e.headCommit === readySha && (e.status === "speculating" || e.status === "squashed")) {
+        try {
+          await opts.api.ready(entry.id, readySha);
+          opts.log(`marked ready (gen ${gen})`);
+          readySha = null;
+        } catch (err) {
+          opts.log(`ready rejected: ${(err as Error).message}`);
+        }
       }
 
       if (e.status === "retired") {
@@ -125,10 +148,10 @@ export function startAgent(opts: AgentOptions): AgentHandle {
             opts.log(`checks failed (${e.checks?.failed ?? "?"} failing) - applying scripted fix`);
             step.apply(dir);
             const sha = await commitAll(dir, step.message, opts.agent);
-            await push(dir);
-            try {
-              await opts.api.ready(entry.id, sha);
-            } catch {}
+            if (sha !== null) {
+              await push(dir);
+              readySha = sha; // posted on the next polls once headCommit catches up
+            }
           }
         } else if (failedPolls >= 5) {
           throw new Error(`${entry.id} checks keep failing`);

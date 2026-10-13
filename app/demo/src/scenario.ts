@@ -45,8 +45,8 @@ async function pushFixture(remote: string, token: string, log: (m: string) => vo
   if (await hasChanges(dir)) {
     const sha = await commitAll(dir, "chore: seed fixture (order api, checkout ui, tests)", "arb-scenario");
     await push(dir);
-    log(`fixture pushed to trunk at ${sha.slice(0, 8)}`);
-    return sha;
+    log(`fixture pushed to trunk at ${(sha ?? "unchanged").slice(0, 8)}`);
+    return head(dir);
   }
   log("trunk already contains the fixture");
   return head(dir);
@@ -72,7 +72,10 @@ async function main(): Promise<void> {
   log(`trunk init: ${trunk.repo} ${trunk.remote}`);
   await pushFixture(trunk.remote, trunk.token, log);
 
-  const apiH = startApiAgent({ api, workRoot: WORK_ROOT, log: scoped(tl, "api") });
+  // Delay the producer's refactor push until both consumers exist: the early
+  // cutoff is counted per live consumer at push-detection time, and the live
+  // plane's fork+hash in createEntry takes a few seconds.
+  const apiH = startApiAgent({ api, workRoot: WORK_ROOT, log: scoped(tl, "api"), firstPushDelayMs: 6000 });
   const apiId = await apiH.entryId;
   tl("scenario", `api entry is ${apiId}; staggering consumer registrations`);
   await sleep(2000);
@@ -133,6 +136,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  console.error(`demo failed: ${(e as Error).message}`);
+  console.error(`demo failed: ${(e as Error).stack ?? e}`);
   process.exit(1);
 });
