@@ -1,0 +1,9 @@
+{
+  "name": "arb-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "description": "ARB live pipeline UI — static files, no build step, served by arb-control-plane",
+  "scripts": {
+    "test": "node --test"
+  }
+}
