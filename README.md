@@ -55,10 +55,14 @@ Concretely, per `app/CONTRACTS.md`:
 - **Retirement modes.** If the trunk head is an ancestor of the entry head:
   fast-forward via isomorphic-git inside the Worker. Otherwise a
   **path-disjoint splice**: if the paths the entry changed (P) and the paths
-  trunk changed since the entry's base (Q) are disjoint, a new trunk commit
-  overlays P onto the trunk tree (disjoint changes commute); if P ∩ Q ≠ ∅ the
-  entry is squashed with reason `trunk-overlap`. There is never a textual
-  merge — see the Decision section of `odd/tasks/agent-reorder-buffer.md`.
+  trunk changed since the entry's base (Q) are disjoint, a new commit —
+  `arb: splice <entry-head> onto <trunk-head>` — overlays P onto the trunk
+  tree with `parents = [trunk head]`, is pushed to the `arb-candidate` ref
+  on the trunk repo, re-checked there, and only then `main` is moved to it
+  (disjoint changes commute). If P ∩ Q ≠ ∅ the entry is squashed with reason
+  `trunk-overlap` and re-forks *from trunk*. There is never a textual merge —
+  see the Decision section of `odd/tasks/agent-reorder-buffer.md`; implemented
+  in `app/control-plane/src/retire.ts` + `src/splice.ts`.
 - **Interface hashes only decide *when to squash early*.** Behavior is still
   verified at retirement: an unchanged signature does not prove unchanged
   behavior.
@@ -127,7 +131,7 @@ flowchart TD
     DO -->|runChecks| DW
     DW -.->|reads commit files| ART
     DO -->|retire at head| ISO
-    ISO -->|git push, fast-forward only| TRUNK
+    ISO -->|git push, fast-forward or splice| TRUNK
     DO -->|ArbEvent over WebSocket| DASH
     W -->|serves /| DASH
 ```
@@ -217,19 +221,20 @@ npm run mock -- --port 8899 --root tmp-mock/live   # terminal 1
 npm run demo -- --base http://127.0.0.1:8899        # terminal 2
 ```
 
-Tests per package: `npm test` (control-plane 11 state-machine cases, demo 5
-scenario cases, dashboard 14 event-folding cases, hasher 24 hash checks,
-checker and retirer-spike unit suites).
+Tests per package: `npm test` (control-plane 26 cases — state machine +
+splice + git-level retire; demo 5 scenario cases, dashboard 24
+event-folding cases, hasher 24 hash checks, checker and retirer-spike unit
+suites).
 
 ## What is real vs mocked
 
 **Real:** every Cloudflare primitive above — Artifacts repos, fork-of-fork
 forwarding, write tokens, `repo.pushed` events through the queue, the DO
 state machine, WebSocket events to the dashboard, interface hashing in a
-Worker, checks in a Dynamic Worker, and git fast-forward retirement. Note:
-the hasher/checker/retirer ports in the deployed control plane are stub or
-in-integration depending on build state — see "Known gaps" in
-`app/control-plane/NOTES.md` for the current wiring status.
+Worker, checks in a Dynamic Worker, and fast-forward/splice retirement.
+All ports in the deployed control plane are real (no stubs) — the full
+scenario ran end to end against `arb-control-plane`; see "Live E2E results"
+in `app/control-plane/NOTES.md`.
 
 **Mocked:** agent intelligence. The three agents are deterministic scripts
 (`app/demo/src/agents/`): there is no LLM anywhere. Adapting to a squash is a
@@ -254,9 +259,14 @@ Every figure was measured in a real run; source file per row.
 | Dynamic-Worker check | 4/4 pass in 261 ms; worst cold-machine miss ~7.7 s | `app/checker/NOTES.md` |
 | Fast-forward retirement from a Worker | ~0.9 s median; 17–45 ms CPU | `app/retirer-spike/NOTES.md` |
 | Sandbox `npm test` on a fork (rejected path) | warm 18.8–20.7 s | `spikes/SPIKES.md` |
-| Push → squash visible, live smoke | ~8 s | `app/control-plane/NOTES.md` |
+| Push → squash, live | ~1.7 s end-to-end (push detection + hash + squash in one poll tick); earlier manual smoke ~8 s | `app/control-plane/NOTES.md` |
+| Squash → re-fork done, live | ~2.3 s / ~4.5 s (two parallel forks) | `app/control-plane/NOTES.md` |
+| Check in a Dynamic Worker, live | 90–187 ms per commit (incl. 90 ms splice candidate) | `app/control-plane/NOTES.md` |
+| Failed check → fix push detected, live | ~2.8 s | `app/control-plane/NOTES.md` |
+| Retirement, live | fast-forward 507 ms / 518 ms; splice 1085 ms | `app/control-plane/NOTES.md` |
+| Live end-to-end, main scenario | ~38 s wall — 2 squashes, 2 early cutoffs, 3 retired, 3 checks run, 5 pushes seen | `app/control-plane/NOTES.md` |
+| Live end-to-end, failing-check scenario | 43.8 s wall — 2 squashes, 2 early cutoffs, 3 retired (e3 via splice), 5 checks run, 7 pushes seen | `app/control-plane/NOTES.md` |
 | Full 3-agent scenario, local mock | 2 squashes, 4 early cutoffs, 3 retired in ~23 s | `app/demo/NOTES.md` |
-| Live end-to-end integrated scenario | TBD (pending integration run) | — |
 
 ## Limitations and next steps
 
@@ -267,8 +277,10 @@ Every figure was measured in a real run; source file per row.
   flight must be redone (`app/control-plane/NOTES.md` known gaps).
 - **Vetoed entries hold buffer slots** until `POST /api/reset` (contract
   semantics: `robSize` counts non-retired entries).
-- **Scale-out is designed, not deployed:** one DO serves the whole buffer;
-  per-connected-component DOs are the documented path.
+- **Scale-out is a design argument, not a measurement:** one DO serves the
+  whole buffer today and the largest real run had 3 entries. The "fleet of
+  agents" claim rests on one-DO-per-connected-component sharding, which is
+  documented but unmeasured.
 - **Next steps:** stub value prediction with a hit/miss counter (speculate on
   a declared stub before the producer writes anything), Grace Period hand-off
   for breaking changes with readers outside the buffer, LLM-driven agents,
