@@ -78,9 +78,12 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
   - Sharded: per-event work flat (<20 µs).
   - Containment: 0 squashes outside transitive dependents across 3,803 pushes.
   - Parent spot check: N=1000 run reproduced (head() 23.6 µs single vs 1.3 µs sharded).
-- [ ] T14 (D) Act on T12: index maps and a head cursor in `rob.ts`, plus one ReorderBuffer DO per connected component (routing by root producer). Re-run the bench. Runs AFTER T11 (same files).
-- [ ] T13 (D) Docs refresh with T11/T12 evidence. Dispatched (`odd/prompts/T13-docs-refresh.md`).
-- [ ] T15 (D) Restore the early-cutoff scene; fix the flaky failing-check test (10/10 runs). Dispatched (`odd/prompts/T15-demo-fixes.md`).
+- [ ] T14 (D) Act on T12: index maps and a head cursor in `rob.ts`, plus one ReorderBuffer DO per connected component, with a trunk DO serializing retirement. Re-run the bench. Dispatched to SWE-2 max with a rollback safety net (`odd/prompts/T14-sharding.md`).
+- [x] T13 (D) Docs refresh with T11/T12 evidence. Commit `4f0042f`. Parent structural readback: 3 embedded screenshots exist; the scale section is present and honestly states that ONE DO is deployed today.
+- [x] T15 (D) Restore the early-cutoff scene; fix the flaky failing-check test. Commit `e8e85b8`.
+  - Root cause of the flake: a stale `failed` verdict was read before the re-check ran on the fix commit.
+  - Parent spot check: `npm test` 3/3 runs 12/12; live main exit 0 with prediction 2/1, early cutoffs 2, squashes 3, retired 3.
+  - Tagged `demo-stable-1`; known-good Worker version `a1c784f2-456f-4920-a790-2de3277d7e3b`.
 - [ ] T16 (D) Record live dashboard footage (playwright video) for the submission video, after T14/T15.
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
