@@ -1,0 +1,31 @@
+name = "arb-control-plane"
+main = "src/index.ts"
+compatibility_date = "2026-10-12"
+account_id = "f3adabb2e83104cf7b9c244077547991"
+workers_dev = true
+
+[[artifacts]]
+binding = "ARTIFACTS"
+namespace = "arb"
+
+[[durable_objects.bindings]]
+name = "ROB"
+class_name = "ReorderBuffer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ReorderBuffer"]
+
+[[queues.consumers]]
+queue = "arb-push-events"
+max_batch_size = 10
+max_batch_timeout = 1
+
+[assets]
+directory = "../dashboard"
+binding = "ASSETS"
+run_worker_first = true
+
+[vars]
+POLL_FALLBACK = "on"
+POLL_INTERVAL_MS = "3000"
