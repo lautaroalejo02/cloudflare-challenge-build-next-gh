@@ -58,8 +58,9 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
 - [x] T7 (D) `app/retirer-spike`: prove fast-forward retirement from a fork to `arb-trunk` main from a Worker (isomorphic-git), with timings. Commit `0362bdd`. Result: FF via isomorphic-git in a Worker (`nodejs_compat`), ~0.9 s median, 17-45 ms CPU; a non-descendant gets 409.
 - [ ] T8 (D) Integration: wire hasher, checker and retirer into control-plane; implement the path-disjoint splice; deploy; run the scenario end to end; fix. Dispatched to SWE-2 max (`odd/prompts/T8-integration.md`).
 - [ ] T9 (D) Demo hardening, split into parallel writers on disjoint surfaces:
-  - T9a: dashboard polish + real-event alignment (`odd/prompts/T9a-dashboard-polish.md`).
-  - T9b: README, architecture doc and video script (`odd/prompts/T9b-docs.md`).
+  - [x] T9a: dashboard polish + real-event alignment. Commit `e77db98`. Parent spot check: `node --test` gave 24/24; the 1920x1080 squash screenshot was reviewed and the connectors are clean.
+    - OPEN: the "squash after push" stat is synthetic in the mock (~1.2 s spacing). Live, squash and push share a timestamp, so the stat would read ~0 ms. Before the video, fix it (measure from the git push time) or hide it.
+  - [x] T9b: README, architecture doc and video script. Commit `3967610`. Parent structural readback done. Live E2E numbers are TBD until T8.
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
 Route declaration: T2-T7 are delegated because each package is non-trivial and the six run in parallel in disjoint directories. That is the writer trigger plus the user's explicit request to use many Devin agents. T8 and T9 each go to one writer, because they touch multiple packages.
