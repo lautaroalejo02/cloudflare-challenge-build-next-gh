@@ -78,13 +78,17 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
   - Sharded: per-event work flat (<20 µs).
   - Containment: 0 squashes outside transitive dependents across 3,803 pushes.
   - Parent spot check: N=1000 run reproduced (head() 23.6 µs single vs 1.3 µs sharded).
-- [ ] T14 (D) Act on T12: index maps and a head cursor in `rob.ts`, plus one ReorderBuffer DO per connected component, with a trunk DO serializing retirement. Re-run the bench. Dispatched to SWE-2 max with a rollback safety net (`odd/prompts/T14-sharding.md`).
+- [x] T14 (D) Index maps + head cursor in `rob.ts`; ArbRouter DO + one ReorderBuffer DO per component + ArbTrunk DO serializing retirement. Commits `3c41784`, `153ad02`, `70a9147`.
+  - Bench median per event, after: 2.1 / 2.4 / 2.7 µs at 1k / 10k / 100k (before: 29.6 µs / 394 µs / 16.2 ms).
+  - Writer: live main / failing-check / multi all exit 0; Worker `8bfc389a`.
+  - Parent spot check: control-plane `npm test` 41/41; live main exit 0 (prediction 2/1, early cutoffs 2, squashes 3, retired 3); live multi exit 0 (retired 5, squashes stayed inside their components).
+  - Tagged `demo-stable-2`.
 - [x] T13 (D) Docs refresh with T11/T12 evidence. Commit `4f0042f`. Parent structural readback: 3 embedded screenshots exist; the scale section is present and honestly states that ONE DO is deployed today.
 - [x] T15 (D) Restore the early-cutoff scene; fix the flaky failing-check test. Commit `e8e85b8`.
   - Root cause of the flake: a stale `failed` verdict was read before the re-check ran on the fix commit.
   - Parent spot check: `npm test` 3/3 runs 12/12; live main exit 0 with prediction 2/1, early cutoffs 2, squashes 3, retired 3.
   - Tagged `demo-stable-1`; known-good Worker version `a1c784f2-456f-4920-a790-2de3277d7e3b`.
-- [ ] T16 (D) Record live dashboard footage (playwright video) for the submission video, after T14/T15.
+- [ ] T16 (D) Record live dashboard footage (playwright video) for the submission video. Dispatched (`odd/prompts/T16-footage.md`).
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
 Route declaration: T2-T7 are delegated because each package is non-trivial and the six run in parallel in disjoint directories. That is the writer trigger plus the user's explicit request to use many Devin agents. T8 and T9 each go to one writer, because they touch multiple packages.
