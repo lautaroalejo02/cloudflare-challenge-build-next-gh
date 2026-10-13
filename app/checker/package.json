@@ -1,0 +1,20 @@
+{
+  "name": "arb-checker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Runs a commit's tests inside a Dynamic Worker (Worker Loader), with TS type stripping.",
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "sucrase": "^3.35.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.149.0"
+  }
+}

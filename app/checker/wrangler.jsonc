@@ -1,0 +1,9 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "arb-test-checker",
+	"main": "src/test-worker.ts",
+	"compatibility_date": "2026-10-12",
+	"workers_dev": true,
+	"worker_loaders": [{ "binding": "LOADER" }],
+	"artifacts": [{ "binding": "ARTIFACTS", "namespace": "arb" }],
+}
