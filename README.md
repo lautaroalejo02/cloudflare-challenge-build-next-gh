@@ -30,6 +30,7 @@ when reality differs from what they were forwarded.
 |---|---|
 | Reorder buffer entry | `Entry` {fork, exported interface hashes, consumed hashes, producer} |
 | Operand forwarding | A consumer forks the producer's unfinished fork |
+| Value prediction | `stub` sources declare intended signatures at entry creation; consumers forward against the predicted hashes until the producer's first push confirms (hit) or squashes (miss) |
 | Broadcast on the common data bus | `cf.artifacts.repo.pushed` events via a Queue |
 | Squash on mispredict | Consumed interface hash changed → re-fork + diagnosis |
 | Retirement | In-order fast-forward / splice onto `arb-trunk` main |
@@ -41,6 +42,16 @@ Concretely, per `app/CONTRACTS.md`:
   fork at its current head (`fork-of-fork` — verified working in spike 3) and
   records `entry.consumes`, the producer symbols the new entry depends on,
   with the hashes it forked against.
+- **Value prediction (declared stubs).** `POST /api/entries` may carry `stub`:
+  TypeScript sources declaring the entry's *intended* exported signatures. The
+  control plane hashes them with the real hasher, so `entry.exports` starts as
+  predicted hashes and `entry.predicted` lists the unconfirmed symbols.
+  Consumers registering while `predicted` is non-empty forward against the
+  declared hashes (pinned in `consumes`). The producer's first real push
+  resolves each pinned symbol per consumer: match → `prediction.hit`; diverge →
+  `prediction.miss` and a squash with reason `prediction-miss`, whose diagnosis
+  carries the predicted vs actual signature. Verdicts are counted per
+  (consumer, symbol) in `stats.predictionHits` / `stats.predictionMisses`.
 - **Squash.** Every push recomputes the producer's per-symbol interface hash
   (web-tree-sitter inside the Worker). If a consumed symbol's hash changed,
   each dependent is squashed: re-forked from the producer's new head, its
@@ -79,16 +90,63 @@ Two things, and nothing else:
   dashboard first — which re-fork from the vetoed entry's own base so they
   can still retire later.
 
-## Why it scales
+## "Isn't this just stacked PRs?"
 
-- Coordination cost is proportional to the **edges of the in-flight
-  dependency DAG** (the `consumes` records), not to the number of agents.
-- A squash costs the fan-out of one changed interface; pushes that leave the
-  interface hash unchanged cost nothing (early cutoff).
-- Disconnected dependency components map to **one reorder-buffer DO per
-  connected component** (the current deployment uses a single
-  `idFromName("default")` DO; the data model carries no cross-component
-  state, so sharding by component is the documented scale-out path).
+No — and the difference is now measured, not rhetorical. Stacks are linear
+chains over *finished* work, re-stacked by a human after the producer's PR
+lands; a clean rebase can still hide a broken interface. The buffer is a DAG
+over *in-progress* work: dependents forward against live forks and are
+corrected by interface-hash squashes, never by text merges (`research/top10.md`
+Idea 3). Value prediction goes further than any merge-time tool can:
+dependents started against an interface the producer had only *declared*,
+before it wrote a line. And the verdict is a counter, not a claim — in the live
+run the stats read `predictionHits: 2, predictionMisses: 1` (per
+consumer-symbol verdicts): both consumers' pinned `createOrder` landed exactly
+as declared, while `Order` diverged and its consumer was squashed with a
+predicted-vs-actual diagnosis. The machinery caught reality differing
+from the declaration automatically (`app/control-plane/NOTES.md`, "Value
+prediction (T11)").
+
+| `≈` predicted exports before the first push | hit/miss verdicts land on the first push | ordinary squash with diagnosis |
+|---|---|---|
+| ![Consumers forwarding against e1's declared-stub exports](app/dashboard/screenshots/live-predicted.png) | ![Stub-prediction counter reading 1 hit / 1 miss as verdicts land](app/dashboard/screenshots/live-prediction.png) | ![Consumer squashed with old-vs-new signature diagnosis](app/dashboard/screenshots/live-squash.png) |
+
+## Why it scales — and what the benchmark measured
+
+In a synthetic, in-process benchmark of the pure state machine (no network, no
+Durable Object I/O), an interface-changing push squashed exactly the transitive
+dependents whose consumed hashes had changed (3,803 pushes checked, 0
+mismatches, none outside the dependency subtree), with 3 to 39 squashes per
+push in 40-entry components. Today's single-buffer implementation does not yet
+scale with the touched edges: its median per-event time rose from 30 µs at
+1,000 entries to 394 µs at 10,000 and 16 ms at 100,000, because several steps
+scan the whole entry list on every event. Splitting disconnected components
+into separate buffers held the work per event flat (about 80 to 190
+entry-predicate evaluations at every N, median 3 to 17 µs), which supports the
+sharding claim for the state machine itself; cross-component dependencies,
+routing, and real Durable Object latency were not measured.
+— `app/control-plane/bench/RESULTS.md` (reproduce in ~2 min:
+`cd app/control-plane && node --experimental-strip-types bench/run.ts`)
+
+| entries in the buffer | one buffer for all N, median / p95 per event | one buffer per 40-entry component |
+|---|---|---|
+| 1,000 | 29.6 µs / 92.3 µs | 2.9 µs / 11.9 µs |
+| 10,000 | 393.6 µs / 1,462.6 µs | 6.2 µs / 21.0 µs |
+| 100,000 | 16.2 ms / 55.2 ms | 17.2 µs / 48.3 µs |
+
+**Honest status.** The deployed control plane still runs **one** `ReorderBuffer`
+Durable Object for the whole buffer today, so the left column is the current
+cost — paid by every event, including ones that touch two entries, through
+full-array scans in `head()`, `squashTree` and the id/repo lookups. The next
+step is what the right column approximates: per-connected-component sharding
+plus index maps (`Map<id,Entry>`, `Map<repo,Entry>`, a monotone head cursor,
+per-entry persistence) inside `rob.ts` — dispatched as T14, not yet
+implemented (`bench/RESULTS.md` "Recommended fix"; `app/control-plane/NOTES.md`
+reports no such change as of this writing).
+
+- Squash fan-out is bounded by the dependency subtree, independent of N —
+  measured: 3 / 12 / 39 squashes for depth-2 / depth-1 / root producers,
+  never above 39 across the whole run (`bench/RESULTS.md`).
 - Long chains amplify mispredicts; `robSize` bounds that exactly as in
   hardware. Forks are near-free: 10 parallel forks measured at 1.9 s wall
   (`spikes/SPIKES.md`).
@@ -210,8 +268,10 @@ npm install
 npm run demo -- --base https://arb-control-plane.<your-subdomain>.workers.dev
 ```
 
-Three scripted agents (API/UI/Tests) run the organizers' scenario: a body-only
-API refactor (early cutoff), then a breaking `createOrder` signature change
+Three scripted agents (API/UI/Tests) run the organizers' scenario: the API
+agent registers with a declared stub, its first push resolves the predictions
+per consumer (hit → keep working; miss → `prediction-miss` squash), a body-only
+API refactor is an early cutoff, then a breaking `createOrder` signature change
 (two squashes, re-forks, diagnoses), then in-order retirement e1 → e2 → e3.
 Fully offline alternative — a local mock control plane with no Cloudflare at
 all:
@@ -221,8 +281,9 @@ npm run mock -- --port 8899 --root tmp-mock/live   # terminal 1
 npm run demo -- --base http://127.0.0.1:8899        # terminal 2
 ```
 
-Tests per package: `npm test` (control-plane 26 cases — state machine +
-splice + git-level retire; demo 5 scenario cases, dashboard 24
+Tests per package: `npm test` (control-plane 33 cases — state machine +
+splice + git-level retire + declared-stub prediction; demo scenario cases
+incl. a full-run prediction case asserting 2 hits / 1 miss, dashboard 27
 event-folding cases, hasher 24 hash checks, checker and retirer-spike unit
 suites).
 
@@ -231,7 +292,8 @@ suites).
 **Real:** every Cloudflare primitive above — Artifacts repos, fork-of-fork
 forwarding, write tokens, `repo.pushed` events through the queue, the DO
 state machine, WebSocket events to the dashboard, interface hashing in a
-Worker, checks in a Dynamic Worker, and fast-forward/splice retirement.
+Worker, declared-stub value prediction (live verdicts: 2 hits / 1 miss),
+checks in a Dynamic Worker, and fast-forward/splice retirement.
 All ports in the deployed control plane are real (no stubs) — the full
 scenario ran end to end against `arb-control-plane`; see "Live E2E results"
 in `app/control-plane/NOTES.md`.
@@ -266,6 +328,9 @@ Every figure was measured in a real run; source file per row.
 | Retirement, live | fast-forward 507 ms / 518 ms; splice 1085 ms | `app/control-plane/NOTES.md` |
 | Live end-to-end, main scenario | ~38 s wall — 2 squashes, 2 early cutoffs, 3 retired, 3 checks run, 5 pushes seen | `app/control-plane/NOTES.md` |
 | Live end-to-end, failing-check scenario | 43.8 s wall — 2 squashes, 2 early cutoffs, 3 retired (e3 via splice), 5 checks run, 7 pushes seen | `app/control-plane/NOTES.md` |
+| Live end-to-end with declared stubs (T11) | ~52 s wall — predictionHits 2 / misses 1, 3 squashes, 3 retired, 4 checks run, 7 pushes seen | `app/control-plane/NOTES.md` |
+| Live failing-check with declared stubs (T11) | ~50 s wall — same 2/1 verdicts; failing check still blocked retirement (5 checks run) | `app/control-plane/NOTES.md` |
+| Reorder-buffer scale bench (state machine) | median per event 30 µs → 394 µs → 16 ms at N = 1k / 10k / 100k single buffer; flat 3–17 µs with per-component buffers; 3,803 pushes, 0 squash-oracle mismatches | `app/control-plane/bench/RESULTS.md` |
 | Full 3-agent scenario, local mock | 2 squashes, 4 early cutoffs, 3 retired in ~23 s | `app/demo/NOTES.md` |
 
 ## Limitations and next steps
@@ -277,18 +342,23 @@ Every figure was measured in a real run; source file per row.
   flight must be redone (`app/control-plane/NOTES.md` known gaps).
 - **Vetoed entries hold buffer slots** until `POST /api/reset` (contract
   semantics: `robSize` counts non-retired entries).
-- **Scale-out is a design argument, not a measurement:** one DO serves the
-  whole buffer today and the largest real run had 3 entries. The "fleet of
-  agents" claim rests on one-DO-per-connected-component sharding, which is
-  documented but unmeasured.
-- **Next steps:** stub value prediction with a hit/miss counter (speculate on
-  a declared stub before the producer writes anything), Grace Period hand-off
-  for breaking changes with readers outside the buffer, LLM-driven agents,
-  per-fork event subscriptions, veto confirmation in the UI.
+- **Scale-out is now partially measured — and still unfinished.** The
+  in-process benchmark shows the single buffer's per-event cost growing with N
+  (16 ms median at 100k) while per-component buffers stay flat — but the
+  deployed plane still runs one DO, and cross-component routing, real DO
+  latency and DO storage limits (~740 B/entry; 74 MB serialized at 100k) are
+  unmeasured (`app/control-plane/bench/RESULTS.md`). Index maps + per-component
+  sharding (T14) is the tracked next step.
+- **Next steps:** index maps and a head cursor in `rob.ts`, then one
+  `ReorderBuffer` DO per connected component (T14); Grace Period hand-off
+  for breaking changes with readers outside the buffer; LLM-driven agents;
+  per-fork event subscriptions; veto confirmation in the UI. (Declared-stub
+  value prediction — the T11 item — shipped: `predictionHits` /
+  `predictionMisses` are live counters.)
 - Prior art and the "why not just stacked PRs" answer: `research/top10.md`
   Idea 3 — stacks are linear chains restacked by humans after the producer
   pushes; the buffer is a DAG over in-progress work with automatic
-  interface-hash squash.
+  interface-hash squash (see the dedicated section above).
 
 ## License
 
