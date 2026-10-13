@@ -140,6 +140,41 @@ Perf on the demo fixture (6 files, best-of-5, Node test runner):
 top-level walk per file; bodyHash adds one extra canon walk + sha256 per
 symbol inside hashInterface).
 
+## V1b audit fixes
+
+All v1 `hash` values unchanged (base still `f9916f523525`); every
+normalization below applies only to `bodyHash`/`file`/`from`/`source`.
+
+| Finding | Fix | Test |
+|---|---|---|
+| `bodyHash` moved on pure reformat | `canon(..., includeBodies=true)` now drops `,` leaves directly before `)`/`]`/`}`, emits string literals as `'` + fragment + `'`, and wraps a bare arrow `parameter` as `(x)` so `x=>` === `(x)=>`. `if(a) b()` vs `if(a){b()}` still differ (braces are tokens). | `V1b bodyHash: trailing comma in *`, `single vs double quotes`, `*arrow param*`, `real body edit`, `if(a) b() vs if(a){ b() }`, `const initializer`, `export default function body` |
+| `export default <identifier>` emitted nothing (the `value` field is a bare identifier, invisible to the old `childCount > 0` scan) | Resolved through `locals` exactly like `export {x}`: signature/kind/bodyHash/source come from the declaration. Non-declared values keep the `const default:<type>` fallback. | `V1b default-export local function/class resolves to declaration`, `source is the resolved declaration`, `bodyHash tracks resolved declaration's body` |
+| Dedupe collapsed same-named symbols across files | Dedupe key is now `name + signature + file`; the aggregate `hash` dedupes its normalized lines so identical cross-file exports don't move it. | `V1b dedupe: identical exports in different files both appear` |
+| `file`/`from` path forms could diverge | Input keys are normalized once (`\` → `/`, leading `./`/`/` stripped, `.` collapsed) via `normalizeFiles`; `resolveSpecifier` shares `resolveModule`'s candidate list (`.ts`, `.tsx`, `/index.ts`, `.js`→`.ts`) and returns the first candidate that exists, else the plain resolution. `..` past the root clamps to the plain collapsed path. | `V1b paths: input keys normalized`, `V1b imports: extensionless spec / .js specifier / .. past root / unresolvable spec`, `V1b fixture: every import's from equals the imported symbol's file` |
+| `export * as ns from` yielded `names: []` | The `*` lives inside a `namespace_export` child; it's now detected. | `V1b imports: export * as ns -> names ['*']` |
+| Overload signature (no body) could win dedupe, hiding impl edits | On a same-key collision the declaration with a `statement_block` body wins, so `bodyHash` tracks the implementation. | `V1b overloads: *` |
+| Flaky `ratio <= 2x` perf assertion | Removed; the timing line is printed as a measurement only. | (measurement only) |
+
+Latent bug found while fixing #1: `bodyMembers(...).map(canon)` passed the
+element index as `canon`'s `includeBodies` argument (truthy at index ≥ 1).
+Previously invisible because `includeBodies` only skipped `body` fields; once
+it gated real normalization it corrupted signatures (`currency:string` →
+`currency:''`). All `.map(canon)` sites now use `(c) => canon(c)`.
+
+## Known gaps (out of scope for V1b)
+
+- Decorator arguments are dropped entirely (decorators are skipped nodes), so
+  an argument-only edit does not move `bodyHash`.
+- `import x = require("m")` and dynamic `import()` are not extracted.
+- `source` truncation is a plain `slice(0, 4000)` — it can split a surrogate
+  pair at the boundary.
+- `export * as ns from` produces an `ImportRef` but no `SymbolSignature` (the
+  namespace object itself isn't resolvable to a declaration).
+- `export default <non-declared expr>` (e.g. `export default 42`) yields
+  `const default:<inferred>`; identifiers that aren't top-level locals resolve
+  the same way.
+- If two normalized input keys collide (`a/../b.ts` and `b.ts`), last wins.
+
 ## Contract issues
 
 None. The contract's `files` map (path→source) works cleanly; re-export

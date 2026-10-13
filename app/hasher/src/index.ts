@@ -116,21 +116,53 @@ function isPunct(ch: string): boolean {
 
 function canon(node: Node, includeBodies = false): string {
   let out = "";
+  const emit = (t: string): void => {
+    if (out === "" || isPunct(t[0]) || isPunct(out[out.length - 1])) out += t;
+    else out += " " + t;
+  };
+  // (V1b) Next non-comment sibling, for trailing-comma detection.
+  const nextToken = (n: Node): Node | null => {
+    let sib: Node | null = n.nextSibling;
+    while (sib && SKIP_NODES.has(sib.type)) sib = sib.nextSibling;
+    return sib;
+  };
   const visit = (n: Node): void => {
     if (SKIP_NODES.has(n.type)) return;
+    if (includeBodies && n.type === "string") {
+      // Quote style is formatting: canon is the inner text under one quote
+      // char, so 'x' and "x" (and escapes spelled identically) are equal.
+      const inner = n.children
+        .filter((c) => !(c.childCount === 0 && (c.text === '"' || c.text === "'")))
+        .map((c) => c.text)
+        .join("");
+      emit(`'${inner}'`);
+      return;
+    }
     if (n.childCount === 0) {
       const t = n.text;
       if (t === ";") return;
-      const parent = n.parent;
-      if (t === "," && parent && COMMA_BODIES.has(parent.type)) return;
-      if (out === "" || isPunct(t[0]) || isPunct(out[out.length - 1])) out += t;
-      else out += " " + t;
+      if (t === ",") {
+        const parent = n.parent;
+        if (parent && COMMA_BODIES.has(parent.type)) return;
+        // Trailing separators (right before a closer) are pure formatting.
+        if (includeBodies) {
+          const sib = nextToken(n);
+          if (sib && sib.childCount === 0 && (sib.text === ")" || sib.text === "]" || sib.text === "}")) return;
+        }
+      }
+      emit(t);
       return;
     }
     const bodied = BODIED.has(n.type);
+    const arrowParams = includeBodies && n.type === "arrow_function";
     for (let i = 0; i < n.childCount; i++) {
       const c = n.child(i)!;
       if (bodied && !includeBodies && n.fieldNameForChild(i) === "body") continue;
+      // `x => ...` and `(x) => ...` canon to the same parenthesized form.
+      if (arrowParams && n.fieldNameForChild(i) === "parameter") {
+        emit(`(${c.text})`);
+        continue;
+      }
       visit(c);
     }
   };
@@ -360,10 +392,10 @@ function interfaceSignature(iface: Node): string {
   const head = joinCanon(
     iface.children
       .filter((_, i) => iface.fieldNameForChild(i) !== "body")
-      .map(canon),
+      .map((c) => canon(c)),
   );
   const members = bodyMembers(iface.childForFieldName("body"))
-    .map(canon)
+    .map((c) => canon(c))
     .join(";");
   return `${head}{${members}}`;
 }
@@ -447,7 +479,7 @@ function declSymbols(
       const members = body
         ? body.children
             .filter((c) => c.type === "enum_assignment" || c.type === "property_identifier")
-            .map(canon)
+            .map((c) => canon(c))
             .join(",")
         : "";
       return [{ name, kind: "type", signature: `enum ${name}{${members}}`, node: d }];
@@ -494,10 +526,29 @@ function normalizePath(p: string): string {
   return parts.join("/");
 }
 
+// (V1b) Every caller works on one normalized map: backslashes become `/`,
+// leading `./`/`/` are stripped and `.` segments collapse. `..` past the root
+// clamps (the excess hops are dropped — documented in NOTES.md).
+function normalizeFiles(files: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of Object.keys(files)) {
+    out[normalizePath(k.replace(/\\/g, "/"))] = files[k];
+  }
+  return out;
+}
+
+// Candidate file paths for a resolved base, in lookup order: the path as
+// written, then the usual extension guesses, then `.js` -> `.ts`.
+function moduleCandidates(base: string): string[] {
+  const cands = [base, `${base}.ts`, `${base}.tsx`, `${base}/index.ts`];
+  if (base.endsWith(".js")) cands.push(`${base.slice(0, -3)}.ts`);
+  return cands;
+}
+
 function resolveModule(spec: string, importer: string, files: Record<string, string>): string | null {
   const dir = importer.split("/").slice(0, -1).join("/");
   const base = normalizePath(dir === "" ? spec : `${dir}/${spec}`);
-  for (const cand of [base, `${base}.ts`, `${base}.tsx`, `${base}/index.ts`]) {
+  for (const cand of moduleCandidates(base)) {
     if (cand in files) return cand;
   }
   return null;
@@ -651,18 +702,30 @@ function collectExports(
       continue;
     }
     if (node.children.some((c) => c.childCount === 0 && c.text === "default")) {
-      const expr = node.children.find(
-        (c) =>
-          c.childCount > 0 &&
-          !["export", "default"].includes(c.text),
-      );
-      if (expr) {
+      const value = node.childForFieldName("value");
+      const localDecl =
+        value?.type === "identifier" ? locals.get(value.text) : undefined;
+      if (value && localDecl) {
+        // `export default <identifier>`: resolve through locals like `export
+        // {x}` does, so bodyHash and source reflect the declaration.
+        const src = withDocs(topLevelOf(localDecl));
+        for (const s of declSymbols(localDecl, value.text)) {
+          syms.push({
+            name: "default",
+            kind: s.kind,
+            signature: s.signature,
+            file: path,
+            declNode: s.node,
+            source: src,
+          });
+        }
+      } else if (value) {
         syms.push({
           name: "default",
           kind: "const",
-          signature: `const default:${inferExprType(expr)}`,
+          signature: `const default:${inferExprType(value)}`,
           file: path,
-          declNode: expr,
+          declNode: value,
           source: withDocs(node),
         });
       }
@@ -687,33 +750,55 @@ async function sha256_12(text: string): Promise<string> {
     .slice(0, 12);
 }
 
+// True when the declaration node carries an implementation body — used to
+// prefer an overload's implementation over its signature when they share a
+// key, so bodyHash tracks the body that actually runs.
+const hasImplBody = (n: Node): boolean =>
+  n.childForFieldName("body")?.type === "statement_block";
+
 export async function hashInterface(
   files: Record<string, string>,
 ): Promise<InterfaceHash> {
   const parser = await getParser();
-  const seen = new Set<string>();
-  const symbols: SymbolSignature[] = [];
-  for (const path of Object.keys(files).sort()) {
-    if (files[path] === undefined) continue;
-    for (const s of collectExports(parser, path, files, new Set())) {
-      const key = `${s.name} ${s.signature}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      symbols.push({
-        name: s.name,
-        kind: s.kind,
-        signature: s.signature,
-        hash: await sha256_12(s.signature),
-        file: s.file,
-        bodyHash: await sha256_12(canon(s.declNode, true)),
-        source: s.source.slice(0, 4000),
-      });
+  const norm = normalizeFiles(files);
+  // Dedupe key is name + signature + file: identical exports in different
+  // files both appear. On a same-file collision (an overload signature vs
+  // its implementation) the declaration carrying the body wins, so an edit
+  // to the implementation changes bodyHash.
+  const byKey = new Map<string, Sym>();
+  for (const path of Object.keys(norm).sort()) {
+    if (norm[path] === undefined) continue;
+    for (const s of collectExports(parser, path, norm, new Set())) {
+      const key = `${s.name} ${s.signature} ${s.file}`;
+      const prev = byKey.get(key);
+      if (
+        prev !== undefined &&
+        (hasImplBody(prev.declNode) || !hasImplBody(s.declNode))
+      )
+        continue;
+      byKey.set(key, s);
     }
+  }
+  const symbols: SymbolSignature[] = [];
+  for (const s of byKey.values()) {
+    symbols.push({
+      name: s.name,
+      kind: s.kind,
+      signature: s.signature,
+      hash: await sha256_12(s.signature),
+      file: s.file,
+      bodyHash: await sha256_12(canon(s.declNode, true)),
+      source: s.source.slice(0, 4000),
+    });
   }
   symbols.sort(
     (a, b) => a.name.localeCompare(b.name) || a.signature.localeCompare(b.signature),
   );
-  const normalized = symbols.map((s) => `${s.name} ${s.signature}`).join("\n");
+  // Duplicate (name, signature) pairs across files collapse to one line, so
+  // the aggregate hash is unchanged by cross-file duplicates.
+  const normalized = [
+    ...new Set(symbols.map((s) => `${s.name} ${s.signature}`)),
+  ].join("\n");
   return { hash: await sha256_12(normalized), symbols };
 }
 
@@ -729,10 +814,18 @@ function stripQuotes(text: string): string {
   return text.length >= 2 ? text.slice(1, -1) : text;
 }
 
-function resolveSpecifier(spec: string, importer: string): string {
+// Relative specifiers resolve to a repo-relative path. When the plain
+// resolution is not a key in `files`, the resolveModule candidate list is
+// tried so `from` matches the `file` of the symbols it names; unresolvable
+// specifiers fall back to the plain resolution.
+function resolveSpecifier(spec: string, importer: string, files: Record<string, string>): string {
   if (!spec.startsWith(".")) return spec;
   const dir = importer.split("/").slice(0, -1).join("/");
-  return normalizePath(dir === "" ? spec : `${dir}/${spec}`);
+  const base = normalizePath(dir === "" ? spec : `${dir}/${spec}`);
+  for (const cand of moduleCandidates(base)) {
+    if (cand in files) return cand;
+  }
+  return base;
 }
 
 function moduleSpec(node: Node): string | null {
@@ -744,9 +837,10 @@ export async function extractImports(
   files: Record<string, string>,
 ): Promise<ImportRef[]> {
   const parser = await getParser();
+  const norm = normalizeFiles(files);
   const refs: ImportRef[] = [];
-  for (const path of Object.keys(files).sort()) {
-    const src = files[path];
+  for (const path of Object.keys(norm).sort()) {
+    const src = norm[path];
     if (src === undefined) continue;
     const top = parser.parse(src)!.rootNode.children;
     for (const node of top) {
@@ -766,14 +860,18 @@ export async function extractImports(
             }
           }
         }
-        refs.push({ file: path, from: resolveSpecifier(spec, path), names });
+        refs.push({ file: path, from: resolveSpecifier(spec, path, norm), names });
         continue;
       }
       if (node.type !== "export_statement") continue;
       const spec = moduleSpec(node);
       if (spec === null) continue; // no `from`: `export {x}` / `export <decl>` are not imports
       const names: string[] = [];
-      if (node.children.some((c) => c.childCount === 0 && c.text === "*")) {
+      if (
+        node.children.some(
+          (c) => (c.childCount === 0 && c.text === "*") || c.type === "namespace_export",
+        )
+      ) {
         names.push("*"); // `export * from` and `export * as ns from`
       }
       const clause = node.children.find((c) => c.type === "export_clause");
@@ -782,7 +880,7 @@ export async function extractImports(
         const n = sp.childForFieldName("name")?.text;
         if (n) names.push(n);
       }
-      refs.push({ file: path, from: resolveSpecifier(spec, path), names });
+      refs.push({ file: path, from: resolveSpecifier(spec, path, norm), names });
     }
   }
   return refs;
