@@ -30,10 +30,19 @@ control-plane Worker serves this directory at `/` later.
   1920x1080), a 1280x720 check, the deployed page (`live-check.png`), and the
   live T9c demo run (`live-squash.png` at the squash moment,
   `live-final.png` after all three retirements).
+- `recordings/` — T16 live video takes for the submission video
+  (`*.webm`, VP9, plus `<name>.timeline.txt` = the scenario's stdout from the
+  same run). No tokens in the timelines — `grep art_v2_` is clean.
 - `scripts/capture-live.mjs` — headless-Edge capture used for the live shots:
   `waitForSelector('.log-line.t-squash')` for the squash moment and
   `[data-chip="e3"]` for the final state. `npm run capture:live` — start it
   before `npm run demo` so the run streams over `/api/ws`.
+- `scripts/record-live.mjs` — headless-Edge `recordVideo` capture that spawns
+  the scenario itself (`npm run demo -- --base <url> [--scenario X]` in
+  `app/demo`), keeps rolling until it exits +4 s, then saves
+  `recordings/<name>.webm` + `.timeline.txt`. Optional `--delay-ready
+  <entryId>:<ms>` fronts the demo with a loopback proxy that holds only that
+  entry's `ready` POST (see "Live footage" below for why multi needs it).
 
 ## Run
 
@@ -43,6 +52,87 @@ control-plane Worker serves this directory at `/` later.
   while the socket is down; reconnects with 1→8 s backoff.
 - Mock: open `mock.html` (works over `file://` — classic scripts, no fetches)
   or `/?mock=1`. A `↺ replay` button re-runs the script.
+
+## Live footage (T16)
+
+Recorded 2026-10-13 against `arb-control-plane` (deployed, not redeployed by
+this task). One take per scenario; each webm is VP9, `recordVideo` at the
+viewport size, plus the scenario stdout timeline saved alongside.
+
+| File | Scenario | Res | Duration | Size | ffprobe packets |
+|---|---|---|---|---|---|
+| `recordings/main.webm` | main | 1920x1080 | 86.9 s | 16.5 MB | 2172 |
+| `recordings/multi.webm` | multi | 1920x1080 | 100.5 s | 28.7 MB | 2513 |
+| `recordings/multi-720.webm` | multi | 1280x720 | 98.0 s | 19.6 MB | 2451 |
+| `recordings/failing-check.webm` | failing-check | 1920x1080 | 66.9 s | 15.8 MB | 1672 |
+
+`multi.webm` exceeds 25 MB, so `multi-720.webm` is the small fallback take.
+All four passed `ffprobe` (duration + packet count; every packet decodes) and
+the scenarios all exited 0 with all entries retired in order.
+
+### Re-recording
+
+```
+cd app/dashboard
+npx playwright install ffmpeg          # once — recordVideo needs the bundled ffmpeg
+npm run record:live -- --name main
+npm run record:live -- --name multi --scenario multi --delay-ready e5:30000
+npm run record:live -- --name failing-check --scenario failing-check
+```
+
+Options: `--base <url>` (default the production worker), `--size WxH`
+(default 1920x1080; `1280x720` for the small take), `--tail <ms>` (extra
+footage after the scenario exits, default 4000), `--delay-ready
+<entryId>:<ms>`.
+
+`--delay-ready` for multi (IMPORTANT): the two components' splice retirements
+are scripted to land within the same ~2 s window. The splice candidate is
+built on the trunk head at `retire()` time but `moveBranch` pushes to `main`
+only after the candidate check — so when component B lands between A's
+candidate and A's `moveBranch`, A gets a non-fast-forward rejection,
+`_internal.retiring[A]` is never cleared, and the component's head entry
+wedges at `ready` until the 5-min timeout (agent logs `ready rejected: Push
+rejected because it was not a simple fast-forward.`). Observed in 4/4
+unmodified live multi runs — a real control-plane defect (stale-candidate
+window, shared `arb-candidate` scratch ref, no retry). The recordings use a
+30 s delay on `POST /api/entries/e5/ready` only (e5 is deterministically the
+payments-ui entry, registered last); this is client-side timing, identical to
+a slower agent — every event, squash, check and splice in the take is real.
+If the control plane gets a candidate rebuild/retry on non-FF, rerun multi
+without `--delay-ready`.
+
+### Key moments (video timestamps ≈ demo-spawn offset + timeline `+Ns`)
+
+main.webm (spawn offset 7.0 s):
+- ~27-32 s — three entries appear, consumers forwarded onto the api fork with
+  `≈ stub` predicted-hash tags
+- ~42 s — prediction verdicts land (2 hits / 1 miss) and e2 takes the
+  prediction-miss SQUASH on the `Order` interface (`hash.changed` → red flash)
+- ~51 s — early cutoff: api's body-only push, `stats.earlyCutoffs 0 -> 2`,
+  nobody squashed
+- ~60-61 s — breaking push: `createOrder` signature change → e2 + e3 SQUASH
+- ~63 s — e1 retires; ~76 s — e2 retires; ~78 s — e3 retires, all three green
+  chips on the trunk bar by ~79 s
+
+multi.webm (spawn offset 2.3 s) — the 720p take is ~2 s earlier throughout:
+- ~11-18 s — five entries, two api lanes: `comp-e1` orders + `comp-e2`
+  payments forwarding trees visible
+- ~29 s — orders prediction verdicts (2 hits / 1 miss), e3 prediction-miss
+  SQUASH
+- ~25 s / ~39 s — early cutoffs on both producers' body-only pushes
+- ~47 s — payments breaking change SQUASHes e5 (stays inside comp-e2)
+- ~55 s — orders breaking change SQUASHes e3 + e4 (stays inside comp-e1)
+- Retirements: e2 ~48 s, e1 ~59 s, e3 ~67 s, e4 ~71 s, e5 ~94 s (the e5 gap is
+  the deliberate `--delay-ready` stagger); 5/5 green by ~96 s
+
+failing-check.webm (spawn offset 2.3 s):
+- ~22 s — prediction verdicts + e2 prediction-miss SQUASH
+- ~32 s — early cutoff on the body-only push
+- ~45 s — breaking change SQUASHes e2 + e3
+- ~46 s — e1 retires; ~55 s — e2 retires while e3 goes `ready -> failed`
+  (red `check.failed` — the scripted bad test runs in a Dynamic Worker)
+- ~59-62 s — the tests agent pushes the scripted fix, e3 re-checks and
+  retires; all three green by ~63 s
 
 ## Verify
 

@@ -5,7 +5,8 @@
   "description": "ARB live pipeline UI — static files, no build step, served by arb-control-plane",
   "scripts": {
     "test": "node --test",
-    "capture:live": "node scripts/capture-live.mjs"
+    "capture:live": "node scripts/capture-live.mjs",
+    "record:live": "node scripts/record-live.mjs"
   },
   "devDependencies": {
     "playwright": "1.64.0"

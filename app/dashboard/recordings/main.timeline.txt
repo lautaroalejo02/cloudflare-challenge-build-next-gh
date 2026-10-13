@@ -1,0 +1,85 @@
+
+> arb-demo@0.0.0 demo
+> node --experimental-strip-types --disable-warning=ExperimentalWarning src/scenario.ts --base https://arb-control-plane.lautitomasalejo.workers.dev/
+
+[+   0.7s] [scenario] POST /api/reset ok
+[+   1.2s] [scenario] trunk init: arb-trunk https://f3adabb2e83104cf7b9c244077547991.artifacts.cloudflare.net/git/arb/arb-trunk.git
+[+  15.5s] [scenario] fixture pushed to trunk at 8e4d7da9
+[+  19.8s] [api     ] registered e1 seq=1 lane=api repo=arb-e1-api-0-qhncvo
+[+  19.8s] [api     ] declared stub: predicted exports [Cart, createOrder, LineItem, Order]
+[+  19.8s] [scenario] api entry is e1; consumers register against the declared stub
+[+  19.9s] [api     ] cloning arb-e1-api-0-qhncvo -> e1-g0 (generation 0)
+[+  23.8s] [buffer  ] e1 (api) created -> speculating
+[+  23.8s] [buffer  ] e2 (ui) created -> speculating
+[+  23.8s] [buffer  ] e3 (tests) created -> speculating
+[+  24.2s] [ui      ] registered e2 seq=2 lane=ui repo=arb-e2-ui-0-wuh0y1
+[+  24.3s] [ui      ] cloning arb-e2-ui-0-wuh0y1 -> e2-g0 (generation 0)
+[+  25.1s] [tests   ] registered e3 seq=3 lane=tests repo=arb-e3-tests-0-rd0p2f
+[+  25.2s] [tests   ] cloning arb-e3-tests-0-rd0p2f -> e3-g0 (generation 0)
+[+  27.3s] [ui      ] detected createOrder signature v1 - applying v1 checkout variant
+[+  27.4s] [tests   ] detected createOrder signature v1 - writing v1 feature test
+[+  28.9s] [tests   ] pushed 7cff29c8 "test: add createOrder feature coverage" (gen 0)
+[+  29.2s] [ui      ] pushed 673049b1 "feat(ui): express checkout line" (gen 0)
+[+  32.3s] [api     ] pushed afe7a969 "refactor(api): extract sumCart; add currency to Order" (gen 0)
+[+  32.3s] [tests   ] marked ready (gen 0)
+[+  32.4s] [buffer  ] e3 (tests) speculating -> ready
+[+  32.4s] [buffer  ] stats.pushesSeen 0 -> 2
+[+  32.5s] [ui      ] marked ready (gen 0)
+[+  33.2s] [buffer  ] e2 (ui) speculating -> ready
+[+  34.8s] [buffer  ] e2 (ui) ready -> squashed
+[+  34.8s] [buffer  ] stats.squashes 0 -> 1
+[+  34.8s] [buffer  ] stats.pushesSeen 2 -> 3
+[+  34.8s] [buffer  ] stats.predictionHits 0 -> 2
+[+  34.8s] [buffer  ] stats.predictionMisses 0 -> 1
+[+  37.9s] [ui      ] cloning arb-e2-ui-1-azj3k3 -> e2-g1 (generation 1)
+[+  40.7s] [ui      ] squashed: Order interface Order{id:string;region:string;itemCount:number;totalCents:number} -> interface Order{id:string;region:string;currency:string;itemCount:number;totalCents:number}
+[+  41.1s] [ui      ] detected createOrder signature v1 - applying v1 checkout variant
+[+  41.1s] [api     ] pushed d6427011 "refactor(api): reimplement sumCart with reduce" (gen 0)
+[+  43.1s] [ui      ] pushed 64d3d9c9 "feat(ui): reapply express checkout for new createOrder interface" (gen 1)
+[+  43.7s] [buffer  ] stats.earlyCutoffs 0 -> 2
+[+  43.7s] [buffer  ] stats.pushesSeen 3 -> 4
+[+  44.8s] [ui      ] marked ready (gen 1)
+[+  44.8s] [buffer  ] e2 (ui) squashed -> ready
+[+  44.8s] [buffer  ] stats.pushesSeen 4 -> 5
+[+  52.7s] [api     ] pushed da7f6e02 "feat(api)!: createOrder now takes { region, currency } options" (gen 0)
+[+  54.3s] [buffer  ] e1 (api) speculating -> ready
+[+  54.3s] [buffer  ] e2 (ui) ready -> squashed
+[+  54.3s] [buffer  ] e3 (tests) ready -> squashed
+[+  54.3s] [buffer  ] stats.squashes 1 -> 3
+[+  54.3s] [buffer  ] stats.checksRun 0 -> 1
+[+  54.3s] [buffer  ] stats.pushesSeen 5 -> 6
+[+  55.3s] [api     ] marked ready (gen 0)
+[+  55.8s] [buffer  ] e1 (api) ready -> retired
+[+  55.8s] [buffer  ] stats.retired 0 -> 1
+[+  56.3s] [api     ] retired seq=1
+[+  56.7s] [ui      ] cloning arb-e2-ui-2-x12 -> e2-g2 (generation 2)
+[+  60.1s] [tests   ] cloning arb-e3-tests-1-qhy9sb -> e3-g1 (generation 1)
+[+  61.6s] [ui      ] squashed: createOrder fn createOrder(cart:Cart,region:string):Order -> fn createOrder(cart:Cart,opts:{region:string currency:string}):Order
+[+  61.7s] [tests   ] squashed: createOrder fn createOrder(cart:Cart,region:string):Order -> fn createOrder(cart:Cart,opts:{region:string currency:string}):Order
+[+  62.0s] [ui      ] detected createOrder signature v2 - applying v2 checkout variant
+[+  62.1s] [tests   ] detected createOrder signature v2 - writing v2 feature test
+[+  63.8s] [tests   ] pushed 6161a28c "test: reapply feature coverage for new createOrder interface" (gen 1)
+[+  64.1s] [ui      ] pushed b123dae5 "feat(ui): reapply express checkout for new createOrder interface" (gen 2)
+[+  67.1s] [buffer  ] e2 (ui) squashed -> speculating
+[+  67.1s] [buffer  ] e3 (tests) squashed -> speculating
+[+  67.1s] [buffer  ] stats.pushesSeen 6 -> 8
+[+  67.6s] [tests   ] marked ready (gen 1)
+[+  67.9s] [buffer  ] e2 (ui) speculating -> ready
+[+  67.9s] [buffer  ] e3 (tests) speculating -> ready
+[+  67.9s] [buffer  ] stats.checksRun 1 -> 2
+[+  68.8s] [buffer  ] e2 (ui) ready -> retired
+[+  68.8s] [buffer  ] e3 (tests) ready -> checking
+[+  68.8s] [buffer  ] stats.retired 1 -> 2
+[+  69.5s] [buffer  ] e3 (tests) checking -> ready
+[+  69.5s] [buffer  ] stats.checksRun 2 -> 3
+[+  70.3s] [buffer  ] stats.checksRun 3 -> 4
+[+  70.8s] [ui      ] marked ready (gen 2)
+[+  71.1s] [buffer  ] e3 (tests) ready -> retired
+[+  71.1s] [buffer  ] stats.retired 2 -> 3
+[+  71.8s] [tests   ] retired seq=3
+[+  71.9s] [ui      ] retired seq=2
+[+  71.9s] [final   ] e1 api    status=retired gen=0 head=da7f6e02
+[+  71.9s] [final   ] e2 ui     status=retired gen=2 head=b123dae5
+[+  71.9s] [final   ] e3 tests  status=retired gen=1 head=6161a28c
+[+  71.9s] [final   ] stats={"squashes":3,"earlyCutoffs":2,"retired":3,"checksRun":4,"pushesSeen":8,"predictionHits":2,"predictionMisses":1} trunk=401c3c5a retired=3
+[+  71.9s] [scenario] all three entries retired onto trunk in order - demo complete
