@@ -936,3 +936,150 @@ benchmark exited 0 with median **28.8 microseconds/event**, p95 **158.4**, about
 0/200, containment violations 0, callback scans 0/0, and 87.11 MB state. The
 difference from the earlier 13.5 median was not causally isolated; neither run
 establishes baseline performance parity.
+
+## V8 inference scope
+
+**Result: complete.** Deployed `arb-control-plane` version
+`e72a037b-6c00-4edd-a933-d160f84d78e1` on 2026-10-13. No commit, push, git
+revert, or rollback was performed. The known-good rollback remains
+`9f105998-1985-432d-af28-df1908c3d014` (`demo-stable-6`).
+
+### Implementation and decisions
+
+- `pushCommand` carries `changedPaths?: string[]`; `rob.ts` filters each
+  `ImportRef.file` against that set. Missing/empty paths mean no inference,
+  never whole-tree fallback. Existing declared consumes remain unchanged.
+- Extracted V3b's consumer-versus-base usage selection into the shared
+  `changedConsumerFiles` helper, used by both inference and Jev usage. The
+  prior implementation compared decoded source strings; it now compares
+  original blob OIDs from the existing Artifacts tree walk. Added/modified
+  content counts; deleted files and mode-only changes do not.
+- `readTree` optionally collects OIDs. The base walk is metadata-only:
+  no base blobs are fetched. Source-only mock ports derive Git blob SHA-1s.
+  Missing commit/tree/blob metadata throws instead of silently inventing
+  an empty base. Diff failure emits fixed `recover` narration with kind
+  `inference-diff-failed` and reason `inference-diff-failed`, then processes the
+  push with `changedPaths: []`.
+- `push.data.inferenceDiffMs` records the incremental diff wall time,
+  including base metadata I/O and comparison, excluding the pre-existing
+  pushed-tree read/hash/import extraction. This is additive event metadata,
+  not persisted state. DO names remain `router-v2`, `trunk-v2`, and
+  `v2:comp-e<n>`: no state-shape change or migration requires `v2b`.
+- CONTRACTS' V2 inference bullet and changelog now restrict inference to
+  imports in files the entry changed since its `baseCommit`. This resolves
+  V4's inherited `src/ui/paywall.ts` / `charge` inference gap.
+
+### Commands and observed results
+
+| Command | Observed result |
+|---|---|
+| `node --experimental-strip-types --test test/v8.test.ts` (before production edits) | RED: 0/3 passed. Untouched `charge` inferred; missing paths inferred; diff failure inferred dependencies instead of recovering. |
+| `node --experimental-strip-types --test test/v8.test.ts test/v4-real-hasher.test.ts` | GREEN: 4/4 passed at that stage. Real edited checkout still inferred `createOrder`; untouched paywall did not infer `charge`. |
+| `npm test` in `app/control-plane` | Initial run: 158/159 passed; one old pure-machine fixture omitted the newly changed `other.ts` path. Corrected its explicit path set. Final: **161/161**, 0 failed/cancelled/skipped. |
+| `npm test` in `app/demo`, sequential x3 | **18/18** each; exit 0 each; 110.9 s, 103.1 s, 99.8 s. |
+| `npx tsc --noEmit` in `app/control-plane` | Exit 0, clean before deploy. Final `npx.cmd --no-install tsc --noEmit` also exit 0. |
+| `node --experimental-strip-types bench/v8-diff.ts` in `app/control-plane` | Six-file fixture, 1000 timed samples after 100 warmups: median 0.0053 ms, p95 0.0152 ms, max 0.7545 ms. Local comparison only, no network. |
+| `npx wrangler deploy` in `app/control-plane` | Exit 0; version `e72a037b-6c00-4edd-a933-d160f84d78e1`; existing CompiledWasm fallthrough warning only. |
+| `npm.cmd run demo -- --base https://arb-control-plane.lautitomasalejo.workers.dev --scenario main`, x2 | Exit 0 each; live results below. Admin key loaded from `.secret-admin-key`; value never printed. |
+| Same command with `--scenario failing-check` | Exit 0; observed failed check, fix, and all three retirements. |
+| Same command with `--scenario multi` | Exit 0; all five entries retired; component isolation and both chains' final trunk work verified. |
+| Live snapshot assertions | All four runs' entries retired; both main runs inferred exactly `createOrder` and `Cart`, had five judgments with clear/clear/clear/squash/squash, and all measured diff samples were below 300 ms. |
+| Secret scan of four run logs + 12 saved JSON snapshots/results | Passed, 16 files: zero admin/Jev key values, `art_v2_`, or `Bearer ` markers. |
+| `git diff --check` | Exit 0, clean. |
+
+Additional defensive tests cover original OID identity (even identical decoded
+source), added/deleted/mode-only paths, zero base blob reads, and missing base
+metadata. No tests were disabled or skipped; no coverage percentage is claimed.
+
+Setup-only failed invocations were corrected before the successful live batch:
+PowerShell's `npm.ps1` stripped demo flags (exit 2), and an overlapping demo-test
+run locked the shared `app/demo/tmp` directory (EBUSY, exit 1 before reset/live
+work). All three test runs finished before rerunning live sequentially using
+`npm.cmd`. A root-level `npm test` had no test script, and root-level `npx tsc`
+resolved the wrong compiler; package-local commands above are the actual proof.
+The first secret-scan read assumed UTF-8 logs; rerunning with UTF-16 BOM detection
+passed. None of these setup failures remained at closure.
+
+### Live table and final stats
+
+| Run | Exit | Wall | UI inferred symbols | squashes | earlyCutoffs | retired | checksRun | pushesSeen | predictionHits / Misses | judgments | semanticSquashes | inferredDeps |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| main #1 | 0 | 97.5 s | e19: createOrder, Cart | 4 | 5 | 3 | 4 | 10 | 1 / 0 | 5 | 2 | 2 |
+| main #2 | 0 | 88.6 s | e22: createOrder, Cart | 4 | 5 | 3 | 4 | 10 | 1 / 0 | 5 | 2 | 2 |
+| failing-check | 0 | 92.7 s | e25: createOrder, Cart | 4 | 5 | 3 | 5 | 11 | 1 / 0 | 5 | 2 | 2 |
+| multi | 0 | 77.5 s | declared consumers; no inference | 4 | 3 | 5 | 9 | 12 | 2 / 1 | 2 | 0 | 0 |
+
+`charge` is absent from both main UI entries' inferred symbols. Multi's legitimate
+**declared** payments consumer still judges `charge`; V8 does not disable it.
+
+`jev.judged` table for main (all symbols `createOrder`, model `jev-1.13.0`):
+
+| Run | UI / tests entry | Stub resolution (UI) | Refactor (UI / tests) | VAT behavior change (UI / tests) |
+|---|---|---|---|---|
+| main #1 | e19 / e20 | 0.20 clear | 0.02 clear / 0.02 clear | 0.94 squash / 0.97 squash |
+| main #2 | e22 / e23 | 0.24 clear | 0.02 clear / 0.02 clear | 0.94 squash / 0.97 squash |
+
+Judged producer commits (stub / refactor / VAT): main #1
+`d9136728` / `95997e9e` / `b1c596ef`; main #2
+`41fe086f` / `c81b282f` / `1137a8f3`.
+Failing-check had 0.24 clear (UI stub), 0.02 / 0.03 clear (UI/tests refactor),
+and 0.95 / 0.94 squash (UI/tests VAT). Multi had 0.08 clear for payments UI
+`charge` and 0.02 clear for orders tests `createOrder`.
+
+### Push-path diff cost / ~300 ms guard
+
+The deployed Worker's fixture pushes measured these complete incremental diff
+wall times, including actual Artifacts base metadata I/O:
+
+| Run | Diff samples (ms) | Maximum |
+|---|---|---|
+| main #1 | 92, 166, 126 | 166 ms |
+| main #2 | 146, 142, 108 | 146 ms |
+| failing-check | 94, 83, 72 | 94 ms |
+
+Both main runs' six samples had median **134 ms**, maximum **166 ms**;
+all nine measured samples stayed below the contract's approximately 300 ms guard.
+The local benchmark isolates comparison cost and is not presented as network
+latency. Larger trees and transient retries are not covered by this fixture
+measurement; no universal 300 ms guarantee is claimed.
+
+### Files changed and recovery
+
+- `app/CONTRACTS.md`
+- `app/control-plane/src/effects.ts`
+- `app/control-plane/src/ports.ts`
+- `app/control-plane/src/rob.ts`
+- `app/control-plane/test/v2.test.ts`
+- `app/control-plane/test/v3b.test.ts`
+- `app/control-plane/test/v4-real-hasher.test.ts`
+- `app/control-plane/test/v8.test.ts`
+- `app/control-plane/bench/v8-diff.ts`
+- `app/control-plane/NOTES.md`
+
+Run logs: `app/demo/tmp-v8-live-{main-1,main-2,failing-check,multi}.log`.
+Saved public events/state/results: `app/control-plane/tmp/v8/` (gitignored).
+No demo source or fixture changes. Existing untracked `.atl/` was untouched.
+No Cloudflare resources outside the authorized Worker/demo namespace were changed.
+No persistent-state migration; rollback was not needed because final main and
+failing-check runs passed. Remaining work: orchestrator review and commit.
+Engram tools were initially unavailable, then became exposed at closure.
+The V8 bugfix and verification evidence were saved under `arb/v8-inference-scope`
+for project `research-cloudflare`; this section remains the local recovery record.
+
+### Self-check
+
+Outcome: requested implementation, tests, deployed version, and live proof are
+present; no unresolved task blocker remains.
+
+| Axis | Score | Evidence / improvement |
+|---|---|---|
+| Accuracy | 4 | Tests and deployed snapshots agree; fixture timing does not prove larger-tree latency. |
+| Completeness | 4 | All requested scenarios passed; no coverage runner/percentage is available. |
+| Clarity | 4 | Results and raw timing are explicit; the full evidence section is longer than a quick handoff. |
+| Actionability | 4 | Uncommitted changes are ready for the orchestrator; remote deployment is already active. |
+| Conciseness | 4 | Detailed evidence is kept here; setup-error accounting adds length but prevents false proof. |
+
+Overall: 4.0/5. Improvements in priority order: keep demo tests and live runs
+sequential; use package-local Windows `.cmd` entry points; measure larger trees
+before extrapolating the fixture cost. The user can cross-check this assessment
+against the saved logs and snapshots.

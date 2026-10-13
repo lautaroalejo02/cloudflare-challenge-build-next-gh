@@ -9,6 +9,7 @@
 // emit visible `recover`/`retire.failed`/`check.failed` events, and the alarm
 // sweep re-issues whatever is still pending.
 
+import { createHash } from "node:crypto";
 import type { InterfaceHash } from "../../hasher/src/index.ts";
 import { errorText, withRetry } from "../../checker/src/retry.ts";
 import type { ArbEvent, CheckResult, Cmd, Effect, JudgeVerdict, RobState, SigField, SymbolHashes } from "./rob.ts";
@@ -337,15 +338,16 @@ async function runJudge(host: EffectHost, eff: Extract<Effect, { type: "judge" }
 	const selected = new Set<string>();
 	if (consumer) {
 		const commit = consumer.headCommit;
-		const files = commit ? await withRetry(() => host.ports.artifacts.readTree(consumer.repo, commit), { sleep: host.sleep }) : {};
-		const base = consumer.baseCommit ? await withRetry(() => host.ports.artifacts.readTree(consumer.repo, consumer.baseCommit), { sleep: host.sleep }) : {};
+		const oids: Record<string, string> = {};
+		const files = commit ? await withRetry(() => host.ports.artifacts.readTree(consumer.repo, commit, oids), { sleep: host.sleep }) : {};
+		const changed = await changedConsumerFiles(host, consumer.repo, consumer.baseCommit, files, oids);
 		const imports = (await host.ports.hasher.extractImports?.(files).catch(() => [])) ?? [];
 		for (const p of pairs) {
 			if (!p) continue;
 			const list: { file: string; code: string }[] = [];
 			for (const i of imports) {
 				if (!p.files.includes(i.from) || (!i.names.includes(p.symbol) && !i.names.includes("*"))) continue;
-				if (!Object.hasOwn(files, i.file) || files[i.file] === base[i.file] || list.some(u => u.file === i.file)) continue;
+				if (!Object.hasOwn(files, i.file) || !changed.has(i.file) || list.some(u => u.file === i.file)) continue;
 				if (!selected.has(i.file) && selected.size >= 4) continue;
 				selected.add(i.file);
 				list.push({ file: i.file, code: files[i.file].slice(0, JEV_USAGE_LIMIT) });
@@ -373,6 +375,26 @@ async function runJudge(host: EffectHost, eff: Extract<Effect, { type: "judge" }
 	);
 }
 
+/** Shared V3b usage / V8 inference diff. Real Artifacts reads supply original
+ * blob OIDs; source-only test ports use Git blob hashing. Deleted and mode-only
+ * paths cannot contribute imports. The base read is metadata-only in production. */
+export async function changedConsumerFiles(
+	host: EffectHost, repo: string, baseCommit: string,
+	files: Record<string, string>, headOids: Record<string, string> = {},
+): Promise<Set<string>> {
+	if (!baseCommit) throw new Error("base-unavailable");
+	const baseOids: Record<string, string> = {};
+	const base = await withRetry(() => host.ports.artifacts.readTree(repo, baseCommit, baseOids, true), { sleep: host.sleep });
+	const blob = (text: string) => createHash("sha1").update(`blob ${Buffer.byteLength(text)}\0`).update(text).digest("hex");
+	const changed = new Set<string>();
+	for (const [path, source] of Object.entries(files)) {
+		const before = baseOids[path] ?? (Object.hasOwn(base, path) ? blob(base[path]) : undefined);
+		const after = headOids[path] ?? blob(source);
+		if (before !== after) changed.add(path);
+	}
+	return changed;
+}
+
 /**
  * Build the machine `push` command for a queue/alarm push event, or null when
  * it is a no-op. Entry pushes are hashed here (rob.ts stays pure). Events can
@@ -390,10 +412,23 @@ export async function pushCommand(host: EffectHost, repo: string, commit: string
 	const entry = st.entries.find((e) => e.repo === repo || st._internal.pending[e.id] === repo);
 	if (!entry || entry.headCommit === commit || entry.status === "retired" || entry.status === "vetoed") return null;
 	const retry = { sleep: host.sleep };
-	const files = await withRetry(() => host.ports.artifacts.readTree(repo, commit), retry);
+	const oids: Record<string, string> = {};
+	const files = await withRetry(() => host.ports.artifacts.readTree(repo, commit, oids), retry);
 	const { exports, sigs, bodies, sources } = interfaceToMaps(await host.ports.hasher.hashInterface(files));
 	// (V2) Imports drive dependency inference; an absent/throwing extractor
 	// leaves the push import-less (v1 behavior).
+	let changedPaths: string[] | undefined;
+	let changedPathsMs: number | undefined;
+	if (entry.consumesInferred && host.ports.hasher.extractImports) {
+		const started = performance.now();
+		try { changedPaths = [...await changedConsumerFiles(host, repo, entry.baseCommit, files, oids)]; }
+		catch {
+			const result = host.apply({ type: "effect.failed", entryId: entry.id, effect: "inference-diff", reason: "inference-diff-failed" });
+			if (result.ok) await execEffects(host, result.effects);
+			changedPaths = [];
+		}
+		changedPathsMs = performance.now() - started;
+	}
 	const imports = await host.ports.hasher.extractImports?.(files).catch(() => undefined);
 	const head = (await withRetry(() => host.ports.artifacts.log(repo, 1), retry))[0]?.hash;
 	if (head && head !== commit) return null;
@@ -403,5 +438,5 @@ export async function pushCommand(host: EffectHost, repo: string, commit: string
 	// (V2) Persist the pushed declarations for Jev `before`/`after`; a
 	// storage failure degrades to unavailable judgments, never a lost push.
 	await storeSources(host, entry.id, sources, commit);
-	return { type: "push", repo, commit, exports, sigs, bodies, imports };
+	return { type: "push", repo, commit, exports, sigs, bodies, imports, changedPaths, changedPathsMs };
 }

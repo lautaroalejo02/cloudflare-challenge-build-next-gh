@@ -163,7 +163,7 @@ test("inference: a named import fills consumes with the forked hash and emits de
 	const s = inferredWorld();
 	const r = runEff(s, {
 		type: "push", repo: "arb-e2-ui-0", commit: "u1",
-		imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["createOrder"] }],
+		changedPaths: ["src/ui/checkout.ts"], imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["createOrder"] }],
 		exports: { createOrder: "h1", Order: "hO", checkoutPage: "u1" },
 		sigs: { createOrder: { signature: "sig1", file: "src/api/order.ts" }, checkoutPage: { signature: "sigU", file: "src/ui/checkout.ts" } },
 	});
@@ -178,7 +178,7 @@ test("inference: '*' expands to all of the producer's exports from that file", (
 	const s = inferredWorld();
 	const r = runEff(s, {
 		type: "push", repo: "arb-e2-ui-0", commit: "u1",
-		imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["*"] }],
+		changedPaths: ["src/ui/checkout.ts"], imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["*"] }],
 		exports: {},
 	});
 	const e2 = entry(r.state, "e2");
@@ -195,7 +195,7 @@ test("inference: an imported name the producer does not export is ignored", () =
 	const s = inferredWorld();
 	const r = runEff(s, {
 		type: "push", repo: "arb-e2-ui-0", commit: "u1",
-		imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["createOrder", "notExported"] }],
+		changedPaths: ["src/ui/checkout.ts"], imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["createOrder", "notExported"] }],
 		exports: {},
 	});
 	const e2 = entry(r.state, "e2");
@@ -208,12 +208,12 @@ test("inference: deps.inferred only fires for newly inferred names", () => {
 	let s = inferredWorld();
 	s = run(s, {
 		type: "push", repo: "arb-e2-ui-0", commit: "u1",
-		imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["createOrder"] }],
+		changedPaths: ["src/ui/checkout.ts"], imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["createOrder"] }],
 		exports: {},
 	});
 	const r = runEff(s, {
 		type: "push", repo: "arb-e2-ui-0", commit: "u2",
-		imports: [
+		changedPaths: ["src/ui/checkout.ts", "src/ui/other.ts"], imports: [
 			{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["createOrder"] },
 			{ file: "src/ui/other.ts", from: "src/api/order.ts", names: ["Order"] },
 		],
@@ -237,7 +237,7 @@ test("inference: a newly inferred name that drifted from the producer squashes i
 	// e2 now pushes work importing the drifted symbol: it forked against h1.
 	const r = runEff(s, {
 		type: "push", repo: "arb-e2-ui-0", commit: "u1",
-		imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["createOrder"] }],
+		changedPaths: ["src/ui/checkout.ts"], imports: [{ file: "src/ui/checkout.ts", from: "src/api/order.ts", names: ["createOrder"] }],
 		exports: {},
 		sigs: { createOrder: { signature: "sig1", file: "src/api/order.ts" } },
 	});
@@ -284,7 +284,7 @@ test("deps.undeclared: imports of another live entry's own files are reported on
 	// e2 pushes work importing e3's own file (a lateral, undeclared dep).
 	const r = runEff(s, {
 		type: "push", repo: "arb-e2-ui-0", commit: "u1",
-		imports: [{ file: "src/ui/checkout.ts", from: "src/svc/pay.ts", names: ["charge"] }],
+		changedPaths: ["src/ui/checkout.ts"], imports: [{ file: "src/ui/checkout.ts", from: "src/svc/pay.ts", names: ["charge"] }],
 		exports: {},
 	});
 	const evs = events(r.effects, "deps.undeclared");
@@ -294,7 +294,7 @@ test("deps.undeclared: imports of another live entry's own files are reported on
 	// Reported once: a second push re-importing the same file does not re-emit.
 	const r2 = runEff(r.state, {
 		type: "push", repo: "arb-e2-ui-0", commit: "u2",
-		imports: [{ file: "src/ui/checkout.ts", from: "src/svc/pay.ts", names: ["charge"] }],
+		changedPaths: ["src/ui/checkout.ts"], imports: [{ file: "src/ui/checkout.ts", from: "src/svc/pay.ts", names: ["charge"] }],
 		exports: {},
 	});
 	assert.equal(events(r2.effects, "deps.undeclared").length, 0);

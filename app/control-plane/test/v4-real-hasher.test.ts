@@ -59,7 +59,7 @@ test("V4 real hasher: src/ui/checkout.ts infers createOrder from src/api/order.t
 		fork: async (_f, to) => ({ name: to, remote: `https://x/${to}` }),
 		token: async (repo) => `tok-${repo}`,
 		log: async () => [{ hash: "u1" }],
-		readTree: async () => pushed,
+		readTree: async (_repo, commit) => commit === "t0" ? base : pushed,
 	};
 	const host: EffectHost = {
 		ports: { artifacts, hasher: { hashInterface, extractImports }, checker: {} as never, retirer: {} as never },
@@ -77,6 +77,7 @@ test("V4 real hasher: src/ui/checkout.ts infers createOrder from src/api/order.t
 
 	const r = run(state, cmd);
 	const e2 = r.state.entries.find((e) => e.id === "e2")!;
+	assert.equal(e2.consumes.charge, undefined, "untouched paywall imports are not inferred");
 	assert.equal(e2.consumes.createOrder, forked.exports.createOrder, "createOrder pinned at the forked hash");
 	const inferred = r.events.find((ev) => ev.type === "deps.inferred" && ev.entryId === "e2");
 	assert.ok(inferred, "deps.inferred emitted");

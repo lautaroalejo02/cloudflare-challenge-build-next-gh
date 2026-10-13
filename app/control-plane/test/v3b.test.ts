@@ -68,7 +68,7 @@ test("V3b inference uses the actual in-flight fork content baseline", () => {
     s._internal.pending.e2 = "c";
     run(s, { type: "push", repo: "p", commit: "A", exports: { s: "new", other: "h" } });
     run(s, { type: "fork.done", entryId: "e2", repo: "c", remote: "x", baseCommit: "p0", exports: { s: "h", other: "h" } });
-    run(s, { type: "push", repo: "c", commit: "C", exports: {}, imports: [{ file: "c.ts", from: "p.ts", names: ["s"] }] });
+    run(s, { type: "push", repo: "c", commit: "C", exports: {}, changedPaths: ["c.ts"], imports: [{ file: "c.ts", from: "p.ts", names: ["s"] }] });
     assert.equal(s.entries[1].diagnosis?.reason, "interface-changed");
 });
 test("V3b untouched trunk exports never imply undeclared ownership", () => {
@@ -78,7 +78,7 @@ test("V3b untouched trunk exports never imply undeclared ownership", () => {
         run(s, { type: "entry.create", agent: id, lane: id });
         run(s, { type: "fork.done", entryId: id, repo: id, remote: "x", baseCommit: "t0", exports: { inherited: "h" }, bodies: { inherited: "b" }, sigs: { inherited: { signature: "i()", file: "trunk.ts" } } });
     }
-    const eff = run(s, { type: "push", repo: "e2", commit: "C", exports: { inherited: "h" }, bodies: { inherited: "b" }, imports: [{ file: "c.ts", from: "trunk.ts", names: ["inherited"] }] });
+    const eff = run(s, { type: "push", repo: "e2", commit: "C", exports: { inherited: "h" }, bodies: { inherited: "b" }, changedPaths: ["c.ts"], imports: [{ file: "c.ts", from: "trunk.ts", names: ["inherited"] }] });
     assert.equal(events(eff, "deps.undeclared").length, 0);
 });
 test("V3b undeclared reports exclude untouched names in another entry's changed file", () => {
@@ -86,14 +86,14 @@ test("V3b undeclared reports exclude untouched names in another entry's changed 
     run(s, { type: "entry.create", agent: "other", lane: "other" });
     run(s, { type: "fork.done", entryId: "e3", repo: "other", remote: "x", baseCommit: "t0", exports: { untouched: "h", changed: "h" }, sigs: { untouched: { signature: "u()", file: "shared.ts" }, changed: { signature: "c()", file: "shared.ts" } } });
     run(s, { type: "push", repo: "other", commit: "O", exports: { untouched: "h", changed: "new" } });
-    const eff = run(s, { type: "push", repo: "c", commit: "C", exports: {}, imports: [{ file: "c.ts", from: "shared.ts", names: ["untouched"] }] });
+    const eff = run(s, { type: "push", repo: "c", commit: "C", exports: {}, changedPaths: ["c.ts"], imports: [{ file: "c.ts", from: "shared.ts", names: ["untouched"] }] });
     assert.equal(events(eff, "deps.undeclared").length, 0);
 });
 test("V3b prototype-named exports are inferred as own properties", () => {
     const s = world(true);
     run(s, { type: "push", repo: "p", commit: "A", exports: { constructor: "hc", toString: "ht" }, sigs: { constructor: { signature: "c()", file: "p.ts" }, toString: { signature: "t()", file: "p.ts" } } });
     run(s, { type: "fork.done", entryId: "e2", repo: "c", remote: "x", baseCommit: "A", exports: { constructor: "hc", toString: "ht" } });
-    run(s, { type: "push", repo: "c", commit: "C", exports: {}, imports: [{ file: "c.ts", from: "p.ts", names: ["constructor", "toString"] }] });
+    run(s, { type: "push", repo: "c", commit: "C", exports: {}, changedPaths: ["c.ts"], imports: [{ file: "c.ts", from: "p.ts", names: ["constructor", "toString"] }] });
     assert.deepEqual(Object.keys(s.entries[1].consumes), ["constructor", "toString"]);
 });
 test("V3b apply hot path preserves stats and never iterates all entries", () => {
@@ -231,7 +231,7 @@ test("V3b consumers infer __proto__ as a symbol, not their object prototype", ()
     const hashes = Object.fromEntries([["__proto__", "hp"]]);
     run(s, { type: "push", repo: "p", commit: "A", exports: hashes, sigs: Object.fromEntries([["__proto__", { signature: "p()", file: "p.ts" }]]) });
     run(s, { type: "fork.done", entryId: "e2", repo: "c", remote: "x", baseCommit: "A", exports: hashes });
-    run(s, { type: "push", repo: "c", commit: "C", exports: {}, imports: [{ file: "c.ts", from: "p.ts", names: ["__proto__"] }] });
+    run(s, { type: "push", repo: "c", commit: "C", exports: {}, changedPaths: ["c.ts"], imports: [{ file: "c.ts", from: "p.ts", names: ["__proto__"] }] });
     assert.ok(Object.hasOwn(s.entries[1].consumes, "__proto__"));
     assert.equal(s.entries[1].consumes.__proto__, "hp");
     assert.equal(Object.getPrototypeOf(s.entries[1].consumes), Object.prototype);
@@ -246,7 +246,7 @@ test("V3b duplicate export names retain every declaring file for inference", () 
     const symbols = ["first.ts", "second.ts"].map(file => ({ name: "s", kind: "function" as const, hash: "h", signature: "s()", file, bodyHash: "b", source: "BODY" }));
     const maps = interfaceToMaps({ hash: "h", symbols });
     run(s, { type: "push", repo: "p", commit: "A", exports: maps.exports, sigs: maps.sigs, bodies: maps.bodies });
-    run(s, { type: "push", repo: "c", commit: "C", exports: {}, imports: [{ file: "c.ts", from: "first.ts", names: ["s"] }] });
+    run(s, { type: "push", repo: "c", commit: "C", exports: {}, changedPaths: ["c.ts"], imports: [{ file: "c.ts", from: "first.ts", names: ["s"] }] });
     assert.ok(Object.hasOwn(s.entries[1].consumes, "s"));
     assert.deepEqual(s._internal.files.e1.s, ["first.ts", "second.ts"]);
 });

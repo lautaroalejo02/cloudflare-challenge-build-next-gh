@@ -373,6 +373,10 @@ export type Cmd =
 			sigs?: SigField;
 			/** (V2) Import edges of the pushed tree (hasher `extractImports`). */
 			imports?: ImportRef[];
+			/** Added/modified importing files versus baseCommit, by blob OID. Missing = no inference. */
+			changedPaths?: string[];
+			/** Diff wall time, including base metadata reads, for the push-cost guard. */
+			changedPathsMs?: number;
 			/** (V2) Exported symbol -> bodyHash of the pushed content. */
 			bodies?: SymbolHashes;
 	  }
@@ -1066,7 +1070,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			emit(state, effects, now, {
 				type: "push",
 				entryId: target.id,
-				data: { repo: cmd.repo, commit: cmd.commit },
+				data: { repo: cmd.repo, commit: cmd.commit, ...(cmd.changedPathsMs !== undefined ? { inferenceDiffMs: cmd.changedPathsMs } : {}) },
 			});
 			// (V2) Dependency inference: an entry registered without `consumes`
 			// fills it from imports of the producer's declaring files, pinned to
@@ -1074,7 +1078,8 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			// inferred name that already drifted squashes immediately.
 			let inferredDrift: Diagnosis["changed"] = [];
 			const pushProducer = target.producerId ? find(state, target.producerId) : undefined;
-			if (cmd.imports && target.consumesInferred && pushProducer) {
+			if (cmd.imports && cmd.changedPaths && target.consumesInferred && pushProducer) {
+				const changed = new Set(cmd.changedPaths);
 				const prodFiles = state._internal.files[pushProducer.id] ?? {};
 				const symsByFile = new Map<string, string[]>();
 				for (const [sym, files] of Object.entries(prodFiles)) {
@@ -1087,6 +1092,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				}
 				const inferred: SymbolHashes = {};
 				for (const imp of cmd.imports) {
+					if (!changed.has(imp.file)) continue;
 					const here = symsByFile.get(imp.from);
 					if (!here) continue;
 					for (const n of imp.names.includes("*") ? here : imp.names) {

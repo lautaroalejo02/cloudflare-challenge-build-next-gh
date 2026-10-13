@@ -34,8 +34,9 @@ export interface ArtifactsPort {
 	token(repo: string, ttlSeconds: number): Promise<string>;
 	/** Newest-first commit metadata; empty array if the ref cannot be resolved. */
 	log(repo: string, limit: number, ref?: string): Promise<CommitMeta[]>;
-	/** All `.ts` files at `commit`: path -> source text. */
-	readTree(repo: string, commit: string): Promise<Record<string, string>>;
+	/** All `.ts` files at `commit`: path -> source text. Optional OID collector
+	 * preserves original blob identity; metadataOnly reads no blobs. */
+	readTree(repo: string, commit: string, blobOids?: Record<string, string>, metadataOnly?: boolean): Promise<Record<string, string>>;
 }
 
 // --- Hasher -----------------------------------------------------------------
@@ -281,29 +282,34 @@ export function realArtifacts(artifacts: ArtifactsBinding): ArtifactsPort {
 				await dispose(repo);
 			}
 		},
-		async readTree(repoName, commit) {
+		async readTree(repoName, commit, blobOids, metadataOnly = false) {
 			const repo = await artifacts.get(repoName);
 			try {
 				const out: Record<string, string> = {};
 				const walk = async (treeHash: string, prefix: string): Promise<void> => {
 					const children = await repo.readTree(treeHash);
-					if (!children) return;
+					if (!children) throw new Error("tree-unavailable");
 					for (const child of children) {
 						const name = entryPath(child);
 						const hash = entryHash(child);
-						if (!name) continue;
+						if (!name || !hash) throw new Error("tree-entry-unavailable");
 						const path = prefix ? `${prefix}/${name}` : name;
 						if (isTreeEntry(child)) {
 							if (hash) await walk(hash, path);
 						} else if (path.endsWith(".ts") && hash) {
-							const blob = await repo.readBlob(hash);
-							if (blob) out[path] = await blob.text();
+							if (blobOids) blobOids[path] = hash;
+							if (!metadataOnly) {
+								const blob = await repo.readBlob(hash);
+								if (!blob) throw new Error("blob-unavailable");
+								out[path] = await blob.text();
+							}
 						}
 					}
 				};
 				const commitMeta = await repo.readCommit(commit);
 				const treeHash = commitMeta?.treeHash;
-				if (treeHash) await walk(treeHash, "");
+				if (!treeHash) throw new Error("commit-unavailable");
+				await walk(treeHash, "");
 				return out;
 			} finally {
 				await dispose(repo);
