@@ -6,6 +6,16 @@ export interface SymbolSignature {
   kind: "function" | "type" | "interface" | "class" | "const";
   signature: string;
   hash: string;
+  // (V2)
+  file: string; // repo-relative path of the declaring file
+  bodyHash: string; // sha256(normalized FULL declaration incl. bodies)[0:12]
+  source: string; // raw declaration text as written, truncated to 4000 chars
+}
+
+export interface ImportRef {
+  file: string; // importing file, repo-relative
+  from: string; // relative specifiers resolved to a repo-relative path; bare specifiers kept as written
+  names: string[]; // binding names as exported by `from`; "default" / "*"; [] for side-effect imports
 }
 
 export interface InterfaceHash {
@@ -104,7 +114,7 @@ function isPunct(ch: string): boolean {
   return !/[A-Za-z0-9_$]/.test(ch);
 }
 
-function canon(node: Node): string {
+function canon(node: Node, includeBodies = false): string {
   let out = "";
   const visit = (n: Node): void => {
     if (SKIP_NODES.has(n.type)) return;
@@ -120,7 +130,7 @@ function canon(node: Node): string {
     const bodied = BODIED.has(n.type);
     for (let i = 0; i < n.childCount; i++) {
       const c = n.child(i)!;
-      if (bodied && n.fieldNameForChild(i) === "body") continue;
+      if (bodied && !includeBodies && n.fieldNameForChild(i) === "body") continue;
       visit(c);
     }
   };
@@ -358,24 +368,31 @@ function interfaceSignature(iface: Node): string {
   return `${head}{${members}}`;
 }
 
-function declaratorSignature(decl: Node, kw: string): { name: string; kind: SymbolSignature["kind"]; signature: string } | null {
+interface DeclSym {
+  name: string;
+  kind: SymbolSignature["kind"];
+  signature: string;
+  node: Node; // (V2) declaration node the FULL canon (bodyHash) is computed over
+}
+
+function declaratorSignature(decl: Node, kw: string): DeclSym | null {
   const nameNode = decl.childForFieldName("name");
   if (!nameNode) return null;
   const name = nameNode.type === "identifier" ? nameNode.text : canon(nameNode);
   const init = decl.childForFieldName("value");
   if (init && (init.type === "arrow_function" || init.type === "function_expression")) {
-    return { name, kind: "function", signature: fnSignature(name, init) };
+    return { name, kind: "function", signature: fnSignature(name, init), node: decl };
   }
   const t =
     annotType(decl.childForFieldName("type")) ?? inferExprType(init);
-  return { name, kind: "const", signature: `${kw} ${name}:${t}` };
+  return { name, kind: "const", signature: `${kw} ${name}:${t}`, node: decl };
 }
 
-// One exported declaration -> zero or more {name, kind, signature} symbols.
+// One exported declaration -> zero or more {name, kind, signature, node} symbols.
 function declSymbols(
   decl: Node,
   exportName: string | null,
-): Array<{ name: string; kind: SymbolSignature["kind"]; signature: string }> {
+): DeclSym[] {
   const d =
     decl.type === "ambient_declaration"
       ? (decl.children.find((c) => c.childCount > 0) ?? decl)
@@ -385,7 +402,7 @@ function declSymbols(
     case "generator_function_declaration":
     case "function_signature": {
       const name = d.childForFieldName("name")?.text ?? exportName ?? "default";
-      return [{ name, kind: "function", signature: fnSignature(name, d) }];
+      return [{ name, kind: "function", signature: fnSignature(name, d), node: d }];
     }
     case "variable_declarator": {
       const parent = d.parent;
@@ -414,6 +431,7 @@ function declSymbols(
           name: d.childForFieldName("name")?.text ?? exportName ?? "default",
           kind: "interface",
           signature: interfaceSignature(d),
+          node: d,
         },
       ];
     case "type_alias_declaration": {
@@ -421,7 +439,7 @@ function declSymbols(
       const value = d.childForFieldName("value");
       const tp = d.childForFieldName("type_parameters");
       const head = `type ${name}${tp ? canon(tp) : ""}`;
-      return [{ name, kind: "type", signature: `${head}=${value ? canon(value) : "unknown"}` }];
+      return [{ name, kind: "type", signature: `${head}=${value ? canon(value) : "unknown"}`, node: d }];
     }
     case "enum_declaration": {
       const name = d.childForFieldName("name")?.text ?? exportName ?? "default";
@@ -432,12 +450,12 @@ function declSymbols(
             .map(canon)
             .join(",")
         : "";
-      return [{ name, kind: "type", signature: `enum ${name}{${members}}` }];
+      return [{ name, kind: "type", signature: `enum ${name}{${members}}`, node: d }];
     }
     case "class_declaration":
     case "abstract_class_declaration": {
       const name = d.childForFieldName("name")?.text ?? exportName ?? "default";
-      return [{ name, kind: "class", signature: classSignature(d, name) }];
+      return [{ name, kind: "class", signature: classSignature(d, name), node: d }];
     }
     default:
       return [
@@ -445,6 +463,7 @@ function declSymbols(
           name: d.childForFieldName("name")?.text ?? exportName ?? "default",
           kind: "type",
           signature: canon(d),
+          node: d,
         },
       ];
   }
@@ -460,6 +479,9 @@ interface Sym {
   name: string;
   kind: SymbolSignature["kind"];
   signature: string;
+  file: string; // (V2) repo-relative path of the declaring file
+  declNode: Node; // (V2) node bodyHash is computed over
+  source: string; // (V2) raw declaration text incl. `export` + attached docs
 }
 
 function normalizePath(p: string): string {
@@ -522,7 +544,8 @@ function collectExports(
 ): Sym[] {
   if (visiting.has(path)) return [];
   visiting.add(path);
-  const tree = parser.parse(files[path]);
+  const sourceText = files[path];
+  const tree = parser.parse(sourceText);
   const top = tree!.rootNode.children;
 
   const locals = new Map<string, Node>();
@@ -530,10 +553,45 @@ function collectExports(
     if (TOP_DECLS.has(node.type)) indexDecl(node, locals);
   }
 
+  // The top-level statement containing a declaration node (for `export {x}`
+  // of a local decl, where source is the decl statement, not the export).
+  const topLevelOf = (n: Node): Node => {
+    let s = n;
+    while (s.parent && s.parent.type !== "program") s = s.parent;
+    return s;
+  };
+
+  // Raw source of a top-level node, prefixed by any contiguous run of
+  // immediately preceding comments (JSDoc or line docs). A comment is
+  // attached only when nothing but whitespace separates it from the node and
+  // the gap contains no blank line. Truncated to 4000 chars.
+  const withDocs = (n: Node): string => {
+    let start = n.startIndex;
+    let i = top.findIndex((t) => t.id === n.id);
+    if (i < 0) i = top.findIndex((t) => t.startIndex === n.startIndex && t.endIndex === n.endIndex);
+    while (i > 0) {
+      const prev = top[i - 1];
+      if (prev.type !== "comment") break;
+      const gap = sourceText.slice(prev.endIndex, start);
+      if (/\S/.test(gap) || /\n\s*\n/.test(gap)) break;
+      start = prev.startIndex;
+      i--;
+    }
+    return sourceText.slice(start, n.endIndex).slice(0, 4000);
+  };
+
   const syms: Sym[] = [];
-  const pushDecl = (decl: Node, exportName: string | null): void => {
+  const pushDecl = (decl: Node, exportName: string | null, srcNode: Node): void => {
+    const src = withDocs(srcNode);
     for (const s of declSymbols(decl, exportName)) {
-      syms.push({ name: s.name, kind: s.kind, signature: s.signature });
+      syms.push({
+        name: s.name,
+        kind: s.kind,
+        signature: s.signature,
+        file: path,
+        declNode: s.node,
+        source: src,
+      });
     }
   };
 
@@ -569,8 +627,16 @@ function collectExports(
         }
         const decl = locals.get(local);
         if (decl) {
+          const src = withDocs(topLevelOf(decl));
           for (const s of declSymbols(decl, local)) {
-            syms.push({ ...s, name: exported });
+            syms.push({
+              name: exported,
+              kind: s.kind,
+              signature: s.signature,
+              file: path,
+              declNode: s.node,
+              source: src,
+            });
           }
         }
       }
@@ -581,7 +647,7 @@ function collectExports(
       const isDefault = node.children.some(
         (c) => c.childCount === 0 && c.text === "default",
       );
-      pushDecl(decl, isDefault ? "default" : null);
+      pushDecl(decl, isDefault ? "default" : null, node);
       continue;
     }
     if (node.children.some((c) => c.childCount === 0 && c.text === "default")) {
@@ -595,6 +661,9 @@ function collectExports(
           name: "default",
           kind: "const",
           signature: `const default:${inferExprType(expr)}`,
+          file: path,
+          declNode: expr,
+          source: withDocs(node),
         });
       }
     }
@@ -635,6 +704,9 @@ export async function hashInterface(
         kind: s.kind,
         signature: s.signature,
         hash: await sha256_12(s.signature),
+        file: s.file,
+        bodyHash: await sha256_12(canon(s.declNode, true)),
+        source: s.source.slice(0, 4000),
       });
     }
   }
@@ -643,4 +715,75 @@ export async function hashInterface(
   );
   const normalized = symbols.map((s) => `${s.name} ${s.signature}`).join("\n");
   return { hash: await sha256_12(normalized), symbols };
+}
+
+// ---------------------------------------------------------------------------
+// (V2) Import extraction, for dependency inference. Same tree-sitter parse;
+// one ImportRef per import statement / `export ... from` statement, in file
+// order. Relative specifiers are resolved by pure path math against the
+// importing file's directory (the target does not have to be in `files`);
+// the extension is kept as written. Bare specifiers pass through unchanged.
+// ---------------------------------------------------------------------------
+
+function stripQuotes(text: string): string {
+  return text.length >= 2 ? text.slice(1, -1) : text;
+}
+
+function resolveSpecifier(spec: string, importer: string): string {
+  if (!spec.startsWith(".")) return spec;
+  const dir = importer.split("/").slice(0, -1).join("/");
+  return normalizePath(dir === "" ? spec : `${dir}/${spec}`);
+}
+
+function moduleSpec(node: Node): string | null {
+  const source = node.childForFieldName("source") ?? node.children.find((c) => c.type === "string");
+  return source ? stripQuotes(source.text) : null;
+}
+
+export async function extractImports(
+  files: Record<string, string>,
+): Promise<ImportRef[]> {
+  const parser = await getParser();
+  const refs: ImportRef[] = [];
+  for (const path of Object.keys(files).sort()) {
+    const src = files[path];
+    if (src === undefined) continue;
+    const top = parser.parse(src)!.rootNode.children;
+    for (const node of top) {
+      if (node.type === "import_statement") {
+        const spec = moduleSpec(node);
+        if (spec === null) continue;
+        const names: string[] = [];
+        const clause = node.children.find((c) => c.type === "import_clause");
+        for (const c of clause?.children ?? []) {
+          if (c.type === "identifier") names.push("default");
+          else if (c.type === "namespace_import") names.push("*");
+          else if (c.type === "named_imports") {
+            for (const sp of c.children) {
+              if (sp.type !== "import_specifier") continue;
+              const n = sp.childForFieldName("name")?.text;
+              if (n) names.push(n);
+            }
+          }
+        }
+        refs.push({ file: path, from: resolveSpecifier(spec, path), names });
+        continue;
+      }
+      if (node.type !== "export_statement") continue;
+      const spec = moduleSpec(node);
+      if (spec === null) continue; // no `from`: `export {x}` / `export <decl>` are not imports
+      const names: string[] = [];
+      if (node.children.some((c) => c.childCount === 0 && c.text === "*")) {
+        names.push("*"); // `export * from` and `export * as ns from`
+      }
+      const clause = node.children.find((c) => c.type === "export_clause");
+      for (const sp of clause?.children ?? []) {
+        if (sp.type !== "export_specifier") continue;
+        const n = sp.childForFieldName("name")?.text;
+        if (n) names.push(n);
+      }
+      refs.push({ file: path, from: resolveSpecifier(spec, path), names });
+    }
+  }
+  return refs;
 }

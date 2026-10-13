@@ -93,6 +93,53 @@ npm run tail:test-worker      # wrangler tail arb-test-hasher --format json
   took 20.7 s end-to-end with a normal 33 ms cpuTime (edge/network transient,
   consistent with the spike-noted 1042/1104-class flakiness).
 
+## V2 (extractImports + file/bodyHash/source)
+
+Implemented per CONTRACTS.md "(V2)" additions, additive only — every v1 hash
+value is unchanged (base still `f9916f523525`, all per-symbol hashes and the
+aggregate identical; the v1 checks run unmodified and green).
+
+- `file`: repo-relative key of the file where the declaration physically
+  lives. For `export {x} from`/`export * from` re-exports this is the TARGET
+  file, not the re-exporting one.
+- `bodyHash`: `sha256(canon(declNode, includeBodies=true))[0:12]` — the same
+  `canon` walk as the interface hash (comments/decorators dropped, whitespace
+  reconstructed, `;` dropped, `,` dropped inside interface/object/enum/class
+  bodies) but function bodies, const initializers and all class member bodies
+  are emitted. For multi-declarator statements (`const a=1,b=2`) each symbol's
+  bodyHash covers only its own declarator. Whole-declaration coverage means
+  private/`#` member bodies DO count (a private body change is a behavior
+  change; the interface hash still ignores them).
+- `source`: raw text of the top-level statement carrying the declaration
+  (the `export_statement` when exported via `export <decl>`, so a leading
+  `export`/`export default` is included; for `export {x}` of a local decl the
+  bare declaration statement, which has no export keyword). Any contiguous
+  run of immediately preceding comments is prepended, where "attached" means
+  only whitespace between siblings and no blank line in the gap — so a
+  trailing `// note` on the previous line also attaches. Truncated to 4000
+  chars (applied at extraction AND at output).
+- `extractImports(files)`: one `ImportRef` per `import_statement` and per
+  `export_statement` that has a `from` source, in per-file source order,
+  files iterated in sorted-key order. `import type` names are included.
+  `{a as b}` reports `a` (the name as exported by `from`, per contract).
+  `export * as ns from` reports `"*"`, same as `export * from`. Side-effect
+  imports produce `names: []`. Two statements importing the same module
+  produce two refs (not merged — downstream can merge on `(file, from)`).
+  Relative specifiers (`./`, `../`) are resolved by pure path normalization
+  against the importing file's directory — the target need not exist in
+  `files` and no extension guessing happens (extension kept as written).
+  Bare specifiers (`node:fs`, `react`, `#alias`) pass through unchanged.
+  Not covered (out of scope): dynamic `import()`, `import x = require()`,
+  `export =`.
+- Worker-safe: `src/` still uses only `crypto.subtle`, `TextEncoder` and
+  web-tree-sitter — no Node APIs.
+
+Perf on the demo fixture (6 files, best-of-5, Node test runner):
+`hashInterface` = 4.8 ms; `hashInterface` + `extractImports` = 5.6 ms →
+1.18x, well under the ~2x budget (extractImports adds one parse + a cheap
+top-level walk per file; bodyHash adds one extra canon walk + sha256 per
+symbol inside hashInterface).
+
 ## Contract issues
 
 None. The contract's `files` map (path→source) works cleanly; re-export
