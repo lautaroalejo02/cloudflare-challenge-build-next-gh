@@ -82,5 +82,10 @@ Route declaration: T2-T7 are delegated because each package is non-trivial and t
 
 - 2026-10-13: T2-T7 complete and pushed to `origin/feat/agent-reorder-buffer` (remote set by the user). T8, T9a and T9b dispatched in parallel.
 
+- 2026-10-13 ~08:00 UTC: Devin's free SWE-2 hit its rate limit ("Reached free model rate limit", reset 08:36 UTC). It cut T11 and T12 mid-task, and T11's partial work in `rob.ts`/`rob.test.ts` is uncommitted.
+  - T12 was handed to a Claude subagent (bench/** only).
+  - T11 resumes automatically at 08:38 UTC with SWE-2 max (`odd/prompts/T11b-resume.md`).
+  - SWE-2 is NOT unlimited: pace parallel SWE-2 runs.
+
 ## Next step
 Review T8 (live E2E), T9a and T9b. Redeploy the control plane with the polished dashboard. Final verification (T10).
