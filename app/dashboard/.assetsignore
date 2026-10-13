@@ -1,0 +1,8 @@
+recordings/
+screenshots/
+scripts/
+test/
+node_modules/
+package.json
+package-lock.json
+NOTES.md
