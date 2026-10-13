@@ -88,7 +88,11 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
   - Root cause of the flake: a stale `failed` verdict was read before the re-check ran on the fix commit.
   - Parent spot check: `npm test` 3/3 runs 12/12; live main exit 0 with prediction 2/1, early cutoffs 2, squashes 3, retired 3.
   - Tagged `demo-stable-1`; known-good Worker version `a1c784f2-456f-4920-a790-2de3277d7e3b`.
-- [ ] T16 (D) Record live dashboard footage (playwright video) for the submission video. Dispatched (`odd/prompts/T16-footage.md`).
+- [x] T16 (D) Record live dashboard footage. Commit `9d2a236`.
+  - Takes: main, multi, multi-720, failing-check. The `.webm` files are LOCAL ONLY (gitignored, 16-30 MB each) in `app/dashboard/recordings/`; timelines are committed.
+  - Parent check: ffprobe main.webm = 86.9 s; no tokens in the timelines.
+  - Found defect: cross-component splice-candidate race on the shared trunk can wedge a component (`retiring` never cleared). The recording avoided it with `--delay-ready e5:30000` (workaround).
+- [ ] T17 (D) Fix the trunk retirement race: atomic per-attempt retire inside ArbTrunk, bounded rebuild, never wedge. Prove it with 5 consecutive live multi runs without a delay. Dispatched (`odd/prompts/T17-trunk-race.md`) with a rollback safety net to `demo-stable-2`.
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
 Route declaration: T2-T7 are delegated because each package is non-trivial and the six run in parallel in disjoint directories. That is the writer trigger plus the user's explicit request to use many Devin agents. T8 and T9 each go to one writer, because they touch multiple packages.
