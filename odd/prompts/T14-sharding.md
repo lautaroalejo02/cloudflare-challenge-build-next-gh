@@ -42,3 +42,11 @@ Read `app/control-plane/bench/RESULTS.md`. In the pure state machine `src/rob.ts
 ## Verification
 - All package test suites are green: control-plane, demo, dashboard. Run `npm test` in `app/demo` 3 times.
 - Report the 3 live scenario results with their stats.
+
+## Safety net
+- Last known-good state: git tag `demo-stable-1`, and deployed control-plane version `a1c784f2-456f-4920-a790-2de3277d7e3b`.
+- If, at the end of your time box, the main and failing-check live scenarios do not both pass with your changes:
+  1. Roll the Worker back with `npx wrangler rollback a1c784f2-456f-4920-a790-2de3277d7e3b` (from `app/control-plane`).
+  2. Confirm the main scenario passes again live.
+  3. Report `partial` with exact blockers. Leave your source changes in place for the orchestrator to review; do not use git to revert.
+- The demo working end to end matters more than sharding.
