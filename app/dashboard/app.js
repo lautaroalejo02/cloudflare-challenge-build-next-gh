@@ -24,35 +24,20 @@
     document.body.classList.add('arb');
     document.body.innerHTML =
       '<header class="topbar">' +
-      '  <div class="brand">AGENT&nbsp;REORDER&nbsp;BUFFER' +
-      '    <span class="brand-sub">speculative forwarding · out-of-order agents</span>' +
-      (MOCK ? '    <span class="mock-chip">MOCK REPLAY</span>' : '') +
+      '  <div class="brand"><h1>ARB</h1><span class="brand-sub">Agent Reorder Buffer</span>' +
+      (MOCK ? '    <span class="mock-chip">Mock replay</span>' : '') +
       '  </div>' +
       '  <div class="top-right">' +
-      (MOCK ? '    <button id="replay" class="btn">↺ replay</button>' : '') +
       '    <div class="conn"><span id="conn-dot" class="dot"></span><span id="conn-text">connecting</span></div>' +
+      (MOCK ? '    <button id="replay" class="btn">Replay</button>' : '') +
       '  </div>' +
       '</header>' +
-      '<div class="statsbar" id="statsbar">' +
-      '  <div class="stat"><span class="stat-num" id="s-squashes">0</span><span class="stat-label">squashes</span></div>' +
-      '  <div class="stat"><span class="stat-num" id="s-cutoffs">0</span><span class="stat-label">early cutoffs</span></div>' +
-      '  <div class="stat"><span class="stat-num pred" id="s-pred">0 hit / 0 miss</span><span class="stat-label">stub predictions</span></div>' +
-      '  <div class="stat"><span class="stat-num" id="s-retired">0</span><span class="stat-label">retired</span></div>' +
-      '  <div class="stat"><span class="stat-num" id="s-checks">0</span><span class="stat-label">checks run</span></div>' +
-      '  <div class="stat"><span class="stat-num" id="s-pushes">0</span><span class="stat-label">pushes seen</span></div>' +
-      '  <div class="stat"><span class="stat-num" id="s-reforkt">—</span><span class="stat-label">re-fork ready</span></div>' +
-      '  <div class="controls">' +
-      '    <label for="robsize">robSize</label>' +
-      (CAN_CONTROL
-        ? '    <input type="range" id="robsize" min="1" max="16" step="1" value="8">'
-        : '') +
-      '    <span id="robsize-val" class="mono">8</span>' +
-      '  </div>' +
-      '</div>' +
       '<main class="main">' +
-      '  <section class="pipeline" id="pipeline">' +
-      '    <svg id="links" class="links"></svg>' +
-      '    <div id="lanes" class="lanes"></div>' +
+      '  <section class="pipeline-shell" aria-label="Reorder buffer">' +
+      '    <div class="pipeline-heading"><h2>Reorder buffer</h2><span>Speculative execution · ordered retirement</span></div>' +
+      '    <div class="pipeline" id="pipeline"><div class="buffer-diagram">' +
+      '    <div class="link-layer"><svg id="links" class="links" aria-hidden="true"></svg></div>' +
+      '    <div id="lanes" class="lanes"></div></div></div>' +
       '    <div id="trunk" class="trunk">' +
       '      <span class="trunk-label" id="trunk-anchor">TRUNK</span>' +
       '      <span class="mono" id="trunk-repo">arb-trunk</span>' +
@@ -61,8 +46,24 @@
       '      <div class="trunk-chips" id="trunk-chips"></div>' +
       '    </div>' +
       '  </section>' +
-      '  <aside class="logpanel"><h2>event log</h2><div id="log" class="log"></div></aside>' +
-      '</main>';
+      '  <aside class="logpanel" aria-labelledby="log-heading"><h2 id="log-heading">Event log</h2><div id="log" class="log"></div></aside>' +
+      '</main>' +
+      '<footer class="statsbar" id="statsbar" aria-label="Execution statistics">' +
+      '  <div class="stat"><span class="stat-label">Squashes</span><span class="stat-num" id="s-squashes">0</span></div>' +
+      '  <div class="stat"><span class="stat-label">Early cutoffs</span><span class="stat-num" id="s-cutoffs">0</span></div>' +
+      '  <div class="stat"><span class="stat-label">Stub predictions</span><span class="stat-num pred" id="s-pred">0 hit / 0 miss</span></div>' +
+      '  <div class="stat"><span class="stat-label">Retired</span><span class="stat-num" id="s-retired">0</span></div>' +
+      '  <div class="stat"><span class="stat-label">Checks run</span><span class="stat-num" id="s-checks">0</span></div>' +
+      '  <div class="stat"><span class="stat-label">Pushes seen</span><span class="stat-num" id="s-pushes">0</span></div>' +
+      '  <div class="stat"><span class="stat-label">Re-fork ready</span><span class="stat-num" id="s-reforkt">—</span></div>' +
+      '  <div class="controls">' +
+      '    <label for="robsize">robSize</label>' +
+      (CAN_CONTROL
+        ? '    <input type="range" id="robsize" min="1" max="16" step="1" value="8">'
+        : '') +
+      '    <span id="robsize-val" class="mono">8</span>' +
+      '  </div>' +
+      '</footer>';
 
     el.lanes = document.getElementById('lanes');
     el.links = document.getElementById('links');
@@ -180,7 +181,7 @@
 
     var html = '';
     if (!live.length) {
-      html = '<div class="empty">buffer empty — waiting for agents…</div>';
+      html = '<div class="empty"><strong>Buffer empty</strong><span>Waiting for agents to enter speculative execution.</span></div>';
     }
     lanes.forEach(function (lane) {
       html += '<div class="lane"><div class="lane-label">' + esc(lane) + '</div><div class="lane-rows">';
@@ -248,8 +249,8 @@
         ' · ' + baseLabel + ' @ ' + c7(e.diagnosis.producerCommit) + '</div>';
       (e.diagnosis.changed || []).slice(0, 2).forEach(function (c) {
         diag += '<div class="diag-sym mono">' + esc(c.symbol) + '  ' + h4(c.oldHash) + ' → ' + h4(c.newHash) + '</div>' +
-          (c.oldSignature ? '<div class="diag-sig old mono">− ' + esc(c.oldSignature) + '</div>' : '') +
-          (c.newSignature ? '<div class="diag-sig new mono">+ ' + esc(c.newSignature) + '</div>' : '');
+          (c.oldSignature ? '<div class="diag-sig old mono"><span class="sig-label">Previous</span> ' + esc(c.oldSignature) + '</div>' : '') +
+          (c.newSignature ? '<div class="diag-sig new mono"><span class="sig-label">Current</span> ' + esc(c.newSignature) + '</div>' : '');
       });
       if (!(e.diagnosis.changed || []).length) {
         diag += '<div class="diag-sig new mono">' +
@@ -281,15 +282,15 @@
       '<span class="gen mono">gen ' + e.generation + '</span>' +
       '<span class="repo mono">' + esc(e.repo) + '</span>' +
       (e.headCommit ? '<span class="commit mono" title="' + esc(e.headCommit) + '">@' + c7(e.headCommit) + '</span>' : '') +
-      (e.cutoffs ? '<span class="cutoff" title="early cutoff: producer push left the consumed interface unchanged">⚡cutoff ×' + e.cutoffs + '</span>' : '') +
+      (e.cutoffs ? '<span class="cutoff" title="early cutoff: producer push left the consumed interface unchanged">Early cutoff ×' + e.cutoffs + '</span>' : '') +
       checks +
       (isHead ? '<span class="headtag">HEAD</span>' +
         (CAN_CONTROL ? '<button class="btn veto" data-veto="' + esc(e.id) + '" title="squash transitive dependents">VETO</button>' : '') : '') +
       '</div>' +
+      diag +
       track +
       '<div class="tags">' + fwd + (fwd && exp ? '<span class="tag-sep"></span>' : '') +
       (exp ? '<span class="tag-label">exports</span>' + exp : '') + '</div>' +
-      diag +
       '</div>';
   }
 
