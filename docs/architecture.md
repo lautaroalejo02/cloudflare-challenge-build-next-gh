@@ -7,24 +7,28 @@ types live in `app/CONTRACTS.md`; this document explains how the pieces move.
 
 | Piece | Location | Role |
 |---|---|---|
-| `rob.ts` | `app/control-plane/src/rob.ts` | Pure reorder-buffer state machine. `apply(state, cmd, now)` returns `{state, effects}`; no Cloudflare imports, unit-tested with `node:test` (33 cases incl. splice decision, git-level retire and declared-stub prediction tests). |
+| `rob.ts` | `app/control-plane/src/rob.ts` | Pure reorder-buffer state machine. `apply(state, cmd, now)` returns `{state, effects}`; no Cloudflare imports, unit-tested with `node:test` (incl. index-map, splice decision, git-level retire and declared-stub prediction tests). Per-component state is O(1)-indexed: `byId`, `byRepo`, `childrenOf`, `pendingRepo` maps and a monotone `headCursor` under `_internal.idx`. |
 | Ports | `app/control-plane/src/ports.ts` | `ArtifactsPort` (real, wraps the `ARTIFACTS` binding), `HasherPort`, `CheckerPort`, `RetirerPort` — the state machine's only I/O surface, so integration swaps interfaces not logic. |
-| DO | `app/control-plane/src/do.ts` | `ReorderBuffer` Durable Object, one instance `idFromName("default-t11")` (the name is bumped on deploy to escape alarmed-object version pinning — `app/control-plane/NOTES.md`). Executes effects, persists state, broadcasts events over hibernating WebSockets, runs the alarm poll. |
-| Worker | `app/control-plane/src/index.ts` | `/api/*` → DO; queue consumer → `onPush`; everything else → static assets. |
+| Component DO | `app/control-plane/src/do.ts` | `ReorderBuffer` Durable Object, **one instance per connected component** (`comp-<rootEntryId>`). Executes effects, persists state, relays ArbEvents to `ArbRouter` for `/api/ws` fan-in, alarms poll only its own live entry repos. Retire effects call `ArbTrunk` through `RetirerPort`. |
+| Router DO | `app/control-plane/src/router.ts` | `ArbRouter` (`router-t14`): global seq allocation, `entryId→comp` / `repo→comp` routing tables, `POST /api/entries` orchestration with global `robSize`, `/api/state` + `/api/events` aggregation, `/api/ws` hub, config/reset fan-out. |
+| Trunk DO | `app/control-plane/src/trunk.ts` | `ArbTrunk` (`trunk-t14`): serializes every `retire`/`moveBranch` on `arb-trunk` through an in-memory promise queue (DO handlers interleave on `await`), owns trunk init + the sole trunk alarm poll + the authoritative `trunk.commit`. |
+| Shard helpers | `app/control-plane/src/shard.ts` | Pure: `componentName(rootId)`, `repoToEntryId(repo)`, `mergeStates`, `mergeEvents`. |
+| Worker | `app/control-plane/src/index.ts` | `POST /api/trunk/init` → `ArbTrunk` (+ router inform); other `/api/*` → `ArbRouter`; queue consumer → repo-routed `onPush`; everything else → static assets. |
 | Hasher | `app/hasher/` | `hashInterface(files)` — web-tree-sitter + TypeScript grammar WASM, normalizes signatures so formatting/comments/bodies/reordering never move a hash. |
 | Checker | `app/checker/` | `runChecks(env, repo, commit)` — walks the commit tree, strips TS (sucrase), loads a Dynamic Worker via the Worker Loader, calls each `tests/**/*.test.ts` module's `run()`. |
 | Retirer | `app/control-plane/src/retire.ts` + pure `src/splice.ts` (grown out of `app/retirer-spike`) | isomorphic-git on `MemFs` inside the DO: fast-forward when the trunk head is an ancestor of the entry head; otherwise the path-disjoint splice — candidate commit pushed to `refs/heads/arb-candidate` on the trunk repo, checked, then `main` moved via `moveBranch`. `P ∩ Q ≠ ∅` → `trunk-overlap` squash. |
 | Dashboard | `app/dashboard/` | Static UI; folds `ArbEvent`s into a `BufferState`-shaped model (`state.js`, DOM-free, Node-testable). |
-| Demo | `app/demo/` | Fixture repo, three scripted agents, `scenario.ts` runner, and `mock-server.ts` (local control-plane stand-in for offline tests). |
+| Demo | `app/demo/` | Fixture repo, five scripted agents across two chains (`api`/`ui`/`tests` + `pay-api`/`pay-ui`), `scenario.ts` runner (`main`, `failing-check`, `multi`), and `mock-server.ts` (local control-plane stand-in for offline tests). |
 
 The push path, end to end:
 
 ```
 agent git push → Artifacts repo.pushed → Queue arb-push-events
-  → Worker consumer → ReorderBuffer DO
+  → Worker consumer → ArbRouter.routeRepo(repo)
+  → arb-trunk → ArbTrunk.onPush | arb-e<seq>-* → owning ReorderBuffer DO
   → readTree(new commit) → hashInterface(files)
   → apply(state, push cmd) → effects {squash+refork | nothing (early cutoff)}
-  → broadcast ArbEvent to dashboards
+  → ArbEvent → ArbRouter → dashboards on /api/ws
 ```
 
 Interface hashing happens in the DO *between* `apply` calls (queue/alarm →
@@ -197,11 +201,12 @@ producer's final head after an early-cutoff push):
   wakes nobody.
 - **One DO per connected component.** A single-threaded DO is the correct
   serialization point *per dependency component*: retirement order only
-  needs to be total within a component. The current build runs one
-  `default-t11` DO; the BufferState carries no cross-component data, so
-  routing `idFromName(componentId)` is the horizontal path. (Cloudflare's own
-  experience with single-coordinator DOs motivated this design —
-  `research/top10.md` Idea 2 cites the Workflows V1→V2 migration.)
+  needs to be total within a component. Implemented in T14: `ArbRouter`
+  routes entries to `comp-<rootId>` `ReorderBuffer` DOs, `ArbTrunk`
+  serializes the one shared resource (trunk `main`), and `/api/state` is an
+  aggregation over components. (Cloudflare's own experience with
+  single-coordinator DOs motivated this design — `research/top10.md` Idea 2
+  cites the Workflows V1→V2 migration.)
 - **Forks are near-free.** Spike 3 measured 10 parallel forks in 1.9 s wall;
   a squash costs the fan-out of one changed interface, paid only on
   mispredict.
@@ -234,53 +239,48 @@ producer's final head after an early-cutoff push):
   the timed run.
 - **Hardware:** Ryzen 5 7530U, Windows 11, Node v22.15.1.
 
-### Results
+### Results — before and after the T14 index maps
 
-Median / p95 µs per event, all kinds mixed:
+Median / p95 µs per event, all kinds mixed. The left columns are the
+pre-index revision; "indexed" is the same rerun after `byId`/`byRepo`/
+`childrenOf`/`pendingRepo` maps and the monotone `headCursor` landed.
 
-| N | single med | single p95 | single scan (mean) | sharded med | sharded p95 | sharded scan (mean) |
-|---|---|---|---|---|---|---|
-| 1,000 | 29.6 | 92.3 | 3,085 | 2.9 | 11.9 | 116 |
-| 10,000 | 393.6 | 1,462.6 | 31,290 | 6.2 | 21.0 | 134 |
-| 100,000 | 16,208 | 55,220 | 304,219 | 17.2 | 48.3 | 187 |
+| N | single med (before) | single med / p95 (indexed) | single scan (mean) | sharded med / p95 (indexed) |
+|---|---|---|---|---|
+| 1,000 | 29.6 | 2.1 / 19.3 | ~0 | 2.1 / 12.0 |
+| 10,000 | 393.6 | 2.4 / 18.8 | ~0 | 3.4 / 51.0 |
+| 100,000 | 16,208 | 2.7 / 23.3 | ~0 | 62.5 / 112.7 |
 
-- **Single buffer grows ~linearly or worse.** Median rose 13× for 10×
-  entries, then 41× for the next 10× (not isolated — likely allocation/GC of
-  large temporaries plus cache misses). Every event pays it, including ones
-  touching two entries. Line-level causes (for that revision): `head()` — a
-  filter+sort over all entries — runs at the end of *every* `apply()` via
+- **Pre-index, single buffer grew ~linearly or worse** — `head()` ran a
+  filter+sort over all entries at the end of *every* `apply()` via
   `cascade()` (the exact-2N scan on `check.done`: 1,999 / 19,999 / 199,999+
-  evaluations); `squashTree` and the push loop scan all entries per squashed
-  node ((k+1)·N for a push squashing k; max 4.28M scans observed on one push);
-  `find()` lookups and the pending reverse lookup. Whole-state `v8.serialize`
-  per `persist()`: 3.2 / 45 / 634 ms.
-- **Sharded work is flat in N.** Scans 116 / 134 / 187 mean — 80 for
-  `check.done` at every N, i.e. exactly 2 × 40. Wall medians still rose 2.9 /
-  6.2 / 17.2 µs, but a hot-shard control (`BENCH_HOT=25` — events confined to
-  25 shards inside the same 2,500-state heap) gave median 3.8 µs / p95 16.3:
-  the rise is memory locality of the one-process simulation, not algorithmic
-  growth (single control run).
-- **Containment verified, not assumed.** Every push (3,803 across both modes)
-  was checked against an independent oracle built from the DAG and pre-push
-  `consumes`: 0 mismatches, 0 squashes outside the pushed entry's transitive
-  dependents. Interface-push squash counts were subtree sizes — 3 / 12 / 39
-  (depth-2 / depth-1 / root), mean 7.5, p95 39 at N=100k — bounded by fan-out,
-  independent of N.
-- **State size:** ≈740 bytes/entry as JSON — 0.65 MB / 6.9 MB / 74 MB single,
-  similar sharded-total; the 200-event `eventLog` adds ~30 KB per shard.
-  Durable Object storage value limits were *not* verified in this run — the
-  single-DO state is already written as one value.
+  evaluations); `squashTree` and the push loop scanned all entries per
+  squashed node (max 4.28M scans on one push). Index maps removed those
+  scans: ~0 entry-predicate evaluations per event now, medians flat in N.
+- **Containment verified, not assumed.** Every push (3,803 across both
+  modes) was checked against an independent oracle built from the DAG and
+  pre-push `consumes`: 0 mismatches, 0 squashes outside the pushed entry's
+  transitive dependents — unchanged by the index rewrite. Interface-push
+  squash counts were subtree sizes — 3 / 12 / 39 (depth-2 / depth-1 /
+  root), mean 7.5, p95 39 at N=100k — bounded by fan-out, independent of N.
+- **State size is the residual bottleneck.** ≈740 bytes/entry plus indexes
+  as JSON: 0.69 / 7.4 / 80 MB single-buffer at 1k/10k/100k; whole-state
+  `v8.serialize` ~3.7 / 52 / 732 ms vs ~0.08 ms per 40-entry component
+  state. Durable Object storage value limits were *not* verified — but at
+  40-entry components the write is two orders of magnitude smaller.
 
-### The fix, and what is still unmeasured
+### Deployed topology and live verification
 
-Recommended in `RESULTS.md` (not applied, not measured as a patch): a
-monotone cursor to the first live entry (O(1) amortized `head()`);
-`Map<id,Entry>`, `Map<repo,Entry>`, `Map<producerId,Entry[]>` and a pending
-repo→id map; per-entry-key or delta persistence instead of whole-state
-writes. Acting on it — index maps plus one `ReorderBuffer` DO per connected
-component (routing by root producer) — is dispatched as T14; as of this
-writing `src/index.ts` still resolves a single `idFromName("default-t11")`
-object and `rob.ts` has no index maps.
+T14 implemented the fix the benchmark recommended — index maps in `rob.ts`
+plus the three-role DO split (`ArbRouter` + `ArbTrunk` + one `ReorderBuffer`
+per connected component). Verified live
+(`https://arb-control-plane.lautitomasalejo.workers.dev`, all scenarios exit
+0): `main` and `failing-check` behave as before, and the new `multi`
+scenario runs two independent chains in separate component DOs — squashes
+stayed inside their producer's component, the payments producer retired
+before the orders head (no cross-component head-of-line blocking), and all
+five entries retired onto the shared `arb-trunk`. Stats in
+`app/control-plane/NOTES.md` "Sharding (T14)".
 
 Caveats (from `RESULTS.md`): synthetic uniform workload with uniform routing;
 complete ternary trees only — no cross-component edges, no shared producers;
@@ -289,8 +289,10 @@ figures from 2,500 / 1,200 events; the 100k p95 comes from dozens of events
 per kind); event-kind proportions differ per mode and size — compare the
 all-kinds rows loosely, the per-kind rows precisely; sharded runs retire
 fewer entries at large N because each shard has its own head and receives few
-events. Cross-component dependencies, routing, real DO latency, and DO
-storage limits remain unmeasured.
+events. The µs numbers characterize the state machine only: cross-component
+dependencies, routing, real DO latency, queue timing and DO storage limits
+remain unmeasured — the live demo verifies correctness end-to-end, not
+latency.
 
 ## Known seams
 

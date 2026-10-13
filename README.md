@@ -113,36 +113,48 @@ prediction (T11)").
 
 ## Why it scales — and what the benchmark measured
 
+The control plane now runs **one `ReorderBuffer` Durable Object per connected
+producer/consumer component** (`comp-<rootEntryId>`), routed by an `ArbRouter`
+DO that owns global sequence numbers, the entry→component table and
+`/api/state`·`/api/ws` aggregation. Retirement onto the shared trunk is
+serialized by a dedicated `ArbTrunk` DO — the trunk is the one shared
+resource, so all fast-forward/splice decisions pass through a single promise
+queue. Inside `rob.ts`, index maps (`byId`, `byRepo`, `childrenOf`,
+`pendingRepo`) and a monotone head cursor replaced the per-event full-array
+scans.
+
 In a synthetic, in-process benchmark of the pure state machine (no network, no
-Durable Object I/O), an interface-changing push squashed exactly the transitive
-dependents whose consumed hashes had changed (3,803 pushes checked, 0
-mismatches, none outside the dependency subtree), with 3 to 39 squashes per
-push in 40-entry components. Today's single-buffer implementation does not yet
-scale with the touched edges: its median per-event time rose from 30 µs at
-1,000 entries to 394 µs at 10,000 and 16 ms at 100,000, because several steps
-scan the whole entry list on every event. Splitting disconnected components
-into separate buffers held the work per event flat (about 80 to 190
-entry-predicate evaluations at every N, median 3 to 17 µs), which supports the
-sharding claim for the state machine itself; cross-component dependencies,
-routing, and real Durable Object latency were not measured.
+Durable Object I/O), that removed the O(N) cost: median per-event time is now
+flat at ~2–3 µs from 1,000 to 100,000 entries, vs 16 ms at 100,000 before the
+indexes. An interface-changing push still squashes exactly the transitive
+dependents whose consumed hashes changed (3,803 pushes checked, 0 mismatches,
+none outside the dependency subtree). The residual single-DO cost is state
+serialization — ~80 MB / ~732 ms to persist at N=100,000 vs ~0.08 ms per
+40-entry component — which is what the per-component DO split addresses.
 — `app/control-plane/bench/RESULTS.md` (reproduce in ~2 min:
 `cd app/control-plane && node --experimental-strip-types bench/run.ts`)
 
-| entries in the buffer | one buffer for all N, median / p95 per event | one buffer per 40-entry component |
-|---|---|---|
-| 1,000 | 29.6 µs / 92.3 µs | 2.9 µs / 11.9 µs |
-| 10,000 | 393.6 µs / 1,462.6 µs | 6.2 µs / 21.0 µs |
-| 100,000 | 16.2 ms / 55.2 ms | 17.2 µs / 48.3 µs |
+| entries in the buffer | single buffer, median / p95 per event | after index maps, median / p95 | one buffer per 40-entry component |
+|---|---|---|---|
+| 1,000 | 29.6 µs / 92.3 µs | 2.1 µs / 19.3 µs | 2.1 µs / 12.0 µs |
+| 10,000 | 393.6 µs / 1,462.6 µs | 2.4 µs / 18.8 µs | 3.4 µs / 51.0 µs |
+| 100,000 | 16.2 ms / 55.2 ms | 2.7 µs / 23.3 µs | 62.5 µs / 112.7 µs |
 
-**Honest status.** The deployed control plane still runs **one** `ReorderBuffer`
-Durable Object for the whole buffer today, so the left column is the current
-cost — paid by every event, including ones that touch two entries, through
-full-array scans in `head()`, `squashTree` and the id/repo lookups. The next
-step is what the right column approximates: per-connected-component sharding
-plus index maps (`Map<id,Entry>`, `Map<repo,Entry>`, a monotone head cursor,
-per-entry persistence) inside `rob.ts` — dispatched as T14, not yet
-implemented (`bench/RESULTS.md` "Recommended fix"; `app/control-plane/NOTES.md`
-reports no such change as of this writing).
+**Live evidence.** `--scenario multi` runs two independent chains
+(orders `api→ui+tests`, payments `api→ui`) against the deployed plane:
+`/api/state` showed them in separate component DOs, every squash stayed
+inside its producer's component, the payments producer retired *before* the
+orders head (no cross-component head-of-line blocking), and both chains
+retired onto the shared trunk. See `app/control-plane/NOTES.md` "Sharding
+(T14)" for the full stats.
+
+**Honest status.** The benchmark is synthetic and in-process: complete
+ternary trees, no cross-component edges or shared producers, no network,
+queue, routing or real Durable Object storage I/O in the timing path. The
+sharded deployment is verified end-to-end by the live demo scenarios; the
+µs numbers characterize the state machine, not Cloudflare latency.
+Per-entry-key persistence inside a DO is still future work — each component
+still writes its whole (much smaller) state per mutation.
 
 - Squash fan-out is bounded by the dependency subtree, independent of N —
   measured: 3 / 12 / 39 squashes for depth-2 / depth-1 / root producers,
