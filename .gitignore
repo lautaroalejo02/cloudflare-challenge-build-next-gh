@@ -7,3 +7,4 @@ tmp/
 .dev.vars
 spikes/_logs/
 *.log
+odd/logs/
