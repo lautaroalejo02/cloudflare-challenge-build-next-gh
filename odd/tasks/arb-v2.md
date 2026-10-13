@@ -22,7 +22,7 @@ The v1 demo needs scripted dependency declarations and is blind to same-signatur
 - Max 3 concurrent SWE-2 runs (rate-limit lesson from v1).
 
 ## Safety net
-Known-good: tag `demo-stable-6` (`a16239e`), Worker version `9f105998-1985-432d-af28-df1908c3d014`; V2 live main passed 3/3. Previous: `demo-stable-5`, Worker `b3e47042-6c08-467a-b947-3350a0b7ce40` (v1 + redesign).
+Known-good: tag `demo-stable-7` (`6c1b760`), Worker version `e72a037b-6c00-4edd-a933-d160f84d78e1`; V2 + V8 live main passed 2/2. Earlier: `demo-stable-6`, Worker `9f105998-1985-432d-af28-df1908c3d014`. Previous: `demo-stable-5`, Worker `b3e47042-6c08-467a-b947-3350a0b7ce40` (v1 + redesign).
 
 ## Delivery strategy
 `exception-ok`: forecast is about 1,800 authored lines, above the 400-line budget. Reason: hackathon deadline, and the user authorized pushing to `main` once it works. Each task still lands as its own work-unit commit.
@@ -45,7 +45,10 @@ Route legend: D = delegated writer, I = inline (orchestrator), A = audit (Sonnet
   - Parent spot check: 156/156 control-plane and 18/18 demo tests; reset without the key returns 403; the live events have 0 `art_v2_` and 0 `Bearer`.
   - Pushed to `main` (`ce2d463`) and tagged `demo-stable-6`.
   - Known gap: inference reads imports from the whole entry tree, so the UI also inferred `charge` from an untouched trunk file. Main now shows 1 prediction hit / 0 misses, and runs take about 90-100 s.
-- [ ] V8 (D, Codex) Restrict inference to imports in files the entry changed since its `baseCommit`. Redeploy and run live. Prompt `odd/prompts/V8-inference-scope.md`.
+- [x] V8 (D, Codex) Restrict inference to imports in files the entry changed since its `baseCommit`. Redeploy and run live. Prompt `odd/prompts/V8-inference-scope.md`.
+  - Done `6c1b760`, Worker `e72a037b-6c00-4edd-a933-d160f84d78e1`, tag `demo-stable-7`, pushed to `main`.
+  - Live: main x2, failing-check and multi all exit 0. The UI infers only `createOrder` and `Cart` (no `charge`). Jev: refactor 0.02 (clear), VAT 0.94/0.97 (squash). Diff cost median 134 ms, max 166 ms.
+  - Parent re-ran the control-plane tests: 161/161.
 - [ ] V6 (A) Sonnet audit per landed unit (V1, V2, V3, V4).
 - [ ] V7 (D) Docs: README, `docs/architecture.md`, `docs/demo-script.md`.
 - [ ] S1 (stretch) Jev producer routing from `task` text.
