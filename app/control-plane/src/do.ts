@@ -23,7 +23,7 @@ import {
 	realHasher,
 	type ArtifactsPort,
 	type Ports,
-	type RetirerPort,
+	type TrunkRetirerPort,
 } from "./ports.ts";
 import { ROUTER_NAME } from "./router.ts";
 import { TRUNK_NAME, type ArbTrunk } from "./trunk.ts";
@@ -52,12 +52,14 @@ export interface Env {
 
 /** The component DO's "retirer" is the shared ArbTrunk DO: every component
  * calls the same object, which serializes all trunk mutations (the trunk is
- * the single shared resource across shards). */
-function stubRetirer(env: Env): RetirerPort {
+ * the single shared resource across shards). Retirement goes through the
+ * atomic RPC (T17): build -> check -> move inside one queue slot. */
+function stubRetirer(env: Env): TrunkRetirerPort {
 	const stub = () => env.TRUNK.get(env.TRUNK.idFromName(TRUNK_NAME));
 	return {
 		retire: (args) => stub().retire(args),
 		moveBranch: (args) => stub().moveBranch(args),
+		retireAtomic: (args) => stub().retireAtomic(args),
 	};
 }
 
@@ -235,50 +237,85 @@ export class ReorderBuffer extends DurableObject<Env> {
 					break;
 				}
 				case "check": {
-					const result = await this.ports.checker.runChecks(eff.repo, eff.commit);
+					// A thrown checker call must not wedge the entry at
+					// "checking": report it as a failed run — the same visible,
+					// recoverable path as a red test.
+					let result;
+					try {
+						result = await this.ports.checker.runChecks(eff.repo, eff.commit);
+					} catch (e) {
+						result = {
+							commit: eff.commit,
+							passed: 0,
+							failed: 1,
+							durationMs: 0,
+							results: [{ name: "checker", ok: false, error: String(e instanceof Error ? e.message : e) }],
+						};
+					}
 					const r = this.applyCmd({ type: "check.done", entryId: eff.entryId, result });
 					if (r.ok) queue.push(...r.effects);
 					break;
 				}
 				case "retire": {
-					const res = await this.ports.retirer.retire({
-						fromRepo: eff.fromRepo,
-						commit: eff.commit,
-						baseCommit: eff.baseCommit,
-						toRepo: eff.toRepo,
-						branch: eff.branch,
-					});
-					let r;
-					if (res.outcome === "fast-forward") {
-						r = this.applyCmd({
-							type: "retire.done",
-							entryId: eff.entryId,
-							commit: res.commit,
-							entryCommit: eff.commit,
-							mode: "fast-forward",
+					// T17: ArbTrunk runs the whole cycle (head -> splice -> check
+					// -> move) inside one serialized slot with bounded rebuilds.
+					// The returned `attempts` are replayed as check/retry events
+					// in order, then the final outcome is applied. Any thrown
+					// error still reaches `retire.failed` — `retiring` is always
+					// cleared, so the component can never wedge.
+					try {
+						const res = await this.ports.retirer.retireAtomic({
+							fromRepo: eff.fromRepo,
+							commit: eff.commit,
+							baseCommit: eff.baseCommit,
+							toRepo: eff.toRepo,
+							branch: eff.branch,
 						});
-					} else if (res.outcome === "splice") {
-						r = this.applyCmd({ type: "retire.planned", entryId: eff.entryId, candidate: res.candidate });
-					} else {
-						r = this.applyCmd({ type: "retire.overlap", entryId: eff.entryId, overlap: res.overlap });
+						for (const a of res.attempts) {
+							if (a.candidate && a.check) {
+								const rc = this.applyCmd({
+									type: "retire.checked",
+									entryId: eff.entryId,
+									candidate: a.candidate,
+									result: a.check,
+								});
+								if (rc.ok) queue.push(...rc.effects);
+							}
+							if (a.reason) {
+								const rr = this.applyCmd({
+									type: "retire.retry",
+									entryId: eff.entryId,
+									attempt: a.attempt,
+									reason: a.reason,
+								});
+								if (rr.ok) queue.push(...rr.effects);
+							}
+						}
+						let r;
+						if (res.outcome === "fast-forward" || res.outcome === "splice") {
+							r = this.applyCmd({
+								type: "retire.done",
+								entryId: eff.entryId,
+								commit: res.commit,
+								entryCommit: eff.commit,
+								mode: res.outcome,
+							});
+						} else if (res.outcome === "overlap") {
+							r = this.applyCmd({ type: "retire.overlap", entryId: eff.entryId, overlap: res.overlap });
+						} else if (res.outcome === "retry-exhausted") {
+							r = this.applyCmd({ type: "retire.failed", entryId: eff.entryId, reason: res.reason });
+						}
+						// "check-failed": the replayed retire.checked already moved
+						// the entry to `failed` and cleared `retiring`.
+						if (r?.ok) queue.push(...r.effects);
+					} catch (e) {
+						const r = this.applyCmd({
+							type: "retire.failed",
+							entryId: eff.entryId,
+							reason: String(e instanceof Error ? e.message : e),
+						});
+						if (r.ok) queue.push(...r.effects);
 					}
-					if (r.ok) queue.push(...r.effects);
-					break;
-				}
-				case "retire.commit": {
-					// The splice candidate passed its checks: land it on trunk.
-					await this.ports.retirer.moveBranch({
-						toRepo: eff.toRepo,
-						branch: eff.branch,
-						commit: eff.candidate,
-					});
-					const r = this.applyCmd({
-						type: "retire.done",
-						entryId: eff.entryId,
-						commit: eff.candidate,
-						mode: "splice",
-					});
-					if (r.ok) queue.push(...r.effects);
 					break;
 				}
 			}

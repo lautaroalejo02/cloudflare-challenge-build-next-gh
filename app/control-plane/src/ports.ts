@@ -81,11 +81,41 @@ export interface RetirerPort {
 	moveBranch(args: { toRepo: string; branch: string; commit: string }): Promise<void>;
 }
 
+// --- Atomic retirement (T17) --------------------------------------------------
+
+/** One attempt inside an atomic retire cycle (see src/atomic.ts). */
+export interface AtomicAttempt {
+	attempt: number;
+	/** Splice candidate built this attempt (if it got that far). */
+	candidate?: string;
+	/** Check the candidate ran (checks always execute on the commit that is
+	 * about to become trunk). */
+	check?: CheckResult;
+	/** Why the attempt did not land (absent on the winning attempt). */
+	reason?: string;
+}
+
+/** Result of a fully serialized retire cycle inside ArbTrunk: read head ->
+ * decide ff/splice -> build candidate -> check it -> move main, rebuilt from
+ * the new head on rejection (bounded). `attempts` narrates every try so the
+ * component DO can replay check/retry events. */
+export type AtomicRetireResult =
+	| { outcome: "fast-forward"; commit: string; attempts: AtomicAttempt[]; ms: Record<string, number> }
+	| { outcome: "splice"; commit: string; candidate: string; attempts: AtomicAttempt[]; ms: Record<string, number> }
+	| { outcome: "overlap"; overlap: string[]; p: string[]; q: string[]; attempts: AtomicAttempt[]; ms: Record<string, number> }
+	| { outcome: "check-failed"; candidate: string; attempts: AtomicAttempt[]; ms: Record<string, number> }
+	| { outcome: "retry-exhausted"; reason: string; attempts: AtomicAttempt[]; ms: Record<string, number> };
+
+export interface TrunkRetirerPort extends RetirerPort {
+	/** ArbTrunk RPC: one serialized atomic retire cycle for `args`. */
+	retireAtomic(args: RetireArgs): Promise<AtomicRetireResult>;
+}
+
 export interface Ports {
 	artifacts: ArtifactsPort;
 	hasher: HasherPort;
 	checker: CheckerPort;
-	retirer: RetirerPort;
+	retirer: TrunkRetirerPort;
 }
 
 // --- Real Artifacts port ------------------------------------------------------

@@ -89,6 +89,8 @@ export interface ArbEvent {
 		| "check.failed"
 		| "prediction.hit"
 		| "prediction.miss"
+		| "retire.retry"
+		| "retire.failed"
 		| "retired"
 		| "veto"
 		| "config"
@@ -136,9 +138,10 @@ export interface RobInternal {
 	checking: Record<string, string>;
 	/** entryId -> a retire effect is in flight. */
 	retiring: Record<string, true>;
-	/** entryId -> splice candidate commit pushed to the candidate ref,
-	 * awaiting its check before trunk moves. */
-	retireCandidate: Record<string, string>;
+	/** entryId -> consecutive exhausted atomic-retire cycles for the current
+	 * head (T17). Bounds the component-level auto-retry: cascade re-fires
+	 * while < MAX_RETIRE_CYCLES, then stops until a push/ready resets it. */
+	retireStrikes: Record<string, number>;
 	/** entryId -> ts when the retire effect was emitted (durationMs). */
 	retireStart: Record<string, number>;
 	/** "repo:commit" push dedupe (queue + alarm poll may both fire). */
@@ -180,7 +183,7 @@ export function initialState(): RobState {
 			pending: {},
 			checking: {},
 			retiring: {},
-			retireCandidate: {},
+			retireStrikes: {},
 			retireStart: {},
 			seenPushes: [],
 			repoAlias: {},
@@ -227,8 +230,16 @@ export type Cmd =
 	| { type: "push"; repo: string; commit: string; exports?: SymbolHashes; sigs?: SymbolSignatures }
 	| { type: "entry.ready"; entryId: string; commit: string }
 	| { type: "check.done"; entryId: string; result: CheckResult }
-	/** Retirer pushed a splice candidate for the entry; checks must run on it. */
-	| { type: "retire.planned"; entryId: string; candidate: string }
+	/** One atomic-cycle attempt rebuilt after a rejected trunk move (T17).
+	 * Narration only — `retiring` stays set; the final outcome follows. */
+	| { type: "retire.retry"; entryId: string; attempt: number; reason: string }
+	/** The atomic cycle ran checks on a splice candidate (on the trunk repo).
+	 * Passed -> events only; failed -> the entry goes `failed`. */
+	| { type: "retire.checked"; entryId: string; candidate: string; result: CheckResult }
+	/** The atomic cycle exhausted its rebuilds (or the RPC failed): clear
+	 * `retiring`, emit `retire.failed`, and let the next cascade retry
+	 * (bounded by retireStrikes). */
+	| { type: "retire.failed"; entryId: string; reason: string }
 	/** P ∩ Q ≠ ∅ at retire time: squash the entry (trunk-overlap). */
 	| { type: "retire.overlap"; entryId: string; overlap: string[] }
 	| {
@@ -248,7 +259,6 @@ export type Effect =
 	| { type: "token"; entryId: string; repo: string }
 	| { type: "check"; entryId: string; repo: string; commit: string }
 	| { type: "retire"; entryId: string; fromRepo: string; commit: string; baseCommit: string; toRepo: string; branch: string }
-	| { type: "retire.commit"; entryId: string; toRepo: string; branch: string; candidate: string }
 	| { type: "broadcast"; event: ArbEvent };
 
 export type ApplyResult =
@@ -475,6 +485,12 @@ function squashTree(
 	}
 }
 
+/** Component-level retry bound for exhausted atomic-retire cycles (T17).
+ * Below it the next cascade re-fires retirement automatically; at it the
+ * entry parks at `failed` until a push or a fresh `entry.ready` resets the
+ * strike count. */
+export const MAX_RETIRE_CYCLES = 3;
+
 /** Advance the retirement pipeline: the head entry checks, then retires. */
 function cascade(state: RobState, effects: Effect[], now: number): void {
 	const h = head(state);
@@ -487,7 +503,11 @@ function cascade(state: RobState, effects: Effect[], now: number): void {
 			emit(state, effects, now, { type: "check.started", entryId: h.id, data: { commit: h.headCommit } });
 			return;
 		}
-		if (h.checks.failed === 0 && !state._internal.retiring[h.id]) {
+		if (
+			h.checks.failed === 0 &&
+			!state._internal.retiring[h.id] &&
+			(state._internal.retireStrikes[h.id] ?? 0) < MAX_RETIRE_CYCLES
+		) {
 			state._internal.retiring[h.id] = true;
 			state._internal.retireStart[h.id] = now;
 			effects.push({
@@ -641,6 +661,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const planned = state._internal.pending[e.id];
 			if (planned && planned !== cmd.repo) state._internal.repoAlias[planned] = cmd.repo;
 			clearPending(state, e.id);
+			delete state._internal.retireStrikes[e.id];
 			effects.push({ type: "token", entryId: e.id, repo: e.repo });
 			if (wasSquash) {
 				emit(state, effects, now, {
@@ -694,7 +715,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				target.status = "speculating";
 				delete state._internal.checking[target.id];
 				delete state._internal.retiring[target.id];
-				delete state._internal.retireCandidate[target.id];
+				delete state._internal.retireStrikes[target.id];
 				delete state._internal.retireStart[target.id];
 			}
 			state.stats.pushesSeen += 1;
@@ -829,6 +850,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				return err(409, `entry ${e.id} is squashed; push to the new fork first`);
 			}
 			if (cmd.commit !== e.headCommit) return err(409, `commit ${cmd.commit} is not head ${e.headCommit}`);
+			delete state._internal.retireStrikes[e.id];
 			e.status = "ready";
 			emit(state, effects, now, { type: "ready", entryId: e.id, data: { commit: cmd.commit } });
 			break;
@@ -839,45 +861,12 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
 			delete state._internal.checking[e.id];
 			state.stats.checksRun += 1;
-			// Checks are issued from "ready"/"checking" (head) or while retiring
-			// (splice candidate). Any other status means the check is stale —
-			// applying it could resurrect a retired/squashed entry (observed:
-			// a head check completing after retirement flipped e3 back to ready
-			// and triggered a phantom trunk-overlap loop).
+			// Checks are issued from "ready"/"checking" (head). Any other status
+			// means the check is stale — applying it could resurrect a
+			// retired/squashed entry (observed: a head check completing after
+			// retirement flipped e3 back to ready and triggered a phantom
+			// trunk-overlap loop).
 			if (e.status !== "ready" && e.status !== "checking") break;
-			// A splice candidate check runs on the trunk repo, not the fork.
-			if (state._internal.retireCandidate[e.id] === cmd.result.commit) {
-				delete state._internal.retireCandidate[e.id];
-				if (cmd.result.failed === 0) {
-					emit(state, effects, now, {
-						type: "check.passed",
-						entryId: e.id,
-						data: { commit: cmd.result.commit, durationMs: cmd.result.durationMs, splice: true },
-					});
-					effects.push({
-						type: "retire.commit",
-						entryId: e.id,
-						toRepo: state.trunk.repo,
-						branch: "main",
-						candidate: cmd.result.commit,
-					});
-				} else {
-					e.status = "failed";
-					delete state._internal.retiring[e.id];
-					delete state._internal.retireStart[e.id];
-					emit(state, effects, now, {
-						type: "check.failed",
-						entryId: e.id,
-						data: {
-							commit: cmd.result.commit,
-							durationMs: cmd.result.durationMs,
-							failed: cmd.result.failed,
-							splice: true,
-						},
-					});
-				}
-				break;
-			}
 			if (cmd.result.commit !== e.headCommit) break; // stale check; a push moved head
 			// Record only head checks: a splice-candidate result must not
 			// clobber entry.checks (its commit never equals the fork head, which
@@ -901,17 +890,72 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			break;
 		}
 
-		case "retire.planned": {
+		case "retire.retry": {
 			const e = find(state, cmd.entryId);
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
-			if (!state._internal.retiring[e.id]) break; // stale plan: a push moved the entry on
-			state._internal.retireCandidate[e.id] = cmd.candidate;
+			if (!state._internal.retiring[e.id]) break; // stale: a push moved the entry on
+			emit(state, effects, now, {
+				type: "retire.retry",
+				entryId: e.id,
+				data: { attempt: cmd.attempt, reason: cmd.reason },
+			});
+			break;
+		}
+
+		case "retire.checked": {
+			const e = find(state, cmd.entryId);
+			if (!e) return err(404, `entry ${cmd.entryId} not found`);
+			if (!state._internal.retiring[e.id]) break; // stale: a push moved the entry on
+			state.stats.checksRun += 1;
 			emit(state, effects, now, {
 				type: "check.started",
 				entryId: e.id,
 				data: { commit: cmd.candidate, splice: true },
 			});
-			effects.push({ type: "check", entryId: e.id, repo: state.trunk.repo, commit: cmd.candidate });
+			if (cmd.result.failed === 0) {
+				emit(state, effects, now, {
+					type: "check.passed",
+					entryId: e.id,
+					data: { commit: cmd.result.commit, durationMs: cmd.result.durationMs, splice: true },
+				});
+			} else {
+				// The spliced tree itself fails checks: a verdict, not a race —
+				// the agent must push again (which re-arms retirement).
+				e.status = "failed";
+				delete state._internal.retiring[e.id];
+				delete state._internal.retireStrikes[e.id];
+				delete state._internal.retireStart[e.id];
+				emit(state, effects, now, {
+					type: "check.failed",
+					entryId: e.id,
+					data: {
+						commit: cmd.result.commit,
+						durationMs: cmd.result.durationMs,
+						failed: cmd.result.failed,
+						splice: true,
+					},
+				});
+			}
+			break;
+		}
+
+		case "retire.failed": {
+			const e = find(state, cmd.entryId);
+			if (!e) return err(404, `entry ${cmd.entryId} not found`);
+			if (!state._internal.retiring[e.id]) break; // stale: a push moved the entry on
+			delete state._internal.retiring[e.id];
+			delete state._internal.retireStart[e.id];
+			const strikes = (state._internal.retireStrikes[e.id] = (state._internal.retireStrikes[e.id] ?? 0) + 1);
+			const exhausted = strikes >= MAX_RETIRE_CYCLES;
+			emit(state, effects, now, {
+				type: "retire.failed",
+				entryId: e.id,
+				data: { reason: cmd.reason, strike: strikes, exhausted },
+			});
+			// Below the bound the trailing cascade re-fires the retire effect
+			// automatically. At the bound the entry is parked at `failed` — a
+			// push or a fresh `entry.ready` resets the strikes and retries.
+			if (exhausted) e.status = "failed";
 			break;
 		}
 
@@ -919,7 +963,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const e = find(state, cmd.entryId);
 			if (!e) return err(404, `entry ${cmd.entryId} not found`);
 			delete state._internal.retiring[e.id];
-			delete state._internal.retireCandidate[e.id];
+			delete state._internal.retireStrikes[e.id];
 			delete state._internal.retireStart[e.id];
 			// Squash the entry itself: its agent re-applies the change on a
 			// fresh fork of TRUNK. The collision is with trunk content, so the
@@ -949,7 +993,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const startedAt = state._internal.retireStart[e.id];
 			const durationMs = startedAt === undefined ? undefined : now - startedAt;
 			delete state._internal.retiring[e.id];
-			delete state._internal.retireCandidate[e.id];
+			delete state._internal.retireStrikes[e.id];
 			delete state._internal.retireStart[e.id];
 			e.status = "retired";
 			idx(state).active -= 1;
@@ -973,7 +1017,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			clearPending(state, e.id);
 			delete state._internal.checking[e.id];
 			delete state._internal.retiring[e.id];
-			delete state._internal.retireCandidate[e.id];
+			delete state._internal.retireStrikes[e.id];
 			delete state._internal.retireStart[e.id];
 			emit(state, effects, now, { type: "veto", entryId: e.id, data: { seq: e.seq } });
 			// Dependents rebase onto the vetoed entry's own base and are

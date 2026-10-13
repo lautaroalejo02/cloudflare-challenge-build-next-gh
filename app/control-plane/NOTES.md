@@ -12,15 +12,16 @@ Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
   the DO. Internal bookkeeping (`_internal`: signature texts, in-flight
   forks, check/retire dedupe, push dedupe, event log) is persisted but
   stripped from `GET /api/state` via `publicState()`.
-- `test/` — 33 node:test cases (run with `node --experimental-strip-types`,
+- `test/` — 54 node:test cases (run with `node --experimental-strip-types`,
   Node 22.15): `rob.test.ts` state machine (forwarding, early cutoff, squash
   + diagnosis, transitive squash, in-order retirement, failing check +
   retry, robSize 409, veto + transitive dependents, veto non-head 409,
-  reset, push dedupe/unknown-repo, pending-refork dedupe, splice/overlap
-  retire plan, stale-plan drop, no-op ready on squashed refork, declared-stub
-  value prediction),
+  reset, push dedupe/unknown-repo, pending-refork dedupe, atomic retire
+  checked/retry/failed/overlap paths + strike bound + stale-drop, no-op
+  ready on squashed refork, declared-stub value prediction),
   `splice.test.ts` pure path-disjoint decision, `retire.test.ts` git-level
-  fast-forward/splice/already-on-trunk on `MemFs` + isomorphic-git.
+  fast-forward/splice/already-on-trunk on `MemFs` + isomorphic-git,
+  `atomic.test.ts` pure retry-loop races/rebuilds/exhaustion.
 - `src/ports.ts` — port interfaces + real implementations:
   - `ArtifactsPort` — wraps the `ARTIFACTS` binding (create / fork /
     token / log / readTree). `readTree` walks the commit's root tree
@@ -49,9 +50,13 @@ Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
   entry/repo → component routing table, `POST /api/entries` orchestration
   with global `robSize`, `/api/state` + `/api/events` aggregation across
   components, `/api/ws` hub, config/reset fan-out.
-- `src/trunk.ts` — `ArbTrunk` DO (`trunk-t14`): serialized `retire` /
-  `moveBranch` on `arb-trunk` (promise queue — DO handlers interleave on
-  await), trunk-init, sole trunk alarm poller, authoritative trunk head.
+- `src/trunk.ts` — `ArbTrunk` DO (`trunk-t17`): serialized `retireAtomic`
+  on `arb-trunk` (one promise-queue slot spans head-read → candidate →
+  check → move, with bounded in-slot rebuilds; the legacy `retire` /
+  `moveBranch` RPCs remain but are unused), trunk-init, sole trunk alarm
+  poller, authoritative trunk head.
+- `src/atomic.ts` — pure `retireAtomic` retry loop over `RetirerPort` +
+  `CheckerPort` (no Cloudflare/git imports, unit-testable).
 - `src/shard.ts` — pure helpers: `componentName`, `repoToEntryId`,
   `mergeStates`, `mergeEvents`.
 - `src/index.ts` — Worker: `POST /api/trunk/init` -> `ArbTrunk` (+ router
@@ -71,7 +76,7 @@ Deployed: `https://arb-control-plane.lautitomasalejo.workers.dev`
 
 ```sh
 npm install
-npm test                 # 26 unit tests (state machine + splice + git), no CF needed
+npm test                 # 54 unit tests (state machine + splice + git + atomic), no CF needed
 npx tsc --noEmit         # typecheck (also compiles app/hasher + app/checker sources)
 npx wrangler types       # regenerate worker-configuration.d.ts
 scripts/setup.sh         # queue + subscription + deploy (Wrangler >= 4.149)
@@ -339,6 +344,64 @@ the concrete argument for the DO split. Details in `bench/RESULTS.md`.
 this deploy (the old zombie `default-t11` object may still poll — it is
 inert). `wrangler.toml` keeps migration v1 (`ReorderBuffer`) and adds v2
 (`ArbRouter`, `ArbTrunk`).
+
+## Trunk race fix (T17)
+
+**Defect.** The T14 two-phase path — `retire()` builds a splice candidate on
+the head it read, the component DO checks it, `moveBranch()` moves `main` —
+left a window where another component could land first. `moveBranch` then
+rejected non-fast-forward, the async retire effect threw, and
+`_internal.retiring` stayed set: the component wedged at `ready` forever
+(reproduced in `--scenario multi`, worked around in T16 with
+`--delay-ready e5:30000`).
+
+**Fix.** Retirement is now one atomic cycle inside `ArbTrunk`
+(`src/atomic.ts` + `ArbTrunk.retireAtomic` RPC): the single queue slot spans
+head-read → ff/splice/overlap decision → candidate build → candidate check →
+`main` move, so no component can land mid-cycle. A rejected move records a
+sanitized `reason` and rebuilds from the new head inside the same slot,
+bounded at `MAX_ATOMIC_ATTEMPTS=3`; `overlap` and `check-failed` return
+immediately (rebuilding the same paths can't change the verdict). The
+component DO replays `attempts[]` into visible events — `retire.retry`
+`{attempt, reason}`, candidate `check.*` (with `splice:true`), `retire.done`,
+`retire.failed` `{reason, strike, exhausted}` — so every failure clears
+`retiring` and the next cascade can retry, bounded by `MAX_RETIRE_CYCLES`.
+The two-phase `retire.planned`/`retire.commit`/`retireCandidate` protocol is
+gone; the plain `check` effect also converts a thrown `runChecks` into a
+failed verdict instead of wedging `checking`.
+
+**Ordering preserved.** In-order per component (one retire effect at a
+time), no cross-component head-of-line blocking (each component's cycle is
+one queue slot, others queue behind, not inside), checks always run on the
+exact candidate commit that becomes trunk — observed in `/api/events` as
+`check.*` `{splice:true}` on the landed commit hash.
+
+**Deploy note.** First T17 deploy (`a3a08161`) surfaced the DO version-pin
+gap again: component DOs restarted on the new code but alarmed `trunk-t14`
+kept serving the old class — `retire.failed` `"RPC receiver does not
+implement the method \"retireAtomic\""` strikes 1→3 → `exhausted` → entry
+`failed` (the no-wedge path proving itself on its own defect class).
+`TRUNK_NAME` bumped to `trunk-t17`; state re-derives via `trunkInit`.
+
+**Live verification** (production `arb-control-plane`, deployed
+`4e0fdc50-cd9f-4cbd-9adc-95a11cedf52d`, 2026-10-13 — all exit 0, no delay
+flags):
+
+| run | wall | squashes | earlyCutoffs | retired | checksRun | pushesSeen | hits/miss | retire.retry | retire.failed |
+|---|---|---|---|---|---|---|---|---|---|
+| multi #1 | 67 s | 4 | 3 | 5 | 8 | 12 | 2/1 | 0 | 0 |
+| multi #2 | 77 s | 4 | 2 | 5 | 8 | 12 | 2/1 | — | — |
+| multi #3 | 63 s | 4 | 3 | 5 | 8 | 12 | 2/1 | — | — |
+| multi #4 | 66 s | 4 | 3 | 5 | 9 | 12 | 2/1 | — | — |
+| multi #5 | 63 s | 4 | 3 | 5 | 8 | 12 | 2/1 | 0 | 0 |
+| main | 56 s | 3 | 2 | 3 | 4 | 8 | 2/1 | 0 | 0 |
+| failing-check | 58 s | 2 | 1 | 3 | 5 | 8 | 2/1 | — | — |
+
+`retire.retry` is expected to be ~never now: the race it exists for is
+closed by serialization (a rejection can only come from out-of-band trunk
+writers). Runs #1 and #5's event feeds confirm 3 splice candidate checks
+each, all on commits that became trunk head, and zero `retire.failed`.
+`--delay-ready` is retired (see `app/dashboard/NOTES.md`).
 
 ## Cloudflare resources created
 

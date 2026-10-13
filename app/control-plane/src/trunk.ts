@@ -16,11 +16,24 @@
 // poll their own forks only).
 
 import { DurableObject } from "cloudflare:workers";
-import { realArtifacts, type ArtifactsPort, type RetireArgs, type RetireOutcome, type RetirerPort } from "./ports.ts";
+import {
+	realArtifacts,
+	realChecker,
+	type ArtifactsPort,
+	type AtomicRetireResult,
+	type CheckerPort,
+	type RetireArgs,
+	type RetireOutcome,
+	type RetirerPort,
+} from "./ports.ts";
 import { realRetirer, type ArtifactsBinding } from "./retire.ts";
+import { retireAtomic } from "./atomic.ts";
 import type { Env } from "./do.ts";
 
-export const TRUNK_NAME = "trunk-t14";
+// Name bump at T17: the old "trunk-t14" instance stays warm on its 3s alarm
+// and kept serving the pre-T17 class (RPC "retireAtomic not implemented").
+// A fresh idFromName boots the new code; trunkInit re-derives head state.
+export const TRUNK_NAME = "trunk-t17";
 const TRUNK_REPO = "arb-trunk";
 const TRUNK_KEY = "trunk";
 const TOKEN_TTL_S = 3600;
@@ -34,15 +47,17 @@ export interface TrunkInfo {
 export class ArbTrunk extends DurableObject<Env> {
 	private artifacts: ArtifactsPort;
 	private retirer: RetirerPort;
+	private checker: CheckerPort;
 	private trunk: TrunkInfo = { repo: "", remote: "", commit: null };
-	/** Serializes trunk mutations (retire + moveBranch) across interleaved
-	 * async handlers. */
+	/** Serializes trunk mutations (retire + moveBranch + retireAtomic) across
+	 * interleaved async handlers. */
 	private queue: Promise<unknown> = Promise.resolve();
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.artifacts = realArtifacts(env.ARTIFACTS as Parameters<typeof realArtifacts>[0]);
 		this.retirer = realRetirer(env.ARTIFACTS as ArtifactsBinding);
+		this.checker = realChecker({ ARTIFACTS: env.ARTIFACTS, LOADER: env.LOADER });
 		ctx.blockConcurrencyWhile(async () => {
 			this.trunk = (await ctx.storage.get<TrunkInfo>(TRUNK_KEY)) ?? this.trunk;
 		});
@@ -105,6 +120,25 @@ export class ArbTrunk extends DurableObject<Env> {
 			await this.retirer.moveBranch(args);
 			this.trunk.commit = args.commit;
 			await this.persist();
+		});
+	}
+
+	/** T17: one fully atomic retire attempt cycle. The WHOLE sequence —
+	 * read head -> ff/splice decision -> candidate build -> candidate check
+	 * -> move main — runs inside a single queue slot, so no other component
+	 * can land on trunk in between (the T16 stale-candidate wedge). Rejected
+	 * moves rebuild from the new head and re-check (bounded, see atomic.ts).
+	 * The caller replays `attempts` into check/retry events and applies the
+	 * final outcome; a `retry-exhausted` result is a clean failure the
+	 * component can retry on its next cascade — never a wedge. */
+	async retireAtomic(args: RetireArgs): Promise<AtomicRetireResult> {
+		return this.enqueue(async () => {
+			const res = await retireAtomic(args, { retirer: this.retirer, checker: this.checker });
+			if (res.outcome === "fast-forward" || res.outcome === "splice") {
+				this.trunk.commit = res.commit;
+				await this.persist();
+			}
+			return res;
 		});
 	}
 

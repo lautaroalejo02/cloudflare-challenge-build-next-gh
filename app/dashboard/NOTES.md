@@ -42,7 +42,8 @@ control-plane Worker serves this directory at `/` later.
   `app/demo`), keeps rolling until it exits +4 s, then saves
   `recordings/<name>.webm` + `.timeline.txt`. Optional `--delay-ready
   <entryId>:<ms>` fronts the demo with a loopback proxy that holds only that
-  entry's `ready` POST (see "Live footage" below for why multi needs it).
+  entry's `ready` POST (kept for debugging; no scenario needs it since the
+  T17 trunk-race fix — see "Live footage" below).
 
 ## Run
 
@@ -76,7 +77,7 @@ the scenarios all exited 0 with all entries retired in order.
 cd app/dashboard
 npx playwright install ffmpeg          # once — recordVideo needs the bundled ffmpeg
 npm run record:live -- --name main
-npm run record:live -- --name multi --scenario multi --delay-ready e5:30000
+npm run record:live -- --name multi --scenario multi
 npm run record:live -- --name failing-check --scenario failing-check
 ```
 
@@ -85,21 +86,17 @@ Options: `--base <url>` (default the production worker), `--size WxH`
 footage after the scenario exits, default 4000), `--delay-ready
 <entryId>:<ms>`.
 
-`--delay-ready` for multi (IMPORTANT): the two components' splice retirements
-are scripted to land within the same ~2 s window. The splice candidate is
-built on the trunk head at `retire()` time but `moveBranch` pushes to `main`
-only after the candidate check — so when component B lands between A's
-candidate and A's `moveBranch`, A gets a non-fast-forward rejection,
-`_internal.retiring[A]` is never cleared, and the component's head entry
-wedges at `ready` until the 5-min timeout (agent logs `ready rejected: Push
-rejected because it was not a simple fast-forward.`). Observed in 4/4
-unmodified live multi runs — a real control-plane defect (stale-candidate
-window, shared `arb-candidate` scratch ref, no retry). The recordings use a
-30 s delay on `POST /api/entries/e5/ready` only (e5 is deterministically the
-payments-ui entry, registered last); this is client-side timing, identical to
-a slower agent — every event, squash, check and splice in the take is real.
-If the control plane gets a candidate rebuild/retry on non-FF, rerun multi
-without `--delay-ready`.
+`--delay-ready` (historical, now unnecessary): the T16 takes used
+`--delay-ready e5:30000` to work around a cross-component splice-candidate
+race — the candidate was built on the trunk head at `retire()` time but
+`moveBranch` pushed to `main` only after the candidate check, so a sibling
+landing in between produced a non-fast-forward rejection and wedged the
+component (`_internal.retiring` never cleared; `ready rejected: Push
+rejected because it was not a simple fast-forward.`). T17 made the whole
+retire cycle atomic inside `ArbTrunk` with bounded rebuilds, so multi runs
+cleanly without any delay. The flag still works if a staggered take is ever
+wanted; every event, squash, check and splice in the T16 takes was real —
+the delay was client-side timing only.
 
 ### Key moments (video timestamps ≈ demo-spawn offset + timeline `+Ns`)
 

@@ -494,7 +494,7 @@ function retiring(state: RobState, id: string, commit: string): { state: RobStat
 	return { state: r.state, effects: r.effects };
 }
 
-test("splice candidate: planned -> check on trunk -> pass -> retire.commit", () => {
+test("atomic splice: checked -> retire.done lands the candidate", () => {
 	let s = trunked("t0");
 	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
 	const r = retiring(s, "e1", "c1");
@@ -503,45 +503,157 @@ test("splice candidate: planned -> check on trunk -> pass -> retire.commit", () 
 	assert.equal(re.length, 1);
 	assert.equal(re[0].baseCommit, "t0");
 
-	// Retirer reports a splice candidate -> check effect targets the trunk repo
-	s = run(s, { type: "retire.planned", entryId: "e1", candidate: "cand1" });
+	// ArbTrunk ran the candidate check inside the atomic slot; the component
+	// replays it as splice check events, then lands via retire.done.
 	const r2 = runEff(s, {
-		type: "check.done",
+		type: "retire.checked",
 		entryId: "e1",
+		candidate: "cand1",
 		result: { commit: "cand1", passed: 2, failed: 0, durationMs: 7, results: [] },
 	});
 	s = r2.state;
-	const rc = r2.effects.filter((e) => e.type === "retire.commit");
-	assert.equal(rc.length, 1);
-	assert.equal(rc[0].candidate, "cand1");
-	assert.equal(rc[0].toRepo, "arb-trunk");
-	assert.equal(broadcasts(r2.effects, "check.passed").length, 1);
+	const evs = broadcasts(r2.effects);
+	assert.equal(evs[0].type, "check.started");
+	assert.equal((evs[0].data as { splice?: boolean }).splice, true);
+	assert.equal(evs[1].type, "check.passed");
+	assert.equal((evs[1].data as { splice?: boolean }).splice, true);
+	assert.equal(entry(s, "e1").status, "ready"); // still retiring, not retired yet
 
-	s = run(s, { type: "retire.done", entryId: "e1", commit: "cand1", mode: "splice" });
+	s = run(s, { type: "retire.done", entryId: "e1", commit: "cand1", entryCommit: "c1", mode: "splice" });
 	assert.equal(entry(s, "e1").status, "retired");
 	assert.equal(s.trunk.commit, "cand1");
 	const retiredEv = s._internal.eventLog.find((ev) => ev.type === "retired")!;
 	assert.equal((retiredEv.data as { mode: string }).mode, "splice");
 });
 
-test("splice candidate: failed candidate check -> failed, no retire.commit", () => {
+test("atomic splice: failed candidate check -> failed, retiring cleared", () => {
 	let s = trunked("t0");
 	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
 	s = retiring(s, "e1", "c1").state;
-	s = run(s, { type: "retire.planned", entryId: "e1", candidate: "cand1" });
 	const { state, effects } = runEff(s, {
-		type: "check.done",
+		type: "retire.checked",
 		entryId: "e1",
+		candidate: "cand1",
 		result: { commit: "cand1", passed: 0, failed: 1, durationMs: 7, results: [{ name: "t", ok: false }] },
 	});
 	s = state;
 	assert.equal(entry(s, "e1").status, "failed");
-	assert.equal(effects.filter((e) => e.type === "retire.commit").length, 0);
-	assert.equal(s._internal.retireCandidate["e1"], undefined);
+	assert.equal(s._internal.retiring["e1"], undefined);
+	assert.equal(s._internal.retireStart["e1"], undefined);
+	assert.equal(broadcasts(effects, "check.failed").length, 1);
+	// No re-fire: a failed check is a verdict, not a race.
+	assert.equal(effects.filter((e) => e.type === "retire").length, 0);
 
 	// A new push clears the failed state and allows a later re-retire.
 	s = run(s, { type: "push", repo: "arb-e1-api-0", commit: "c2", exports: {} });
 	assert.equal(entry(s, "e1").status, "speculating");
+});
+
+test("retire.retry: narrates a rebuild, keeps retiring, does not re-fire", () => {
+	let s = trunked("t0");
+	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+	s = retiring(s, "e1", "c1").state;
+	const { state, effects } = runEff(s, { type: "retire.retry", entryId: "e1", attempt: 1, reason: "non-fast-forward" });
+	s = state;
+	assert.equal(s._internal.retiring["e1"], true);
+	const evs = broadcasts(effects, "retire.retry");
+	assert.equal(evs.length, 1);
+	assert.deepEqual(evs[0].data, { attempt: 1, reason: "non-fast-forward" });
+	assert.equal(effects.filter((e) => e.type === "retire").length, 0);
+	// The eventual land still retires normally.
+	s = run(s, { type: "retire.done", entryId: "e1", commit: "cand2", entryCommit: "c1", mode: "splice" });
+	assert.equal(entry(s, "e1").status, "retired");
+});
+
+test("retire.failed: clears retiring, auto-retries below the bound", () => {
+	let s = trunked("t0");
+	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+	s = retiring(s, "e1", "c1").state;
+	// First exhausted cycle: retiring cleared, strike 1, cascade re-fires.
+	const r1 = runEff(s, { type: "retire.failed", entryId: "e1", reason: "non-fast-forward" });
+	s = r1.state;
+	assert.equal(s._internal.retireStrikes["e1"], 1);
+	assert.equal(broadcasts(r1.effects, "retire.failed").length, 1);
+	const re1 = r1.effects.filter((e) => e.type === "retire");
+	assert.equal(re1.length, 1); // next cascade retried automatically
+	assert.equal(s._internal.retiring["e1"], true);
+	// Second exhausted cycle: strike 2, still auto-retrying.
+	const r2 = runEff(s, { type: "retire.failed", entryId: "e1", reason: "non-fast-forward" });
+	s = r2.state;
+	assert.equal(s._internal.retireStrikes["e1"], 2);
+	assert.equal(r2.effects.filter((e) => e.type === "retire").length, 1);
+	// Third: bound reached — parked at failed, no further retire effect.
+	const r3 = runEff(s, { type: "retire.failed", entryId: "e1", reason: "non-fast-forward" });
+	s = r3.state;
+	assert.equal(s._internal.retireStrikes["e1"], 3);
+	assert.equal(entry(s, "e1").status, "failed");
+	assert.equal(r3.effects.filter((e) => e.type === "retire").length, 0);
+	const last = broadcasts(r3.effects, "retire.failed").at(-1)!;
+	assert.equal((last.data as { exhausted: boolean }).exhausted, true);
+});
+
+test("retire.failed: a push or re-ready resets strikes and re-arms retirement", () => {
+	const failedAtBound = (): RobState => {
+		let s = trunked("t0");
+		s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+		s = retiring(s, "e1", "c1").state;
+		for (let i = 0; i < 3; i++) {
+			s = run(s, { type: "retire.failed", entryId: "e1", reason: "x" });
+		}
+		assert.equal(entry(s, "e1").status, "failed");
+		return s;
+	};
+
+	// Path 1: a new push resets everything.
+	let s = failedAtBound();
+	s = run(s, { type: "push", repo: "arb-e1-api-0", commit: "c2", exports: {} });
+	assert.equal(s._internal.retireStrikes["e1"], undefined);
+	s = run(s, { type: "entry.ready", entryId: "e1", commit: "c2" });
+	s = run(s, {
+		type: "check.done", entryId: "e1",
+		result: { commit: "c2", passed: 1, failed: 0, durationMs: 5, results: [] },
+	});
+	assert.equal(s._internal.retiring["e1"], true);
+
+	// Path 2: a fresh entry.ready on the same failed head also resets.
+	s = failedAtBound();
+	const r = runEff(s, { type: "entry.ready", entryId: "e1", commit: "c1" });
+	assert.equal(r.state._internal.retireStrikes["e1"], undefined);
+	assert.equal(r.effects.filter((e) => e.type === "retire").length, 1);
+});
+
+test("stale retire.* commands are dropped when the entry is not retiring", () => {
+	let s = trunked("t0");
+	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+	// Never marked ready -> not retiring: every retire.* verdict is stale.
+	for (const cmd of [
+		{ type: "retire.retry", entryId: "e1", attempt: 1, reason: "x" } as Cmd,
+		{ type: "retire.checked", entryId: "e1", candidate: "candX", result: { commit: "candX", passed: 1, failed: 0, durationMs: 1, results: [] } } as Cmd,
+		{ type: "retire.failed", entryId: "e1", reason: "x" } as Cmd,
+	]) {
+		const { state, effects } = runEff(s, cmd);
+		s = state;
+		assert.equal(effects.filter((e) => e.type === "broadcast").length, 0);
+		assert.equal(effects.filter((e) => e.type === "retire").length, 0);
+	}
+	assert.equal(entry(s, "e1").status, "speculating");
+	assert.equal(s._internal.retireStrikes["e1"], undefined);
+});
+
+test("mid-atomic push: stale retire.done is dropped and the new head re-retires", () => {
+	let s = trunked("t0");
+	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
+	s = retiring(s, "e1", "c1").state;
+	// A push lands while the atomic cycle is in flight: retiring cleared,
+	// entry back to speculating at c2.
+	s = run(s, { type: "push", repo: "arb-e1-api-0", commit: "c2", exports: {} });
+	assert.equal(s._internal.retiring["e1"], undefined);
+	// The late-arriving atomic result is stale and must not retire the entry.
+	const r = runEff(s, { type: "retire.done", entryId: "e1", commit: "cand1", entryCommit: "c1", mode: "splice" });
+	s = r.state;
+	assert.equal(entry(s, "e1").status, "speculating");
+	assert.equal(s.trunk.retiredCount, 0);
+	assert.equal(broadcasts(r.effects, "retired").length, 0);
 });
 
 test("trunk-overlap: retire.overlap squashes the entry with reason", () => {
@@ -575,15 +687,6 @@ test("retire.done: entryCommit staleness ignored when head moved", () => {
 	assert.equal(entry(s, "e1").status, "speculating"); // not retired
 	assert.equal(s.trunk.retiredCount, 0);
 	assert.equal(broadcasts(r.effects, "retired").length, 0);
-});
-
-test("retire.planned: stale plan (entry no longer retiring) is dropped", () => {
-	let s = trunked("t0");
-	s = created(s, { agent: "a", lane: "api" }, { commit: "t0" }).state;
-	// never marked ready -> not retiring
-	const { state, effects } = runEff(s, { type: "retire.planned", entryId: "e1", candidate: "candX" });
-	assert.equal(state._internal.retireCandidate["e1"], undefined);
-	assert.equal(effects.filter((e) => e.type === "check").length, 0);
 });
 
 // --- T11: declared-stub value prediction -------------------------------------
