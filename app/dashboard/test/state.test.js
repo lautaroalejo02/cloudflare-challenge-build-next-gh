@@ -338,3 +338,35 @@ test('stageIndex maps statuses onto the pipeline track', () => {
   assert.equal(A.stageIndex({ status: 'retired' }), 4);
   assert.equal(A.stageIndex({ status: 'vetoed' }), -1);
 });
+
+// --- T19: admin key gating + infra checks + recovery events -------------------
+
+test('adminKeyFromSearch reads ?key= and ignores empty values', () => {
+  assert.equal(A.adminKeyFromSearch('?key=abc123'), 'abc123');
+  assert.equal(A.adminKeyFromSearch('?mock=1&key=a%2Bb'), 'a+b');
+  assert.equal(A.adminKeyFromSearch('?key='), null);
+  assert.equal(A.adminKeyFromSearch(''), null);
+  assert.equal(A.adminKeyFromSearch('?keyboard=1'), null);
+});
+
+test('adminHeaders adds x-arb-key only when a key is present', () => {
+  assert.deepEqual(A.adminHeaders('k'), { 'content-type': 'application/json', 'x-arb-key': 'k' });
+  assert.deepEqual(A.adminHeaders(null), { 'content-type': 'application/json' });
+});
+
+test('an infra check.failed is not a verdict: the entry stays checking', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e1', ts: 1, data: { entry: entry({ status: 'checking' }) } });
+  A.applyEvent(s, { type: 'check.failed', entryId: 'e1', ts: 2, data: { commit: 'c9', infra: true, error: 'artifacts 503' } });
+  const e = A.findEntry(s, 'e1');
+  assert.equal(e.status, 'checking');
+  assert.equal(e.checks, null);
+  assert.match(s.log[s.log.length - 1].text, /INFRA/);
+});
+
+test('recover events are logged with their kind', () => {
+  const s = A.createState();
+  A.applyEvent(s, { type: 'entry.created', entryId: 'e1', ts: 1, data: { entry: entry({}) } });
+  A.applyEvent(s, { type: 'recover', entryId: 'e1', ts: 2, data: { kind: 'refork', repo: 'arb-e1-api-1' } });
+  assert.match(s.log[s.log.length - 1].text, /RECOVER refork e1/);
+});

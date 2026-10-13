@@ -292,6 +292,14 @@
       }
       case 'check.passed':
       case 'check.failed': {
+        if (ev.type === 'check.failed' && data.infra) {
+          // T19: the checker could not run (platform outage) — not a verdict.
+          // The control plane keeps the entry checking and retries.
+          bump = 'checksRun';
+          pushLog(state, ev, 'check INFRA error ' + (entry ? entry.id : '?') +
+            (data.splice ? ' (splice candidate)' : '') + (data.error ? ' · ' + data.error : '') + ' · will retry');
+          break;
+        }
         // Real payload: { commit, durationMs, failed? } — no full CheckResult.
         var ok = ev.type === 'check.passed';
         var result = isCheckResult(data.checks) ? data.checks : (isCheckResult(data) ? data : null);
@@ -366,6 +374,12 @@
         if (data.trunk) state.trunk.commit = data.trunk.commit || null;
         pushLog(state, ev, 'reset · buffer cleared');
         return;
+      }
+      case 'recover': {
+        // T19 recovery narration: { kind, repo?, reason?, attempt? }.
+        pushLog(state, ev, 'RECOVER ' + (data.kind || '?') + (ev.entryId ? ' ' + ev.entryId : '') +
+          (data.repo ? ' → ' + data.repo : '') + (data.reason ? ' · ' + data.reason : ''));
+        break;
       }
       default: {
         pushLog(state, ev, ev.type + (ev.entryId ? ' · ' + ev.entryId : ''));
@@ -453,8 +467,24 @@
     }
   }
 
+  /* T19 admin key: protected controls (VETO, robSize) only render and send
+   * when the page URL carries ?key=<admin key>. */
+  function adminKeyFromSearch(search) {
+    var m = /[?&]key=([^&#]*)/.exec(search || '');
+    if (!m || !m[1]) return null;
+    try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+  }
+
+  function adminHeaders(key) {
+    var h = { 'content-type': 'application/json' };
+    if (key) h['x-arb-key'] = key;
+    return h;
+  }
+
   return {
     STAGES: STAGES,
+    adminKeyFromSearch: adminKeyFromSearch,
+    adminHeaders: adminHeaders,
     LOG_CAP: LOG_CAP,
     createState: createState,
     applyEvent: applyEvent,

@@ -10,6 +10,10 @@
     /[?&]mock=1\b/.test(location.search) ||
     /mock\.html$/.test(location.pathname);
 
+  // T19: VETO and robSize need the admin key; they only render with ?key=.
+  var ADMIN_KEY = A.adminKeyFromSearch(location.search);
+  var CAN_CONTROL = MOCK || !!ADMIN_KEY;
+
   var state = A.createState();
   var connMode = 'init'; // init | ws | poll | offline | mock
 
@@ -39,7 +43,9 @@
       '  <div class="stat"><span class="stat-num" id="s-reforkt">—</span><span class="stat-label">re-fork ready</span></div>' +
       '  <div class="controls">' +
       '    <label for="robsize">robSize</label>' +
-      '    <input type="range" id="robsize" min="1" max="16" step="1" value="8">' +
+      (CAN_CONTROL
+        ? '    <input type="range" id="robsize" min="1" max="16" step="1" value="8">'
+        : '') +
       '    <span id="robsize-val" class="mono">8</span>' +
       '  </div>' +
       '</div>' +
@@ -80,12 +86,14 @@
     el.predStat = document.getElementById('s-pred');
     el.reforkT = document.getElementById('s-reforkt');
 
-    el.robsize.addEventListener('input', function () {
-      el.robsizeVal.textContent = el.robsize.value;
-    });
-    el.robsize.addEventListener('change', function () {
-      setRobSize(parseInt(el.robsize.value, 10));
-    });
+    if (el.robsize) {
+      el.robsize.addEventListener('input', function () {
+        el.robsizeVal.textContent = el.robsize.value;
+      });
+      el.robsize.addEventListener('change', function () {
+        setRobSize(parseInt(el.robsize.value, 10));
+      });
+    }
     el.lanes.addEventListener('click', function (ev) {
       var btn = ev.target.closest('button[data-veto]');
       if (btn) vetoEntry(btn.getAttribute('data-veto'));
@@ -126,7 +134,9 @@
     el.predStat.textContent = state.stats.predictionHits + ' hit / ' + state.stats.predictionMisses + ' miss';
     var rf = A.reforkTiming(state);
     el.reforkT.textContent = !rf ? '—' : (rf.deltaMs / 1000).toFixed(1) + ' s';
-    if (document.activeElement !== el.robsize) {
+    if (!el.robsize) {
+      el.robsizeVal.textContent = state.robSize;
+    } else if (document.activeElement !== el.robsize) {
       el.robsize.value = state.robSize;
       el.robsizeVal.textContent = state.robSize;
     }
@@ -273,7 +283,8 @@
       (e.headCommit ? '<span class="commit mono" title="' + esc(e.headCommit) + '">@' + c7(e.headCommit) + '</span>' : '') +
       (e.cutoffs ? '<span class="cutoff" title="early cutoff: producer push left the consumed interface unchanged">⚡cutoff ×' + e.cutoffs + '</span>' : '') +
       checks +
-      (isHead ? '<span class="headtag">HEAD</span><button class="btn veto" data-veto="' + esc(e.id) + '" title="squash transitive dependents">VETO</button>' : '') +
+      (isHead ? '<span class="headtag">HEAD</span>' +
+        (CAN_CONTROL ? '<button class="btn veto" data-veto="' + esc(e.id) + '" title="squash transitive dependents">VETO</button>' : '') : '') +
       '</div>' +
       track +
       '<div class="tags">' + fwd + (fwd && exp ? '<span class="tag-sep"></span>' : '') +
@@ -426,7 +437,7 @@
       return;
     }
     fetch('/api/config', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: A.adminHeaders(ADMIN_KEY),
       body: JSON.stringify({ robSize: v })
     }).then(function (r) {
       if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || r.status); });
@@ -440,7 +451,7 @@
       render();
       return;
     }
-    fetch('/api/entries/' + encodeURIComponent(id) + '/veto', { method: 'POST' })
+    fetch('/api/entries/' + encodeURIComponent(id) + '/veto', { method: 'POST', headers: A.adminHeaders(ADMIN_KEY) })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || r.status); });
       }).catch(function (err) { setConn(connMode, 'veto: ' + err.message); });
