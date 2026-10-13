@@ -699,3 +699,106 @@ config is the optional `TYPESAFE_API_KEY` Worker secret (setup above).
   entries retire. Disable polling entirely via `POLL_FALLBACK=off`.
 - Wrangler warns the `CompiledWasm` rule needs an explicit `fallthrough`;
   deploy succeeds regardless (default rule ignored is harmless here).
+
+## V3b audit fixes
+
+No deployment, live scenario, remote operation, or git-state mutation was performed.
+
+| Finding | Fix | Regression test name (`test/v3b.test.ts`) |
+|---|---|---|
+| 1. Unbound platform fetch | `realJev` uses a wrapper calling `globalThis.fetch` with its global receiver. | `V3b realJev binds the global fetch receiver` |
+| 2. Stale verdict loses net change | Re-mark every pending consumed symbol on the new head, even without a new body map, retaining its original body baseline; new net differences issue another judge effect. Source merging preserves that marked declaration baseline too. | `V3b stale judgment keeps the original net-change baseline on an unrelated push`; `V3b pending judgments follow pushes even without a new body map` |
+| 3. Terminal/squashed producer | Drop verdicts, clear judging, and emit `producer-not-live`; never semantic-refork from that producer. | `V3b drops judgment when producer is retired`; `V3b drops judgment when producer is vetoed` |
+| 4. Fork baseline | Snapshot `{ ...producer.exports, ...forkContent.exports }`, then use the existing drift/inference checks. Forked content wins over a newer producer head, while stub-only names remain. | `V3b inference uses the actual in-flight fork content baseline` |
+| 5. False ownership reports | Keep each entry's own fork interface/body baseline and net changed symbols. Report only imported changed names, never untouched trunk inheritance, and preserve multiple owners of the same file. | `V3b untouched trunk exports never imply undeclared ownership`; `V3b undeclared reports exclude untouched names in another entry's changed file` |
+| 6. Usage selection | Require named/namespace imports and changed consumer-owned files versus `baseCommit`. No pushed usage yields `no-usage` without Jev. Request-wide cap: four distinct files, 6000 characters each. Questions carry paths; code appears only in state. | `V3b never-pushed consumer has no usage and makes no Jev call`; `V3b usage excludes inherited and non-importing files and applies caps`; `V3b Jev usage occurs once in state and questions reference paths` |
+| 7. Source retention/recovery | Persist only live-consumed symbols (4000 characters each); replace removed names; delete `src/<id>` on retire/veto/reset and prune terminal consumers' producer records. Storage failures emit one fixed, sanitized recover event per failed operation. Late terminal pushes cannot recreate deleted records. | `V3b source persistence retains only live-consumed bounded declarations`; `V3b source storage failures emit one sanitized recover command`; `V3b retire veto and reset delete entry source records`; `V3b late terminal producer pushes cannot recreate deleted sources` |
+| 8. Body timeout | Keep the abort timer active through JSON parsing, classify aborted bodies as `timeout`, and cancel non-ok bodies before returning/retrying. | `V3b Jev times out a stalled response body`; `V3b Jev cancels non-ok response bodies` |
+| 9. Prototype names/multiple files | Use own-property membership, safe symbol-map construction, and name-to-deduplicated-file-set storage. Internal optional `SigField.files` / `SourceInput.files` preserve duplicate hasher names from multiple declaring files. | `V3b prototype-named exports are inferred as own properties`; `V3b consumers infer __proto__ as a symbol, not their object prototype`; `V3b duplicate export names retain every declaring file for inference` |
+| 10. Hot path/no key | Forward-fill at DO load/index migration, not every `apply`; preserve existing entry fields during migration. A missing Jev key returns `no-key` before source/Artifacts reads. | `V3b apply hot path preserves stats and never iterates all entries`; `V3b no key skips all Artifacts and source reads` |
+
+### TDD evidence
+
+Each finding had an executed RED regression before its corresponding production fix.
+The initial focused run exposed absent replacement judges, an unauthorized retired-producer
+fork, missing unavailable events, missed inference drift, false undeclared reports,
+prototype-name omissions, a full-entry scan, and null results from unbound fetch.
+A targeted rerun exposed duplicate usage code (2 copies instead of 1), a Jev call for
+a never-pushed consumer, 8 usage files instead of 4, an Artifacts read without a key,
+an unused stored symbol, and no recover command on storage failure. The stalled-body
+test was rerun with a bounded observation deadline and failed because the promise did
+not resolve within the attempt timeout. Cleanup, duplicate-name file preservation,
+untouched-name filtering, declared-consumer seeding, and late-terminal-source recreation
+also had targeted observed RED -> GREEN runs.
+
+Focused command: `node --experimental-strip-types --test test/v3b.test.ts`;
+individual reproductions used `--test-name-pattern` for the exact test names above.
+Final suite: **155/155 passed**, including all 124 pre-existing tests and 31 new V3b tests.
+
+Intentional existing V2 expectation/fixture updates:
+- `v2.test.ts`: fork baselines include actual fork content, even for trunk forks;
+  undeclared ownership requires an observed push changing the owner's file;
+  persisted V1 state calls `migrateState` explicitly at the load boundary.
+- `effects.test.ts`: the consumer base tree is separate from its changed head tree.
+- `jev.test.ts`: question usage references paths rather than duplicating code.
+No test was disabled or skipped.
+
+### Checks and scale result
+
+- `npm test`: 155 tests, 155 passed, 0 failed/cancelled/skipped.
+- `npx tsc --noEmit`: clean, exit 0.
+- `npx wrangler deploy --dry-run --outdir tmp/v3b-dry`: builds, exit 0;
+  existing CompiledWasm fallback warning remains. Nothing was deployed.
+- `BENCH_N=100000 BENCH_MODE=single node --experimental-strip-types bench/run.ts`:
+  1200 timed events; final rerun median **13.5 microseconds/event**, p95 **70.2**,
+  versus recorded T14 median **2.7** (about **5.0x slower**). Initial run was 14.6/64.6
+  and overlapped verification briefly; an intermediate serial rerun was 13.6/58.0.
+  Mean/max callback scans were **0/0**;
+  oracle mismatches **0/200**, containment violations **0**. State was 87.11 MB.
+  This does not establish T14-equivalent speed: the V2 fields/fork bookkeeping and
+  runtime environment differ, and the remaining cost was not causally isolated.
+  The measured `apply` path no longer performs the per-event V2 forward-fill scan.
+
+### Bounded tradeoffs and remaining availability limits
+
+- A newly declared consumer seeds its producer's source baseline from an adopted
+  fork only when that fork captured the current producer head. Covered by
+  `V3b a declared consumer fork seeds its producer source baseline`.
+- Newly inferred symbols, stale fork captures, and migrated states can still lack
+  a retained declaration baseline. They return `no-base` rather than manufacture
+  a semantic verdict. No extra historical Artifacts reads were added to recover
+  that data. A stored before-body that does not match the consumer's judgment mark
+  is likewise unavailable, never judged against the wrong baseline.
+- The public contract remains symbol-name keyed: same-name declarations with
+  distinct signatures/bodies cannot be independently represented by its flat
+  export map. All declaring paths now survive for inference/usage selection.
+- Legacy states without an own fork baseline conservatively omit undeclared
+  ownership reports until re-fork, rather than guessing that inherited code is owned.
+- No coverage runner/threshold is configured; no coverage percentage is claimed.
+
+### Independent-verification correction: squash/reparent retention
+
+The independent verifier found that terminal consumers triggered source pruning,
+but squashed consumers did not. A producer could therefore retain declaration
+sources after its final live consumer became squashed. Every squash path now uses
+`markSquashed`, which schedules a deduplicated producer prune. Veto reparenting
+also prunes the newly selected producer, while execution recomputes the retained
+symbol set from current state, preserving other live consumers' sources.
+
+Observed RED -> GREEN regressions (four failures before the bounded correction,
+four passes afterward):
+- `V3b interface squash prunes the sole consumer's producer sources`
+- `V3b semantic squash prunes the sole consumer's producer sources`
+- `V3b squash source pruning preserves other live consumers' symbols`
+- `V3b veto reparenting prunes sources on the old and new producers`
+
+The benchmark above was measured before this retention-only correction; the
+functional/type/dry-run checks were rerun afterward.
+
+Independent final-source verification passed all 31 focused V3b tests; the parent
+reran `npm test` and observed 155/155 passes. The final-source 100k single-buffer
+benchmark exited 0 with median **28.8 microseconds/event**, p95 **158.4**, about
+**10.7x** the recorded 2.7 median. It reported 1200 timed events, oracle mismatches
+0/200, containment violations 0, callback scans 0/0, and 87.11 MB state. The
+difference from the earlier 13.5 median was not causally isolated; neither run
+establishes baseline performance parity.

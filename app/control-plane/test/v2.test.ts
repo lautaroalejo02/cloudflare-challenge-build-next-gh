@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
 	apply,
 	initialState,
+	migrateState,
 	STALE_MARKER_MS,
 	type ApplyResult,
 	type Cmd,
@@ -138,7 +139,7 @@ test("entry.create: omitted consumes with a producer marks consumesInferred", ()
 	assert.equal(e1.consumesInferred, false); // trunk-forked root: no producer to infer from
 	assert.deepEqual(e1.judging, []);
 	assert.deepEqual(e1.bodies, {});
-	assert.deepEqual(e1.forkedExports, {});
+	assert.deepEqual(e1.forkedExports, { createOrder: "h1" });
 
 	s = run(s, { type: "entry.create", agent: "ui", lane: "ui", producerId: "e1" });
 	const e2 = entry(s, "e2");
@@ -150,10 +151,10 @@ test("entry.create: omitted consumes with a producer marks consumesInferred", ()
 	assert.equal(entry(s, "e3").consumesInferred, false);
 });
 
-test("fork.done: forkedExports snapshots the producer's exports, {} for trunk forks", () => {
+test("fork.done: forkedExports snapshots fork content including trunk inheritance", () => {
 	const s = inferredWorld();
 	assert.deepEqual(entry(s, "e2").forkedExports, { createOrder: "h1", Order: "hO" });
-	assert.deepEqual(entry(s, "e1").forkedExports, {});
+	assert.deepEqual(entry(s, "e1").forkedExports, { createOrder: "h1", Order: "hO" });
 });
 
 // --- inference --------------------------------------------------------------
@@ -278,6 +279,8 @@ test("deps.undeclared: imports of another live entry's own files are reported on
 			charge: { signature: "sig3", file: "src/svc/pay.ts" },
 		},
 	});
+	// e3 must actually change its own file, not merely inherit it from trunk.
+	s = run(s, { type: "push", repo: "arb-e3-pay-0", commit: "pay1", exports: { createOrder: "h1", charge: "changed" } });
 	// e2 pushes work importing e3's own file (a lateral, undeclared dep).
 	const r = runEff(s, {
 		type: "push", repo: "arb-e2-ui-0", commit: "u1",
@@ -562,6 +565,7 @@ test("persisted v1 entries forward-fill the V2 fields and keep working", () => {
 	delete (loaded.stats as { judgments?: number }).judgments;
 	delete (loaded.stats as { semanticSquashes?: number }).semanticSquashes;
 	delete (loaded.stats as { inferredDeps?: number }).inferredDeps;
+	migrateState(loaded);
 	// The first bodies-bearing push on a v1 entry only records the baseline
 	// (there is no known prior bodyHash to compare against).
 	let r = runEff(loaded, {

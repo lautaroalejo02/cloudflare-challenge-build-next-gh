@@ -56,6 +56,8 @@ export interface HasherPort {
  * (Jev input) at `commit`, paired with its interface-file and bodyHash. */
 export interface SourceInput {
 	file: string;
+	/** Additional declaring paths when the hasher emits the same name across files. */
+	files?: string[];
 	bodyHash: string;
 	source: string;
 }
@@ -71,7 +73,9 @@ export interface SourceRecord extends SourceInput {
  * storage outside BufferState (the machine stays pure). */
 export interface SourceStorePort {
 	get(entryId: string): Promise<Record<string, SourceRecord>>;
-	merge(entryId: string, map: Record<string, SourceInput>, commit: string): Promise<void>;
+	merge(entryId: string, map: Record<string, SourceInput>, commit: string, baselines?: SymbolHashes): Promise<void>;
+	delete?(entryId: string): Promise<void>;
+	retain?(entryId: string, symbols: string[]): Promise<void>;
 }
 
 /** Pure merge step: the new declaration becomes current; `prev` keeps the
@@ -80,32 +84,39 @@ export function mergeSourceMap(
 	cur: Record<string, SourceRecord>,
 	map: Record<string, SourceInput>,
 	commit: string,
+	baselines: SymbolHashes = {},
 ): Record<string, SourceRecord> {
-	const next = { ...cur };
+	const next: Record<string, SourceRecord> = {};
 	for (const [sym, s] of Object.entries(map)) {
-		const prev = cur[sym];
-		next[sym] = {
+		const prev = Object.hasOwn(cur, sym) ? cur[sym] : undefined;
+		const pinned = Object.hasOwn(baselines, sym) ? baselines[sym] : undefined;
+		Object.defineProperty(next, sym, { enumerable: true, configurable: true, writable: true, value: {
 			file: s.file,
+			...(s.files ? { files: [...new Set(s.files)] } : {}),
 			bodyHash: s.bodyHash,
 			source: s.source.slice(0, 4000),
 			commit,
 			prev:
-				prev && prev.bodyHash !== s.bodyHash
+				pinned !== undefined && prev?.prev?.bodyHash === pinned
+					? prev.prev
+					: prev && prev.bodyHash !== s.bodyHash
 					? { bodyHash: prev.bodyHash, source: prev.source, commit: prev.commit }
 					: (prev?.prev ?? null),
-		};
+		} });
 	}
 	return next;
 }
 
 export interface JevPort {
+	/** False lets the effect runtime short-circuit before storage/Artifacts reads. */
+	available?: boolean;
 	judge(input: JudgeInput): Promise<JudgeVerdict[]>;
 }
 
 /** Real Jev port. A missing key does not throw: `judgeBehavior` returns
  * `no-api-key` null verdicts and the machine treats them as `clear`. */
 export function realJev(apiKey: string | undefined): JevPort {
-	return { judge: (input) => judgeBehavior(input, { apiKey, fetch: globalThis.fetch }) };
+	return { available: !!apiKey, judge: (input) => judgeBehavior(input, { apiKey, fetch: (input, init) => globalThis.fetch(input, init) }) };
 }
 
 // --- Checker / Retirer -------------------------------------------------------

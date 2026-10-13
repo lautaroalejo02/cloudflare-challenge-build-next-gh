@@ -82,7 +82,7 @@ test("judgeBehavior sends the contract payload: state, model, one noul question 
 				instructions: {
 					question: QUESTION,
 					producer: { symbol: "createOrder", before: INPUT.producer[0].before, after: INPUT.producer[0].after },
-					consumer: { usage: [{ file: "src/ui/checkout.ts", code: "createOrder(cart)" }] },
+					consumer: { usage: ["src/ui/checkout.ts"] },
 				},
 				criteria: {
 					true: "The consumer's observable results or correctness change.",

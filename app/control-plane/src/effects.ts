@@ -37,18 +37,21 @@ export function interfaceToMaps(ih: InterfaceHash): {
 	bodies: SymbolHashes;
 	sources: Record<string, SourceInput>;
 } {
-	const exports: SymbolHashes = {};
-	const sigs: SigField = {};
-	const bodies: SymbolHashes = {};
-	const sources: Record<string, SourceInput> = {};
+	const exports: SymbolHashes = Object.create(null);
+	const sigs: SigField = Object.create(null);
+	const bodies: SymbolHashes = Object.create(null);
+	const sources: Record<string, SourceInput> = Object.create(null);
 	for (const s of ih.symbols) {
 		const v2 = s as typeof s & V2Symbol;
+		const previous = Object.hasOwn(sigs, s.name) ? sigs[s.name] : undefined;
+		const previousFiles = typeof previous === "object" ? previous.files ?? (previous.file ? [previous.file] : []) : [];
+		const files = [...new Set([...previousFiles, ...(v2.file ? [v2.file] : [])])];
 		exports[s.name] = s.hash;
-		sigs[s.name] = v2.file ? { signature: s.signature, file: v2.file } : s.signature;
+		sigs[s.name] = v2.file ? { signature: s.signature, file: v2.file, ...(files.length > 1 ? { files } : {}) } : s.signature;
 		if (v2.bodyHash) bodies[s.name] = v2.bodyHash;
-		if (v2.source) sources[s.name] = { file: v2.file ?? "", bodyHash: v2.bodyHash ?? "", source: v2.source };
+		if (v2.source) sources[s.name] = { file: v2.file ?? "", ...(files.length > 1 ? { files } : {}), bodyHash: v2.bodyHash ?? "", source: v2.source };
 	}
-	return { exports, sigs, bodies, sources };
+	return { exports: { ...exports }, sigs: { ...sigs }, bodies: { ...bodies }, sources: { ...sources } };
 }
 
 export interface TokenCache {
@@ -89,6 +92,36 @@ export interface EffectHost {
 
 export interface EffectResults {
 	tokens: Record<string, string>;
+}
+
+/** Sources are retained only while a live direct consumer owns the symbol. */
+export function consumedSymbols(state: RobState, producerId: string): string[] {
+	const symbols = new Set<string>();
+	for (const e of state.entries) {
+		if (e.producerId !== producerId || e.status === "retired" || e.status === "vetoed" || e.status === "squashed") continue;
+		for (const s of Object.keys(e.consumes)) symbols.add(s);
+	}
+	return [...symbols];
+}
+
+async function storeSources(host: EffectHost, entryId: string, sources: Record<string, SourceInput>, commit: string): Promise<void> {
+	if (!host.ports.sources) return;
+	const needed = consumedSymbols(host.state(), entryId);
+	const map = Object.fromEntries(needed.filter(s => Object.hasOwn(sources, s)).map(s => [s, { ...sources[s], source: sources[s].source.slice(0, 4000) }]));
+	const baselines: SymbolHashes = Object.create(null);
+	for (const marks of Object.values(host.state()._internal.judgeMarks)) {
+		for (const [s, mark] of Object.entries(marks)) if (mark.producerId === entryId) baselines[s] = mark.oldBody;
+	}
+	try {
+		await host.ports.sources.merge(entryId, map, commit, baselines);
+	} catch {
+		await reportSourceFailure(host, entryId);
+	}
+}
+
+async function reportSourceFailure(host: EffectHost, entryId: string): Promise<void> {
+	const result = host.apply({ type: "effect.failed", entryId, effect: "source-storage", reason: "source-storage-failed" });
+	if (result.ok) await execEffects(host, result.effects);
 }
 
 export function isAlreadyExists(e: unknown): boolean {
@@ -140,7 +173,7 @@ export async function execEffects(
 		try {
 			await runEffect(host, eff, out, follow);
 		} catch (e) {
-			const reason = errorText(e);
+			const reason = eff.type === "source.delete" || eff.type === "source.prune" ? "source-storage-failed" : errorText(e);
 			if (eff.type === "judge") {
 				// (V2) A judge failure is an unavailable judgment, never a wedge:
 				// the machine clears the marks and treats them as `clear`.
@@ -172,6 +205,12 @@ async function runEffect(host: EffectHost, eff: Effect, out: EffectResults, foll
 		case "broadcast":
 			host.broadcast(eff.event);
 			return;
+		case "source.delete":
+			await ports.sources?.delete?.(eff.entryId);
+			return;
+		case "source.prune":
+			await ports.sources?.retain?.(eff.entryId, consumedSymbols(host.state(), eff.entryId));
+			return;
 		case "token":
 			out.tokens[eff.entryId] = await host.tokens.get(eff.repo);
 			return;
@@ -187,7 +226,7 @@ async function runEffect(host: EffectHost, eff: Effect, out: EffectResults, foll
 			host.registerRepo(created.name);
 			// (V2) Store the forked declarations as Jev `before`/`after` inputs;
 			// storage failures degrade to unavailable judgments, never a wedge.
-			await ports.sources?.merge(eff.entryId, sources, head).catch(() => {});
+			await storeSources(host, eff.entryId, sources, head);
 			follow({
 				type: "fork.done",
 				entryId: eff.entryId,
@@ -199,6 +238,14 @@ async function runEffect(host: EffectHost, eff: Effect, out: EffectResults, foll
 				bodies,
 				planned: eff.toRepo,
 			});
+			// A producer had no retained sources before its first consumer existed.
+			// Seed from the adopted fork only when it captured the current head;
+			// never replace a newer producer declaration with stale fork content.
+			const entry = host.state().entries.find(e => e.id === eff.entryId);
+			const producer = entry?.producerId ? host.state().entries.find(e => e.id === entry.producerId) : undefined;
+			if (entry?.repo === created.name && producer?.headCommit === head && producer.status !== "retired" && producer.status !== "vetoed") {
+				await storeSources(host, producer.id, sources, head);
+			}
 			return;
 		}
 		case "judge": {
@@ -269,31 +316,48 @@ async function runEffect(host: EffectHost, eff: Effect, out: EffectResults, foll
  * declaring files (usage), and ask the Jev port. Missing pieces degrade to
  * `probability: null` verdicts — the machine treats them as `clear`. */
 async function runJudge(host: EffectHost, eff: Extract<Effect, { type: "judge" }>): Promise<JudgeVerdict[]> {
+	const unavailable = (reason: string) => eff.symbols.map(symbol => ({ symbol, probability: null, reason }));
+	if (!host.ports.jev) return unavailable("unavailable");
+	if (host.ports.jev.available === false) return unavailable("no-key");
 	const st = host.state();
 	const consumer = st.entries.find((e) => e.id === eff.consumerId);
-	const recs = (await host.ports.sources?.get(eff.producerId).catch(() => ({} as Record<string, SourceRecord>))) ?? {};
+	if (!consumer?.headCommit || consumer.headCommit === consumer.baseCommit) return unavailable("no-usage");
+	let recs: Record<string, SourceRecord> = {};
+	try { recs = (await host.ports.sources?.get(eff.producerId)) ?? {}; }
+	catch { await reportSourceFailure(host, eff.producerId); }
 	const pairs = eff.symbols.map((symbol) => {
-		const rec = recs[symbol];
-		return rec?.prev ? { symbol, file: rec.file, before: rec.prev.source, after: rec.source } : null;
+		const rec = Object.hasOwn(recs, symbol) ? recs[symbol] : undefined;
+		const mark = st._internal.judgeMarks[eff.consumerId]?.[symbol];
+		if (mark && rec?.prev?.bodyHash !== mark.oldBody) return null;
+		return rec?.prev ? { symbol, files: rec.files ?? [rec.file], before: rec.prev.source, after: rec.source } : null;
 	});
 	// Usage: files in the consumer's tree (at its pushed head, or its fork
 	// base when it never pushed) whose imports reach a judged symbol's file.
-	const usageByFile = new Map<string, { file: string; code: string }[]>();
+	const usageBySymbol = new Map<string, { file: string; code: string }[]>();
+	const selected = new Set<string>();
 	if (consumer) {
-		const commit = consumer.headCommit ?? consumer.baseCommit;
+		const commit = consumer.headCommit;
 		const files = commit ? await withRetry(() => host.ports.artifacts.readTree(consumer.repo, commit), { sleep: host.sleep }) : {};
+		const base = consumer.baseCommit ? await withRetry(() => host.ports.artifacts.readTree(consumer.repo, consumer.baseCommit), { sleep: host.sleep }) : {};
 		const imports = (await host.ports.hasher.extractImports?.(files).catch(() => [])) ?? [];
-		for (const i of imports) {
-			const list = usageByFile.get(i.from) ?? [];
-			list.push({ file: i.file, code: (files[i.file] ?? "").slice(0, JEV_USAGE_LIMIT) });
-			usageByFile.set(i.from, list);
+		for (const p of pairs) {
+			if (!p) continue;
+			const list: { file: string; code: string }[] = [];
+			for (const i of imports) {
+				if (!p.files.includes(i.from) || (!i.names.includes(p.symbol) && !i.names.includes("*"))) continue;
+				if (!Object.hasOwn(files, i.file) || files[i.file] === base[i.file] || list.some(u => u.file === i.file)) continue;
+				if (!selected.has(i.file) && selected.size >= 4) continue;
+				selected.add(i.file);
+				list.push({ file: i.file, code: files[i.file].slice(0, JEV_USAGE_LIMIT) });
+			}
+			usageBySymbol.set(p.symbol, list);
 		}
 	}
 	const need = pairs.map((p): JudgeSymbolInput | null =>
-		p === null ? null : { symbol: p.symbol, before: p.before, after: p.after, usage: usageByFile.get(p.file) ?? [] },
+		p === null ? null : { symbol: p.symbol, before: p.before, after: p.after, usage: usageBySymbol.get(p.symbol) ?? [] },
 	);
 	const bySymbol = new Map<string, JudgeVerdict>();
-	const judgeable = need.filter((x): x is JudgeSymbolInput => x !== null);
+	const judgeable = need.filter((x): x is JudgeSymbolInput => x !== null && x.usage.length > 0);
 	if (judgeable.length && host.ports.jev) {
 		const input: JudgeInput = {
 			producer: judgeable,
@@ -304,6 +368,7 @@ async function runJudge(host: EffectHost, eff: Extract<Effect, { type: "judge" }
 	return eff.symbols.map((symbol, i) =>
 		pairs[i] === null
 			? { symbol, probability: null, reason: "no-base" }
+			: !need[i]?.usage.length ? { symbol, probability: null, reason: "no-usage" }
 			: (bySymbol.get(symbol) ?? { symbol, probability: null, reason: host.ports.jev ? "missing-answer" : "unavailable" }),
 	);
 }
@@ -323,7 +388,7 @@ export async function pushCommand(host: EffectHost, repo: string, commit: string
 		return { type: "push", repo, commit };
 	}
 	const entry = st.entries.find((e) => e.repo === repo || st._internal.pending[e.id] === repo);
-	if (!entry || entry.headCommit === commit) return null;
+	if (!entry || entry.headCommit === commit || entry.status === "retired" || entry.status === "vetoed") return null;
 	const retry = { sleep: host.sleep };
 	const files = await withRetry(() => host.ports.artifacts.readTree(repo, commit), retry);
 	const { exports, sigs, bodies, sources } = interfaceToMaps(await host.ports.hasher.hashInterface(files));
@@ -332,8 +397,11 @@ export async function pushCommand(host: EffectHost, repo: string, commit: string
 	const imports = await host.ports.hasher.extractImports?.(files).catch(() => undefined);
 	const head = (await withRetry(() => host.ports.artifacts.log(repo, 1), retry))[0]?.hash;
 	if (head && head !== commit) return null;
+	// Retirement/veto may land while the asynchronous read/hash runs.
+	const current = host.state().entries.find(e => e.id === entry.id);
+	if (!current || current.status === "retired" || current.status === "vetoed") return null;
 	// (V2) Persist the pushed declarations for Jev `before`/`after`; a
 	// storage failure degrades to unavailable judgments, never a lost push.
-	await host.ports.sources?.merge(entry.id, sources, commit).catch(() => {});
+	await storeSources(host, entry.id, sources, commit);
 	return { type: "push", repo, commit, exports, sigs, bodies, imports };
 }

@@ -51,7 +51,7 @@ export interface ImportRef {
 /** (V2) Signature map arriving on push/fork.done commands: either the plain
  * signature text or `{ signature, file }` when the hasher knows the
  * declaring file (needed by import-based dependency inference). */
-export type SigField = Record<string, string | { signature: string; file?: string }>;
+export type SigField = Record<string, string | { signature: string; file?: string; files?: string[] }>;
 
 /** (V2) One per-symbol Jev verdict carried by `judge.done`. */
 export interface JudgeVerdict {
@@ -244,7 +244,10 @@ export interface RobInternal {
 	predConsumed: Record<string, string[]>;
 	/** (V2) entryId -> exported symbol -> repo-relative declaring file
 	 * (drives import-based dependency inference and `deps.undeclared`). */
-	files: Record<string, SymbolHashes>;
+	files: Record<string, Record<string, string[]>>;
+	/** Own fork content baseline and current net-owned symbols, not trunk inheritance. */
+	forkBaselines: Record<string, { exports: SymbolHashes; bodies: SymbolHashes }>;
+	changedSymbols: Record<string, string[]>;
 	/** (V2) consumerId -> consumed symbol -> pending Jev mark (sweep +
 	 * staleness bookkeeping; `judging` on the entry is the public view). */
 	judgeMarks: Record<string, Record<string, JudgeMark>>;
@@ -307,6 +310,8 @@ export function initialState(): RobState {
 			repoAlias: {},
 			predConsumed: {},
 			files: {},
+			forkBaselines: {},
+			changedSymbols: {},
 			judgeMarks: {},
 			depsReported: {},
 			eventLog: [],
@@ -412,6 +417,8 @@ export type Cmd =
 	| { type: "reset" };
 
 export type Effect =
+	| { type: "source.delete"; entryId: string }
+	| { type: "source.prune"; entryId: string }
 	| { type: "fork"; entryId: string; fromRepo: string; toRepo: string }
 	| { type: "token"; entryId: string; repo: string }
 	| { type: "check"; entryId: string; repo: string; commit: string }
@@ -444,14 +451,15 @@ export function entryDefaults(): Pick<Entry, "consumesInferred" | "forkedExports
 }
 
 /** Split a `SigField` into plain signatures + declaring files. */
-function splitSigs(field: SigField | undefined): { sigs: SymbolSignatures; files: SymbolHashes } {
-	const sigs: SymbolSignatures = {};
-	const files: SymbolHashes = {};
+function splitSigs(field: SigField | undefined): { sigs: SymbolSignatures; files: Record<string, string[]> } {
+	const sigs: SymbolSignatures = Object.create(null);
+	const files: Record<string, string[]> = Object.create(null);
 	for (const [k, v] of Object.entries(field ?? {})) {
 		if (typeof v === "string") sigs[k] = v;
 		else {
 			sigs[k] = v.signature;
-			if (v.file) files[k] = v.file;
+			const declaring = v.files ?? (v.file ? [v.file] : []);
+			if (declaring.length) files[k] = [...new Set(declaring)];
 		}
 	}
 	return { sigs, files };
@@ -464,33 +472,55 @@ function clearJudging(state: RobState, e: Entry): void {
 	delete state._internal.judgeMarks[e.id];
 }
 
+/** Losing a live consumer changes source retention even when no producer push follows. */
+function pruneProducerSources(effects: Effect[], producerId: string | null): void {
+	if (producerId && !effects.some(e => e.type === "source.prune" && e.entryId === producerId)) {
+		effects.push({ type: "source.prune", entryId: producerId });
+	}
+}
+
+function markSquashed(effects: Effect[], entry: Entry): void {
+	entry.status = "squashed";
+	pruneProducerSources(effects, entry.producerId);
+}
+
 /** Rebuild every index from `entries` + `pending` (re-sorts entries by seq).
  * Called on first apply after load/persist-restore, and whenever `entries`
  * changed size outside the machine. */
 export function rebuildIndexes(state: RobState): RobIndexes {
+	migrateState(state);
 	const entries = state.entries;
 	entries.sort((a, b) => a.seq - b.seq);
 	const i = emptyIndexes();
 	for (const e of entries) {
-		// (V2) forward-fill fields absent from v1-persisted entries.
-		Object.assign(e, entryDefaults(), e);
 		i.byId[e.id] = e.seq;
 		if (e.repo) i.byRepo[e.repo] = e.id;
 		if (e.producerId) (i.childrenOf[e.producerId] ??= []).push(e.id);
 		if (e.status !== "retired") i.active += 1;
 		if (e.seq > i.lastSeq) i.lastSeq = e.seq;
 	}
-	// (V2) forward-fill stats/internal maps added after v1.
-	state.stats = { ...initialState().stats, ...state.stats };
-	const ii = state._internal;
-	ii.files ??= {};
-	ii.judgeMarks ??= {};
-	ii.depsReported ??= {};
 	for (const [id, repo] of Object.entries(state._internal.pending)) i.pendingRepo[repo] = id;
 	while (i.headCursor < entries.length && !live(entries[i.headCursor])) i.headCursor++;
 	i.n = entries.length;
 	state._internal.idx = i;
 	return i;
+}
+
+/** Forward-fill persisted state once at the load/migration boundary, not per event. */
+export function migrateState(state: RobState): RobState {
+	const defaults = initialState();
+	state.stats = { ...defaults.stats, ...state.stats };
+	state._internal = { ...defaults._internal, ...state._internal };
+	for (const e of state.entries) {
+		e.consumesInferred ??= false;
+		e.forkedExports ??= {};
+		e.bodies ??= {};
+		e.judging ??= [];
+		for (const [name, files] of Object.entries(state._internal.files[e.id] ?? {})) {
+			if (typeof files === "string") state._internal.files[e.id][name] = [files];
+		}
+	}
+	return state;
 }
 
 /** The maintained index set. Rebuilds lazily when absent or when `entries`
@@ -611,7 +641,7 @@ function consumedDiff(
 ): Diagnosis["changed"] {
 	const changed: Diagnosis["changed"] = [];
 	for (const sym of Object.keys(consumes)) {
-		const newHash = newExports[sym] ?? "";
+		const newHash = Object.hasOwn(newExports, sym) ? newExports[sym] : "";
 		if (consumes[sym] !== newHash) {
 			changed.push({
 				symbol: sym,
@@ -651,7 +681,7 @@ function squashTree(
 		baseExports = { ...baseExports };
 		baseSigs = { ...baseSigs };
 		for (const sym of producer.predicted) {
-			baseExports[sym] = producer.exports[sym] ?? "";
+			Object.defineProperty(baseExports, sym, { value: Object.hasOwn(producer.exports, sym) ? producer.exports[sym] : "", enumerable: true, configurable: true, writable: true });
 			baseSigs[sym] = ownSigs[sym] ?? "";
 		}
 	}
@@ -673,12 +703,13 @@ function squashTree(
 		const oldSigs = state._internal.sigs[c.id] ?? {};
 		const changed = consumedDiff(c.consumes, newExports, oldSigs, newSigs);
 		c.generation += 1;
-		c.status = "squashed";
+		markSquashed(effects, c);
 		c.diagnosis = { reason, changed, producerCommit };
 		clearJudging(state, c);
 		if (reparentTo !== undefined) {
 			reparent(state, c.id, c.producerId, reparentTo);
 			c.producerId = reparentTo;
+			pruneProducerSources(effects, c.producerId);
 		}
 		state.stats.squashes += 1;
 		const newRepo = forkEffect(state, effects, c, fromRepo, now);
@@ -750,16 +781,6 @@ function cascade(state: RobState, effects: Effect[], now: number): void {
 
 export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult {
 	const effects: Effect[] = [];
-	// (V2) forward-fill fields missing from v1-persisted states; idx() may
-	// skip rebuildIndexes when the index still matches, so this runs here.
-	state.stats = { ...initialState().stats, ...state.stats };
-	const ii0 = state._internal;
-	ii0.files ??= {};
-	ii0.judgeMarks ??= {};
-	ii0.depsReported ??= {};
-	for (const e of state.entries) {
-		if (e.judging === undefined) Object.assign(e, entryDefaults(), e);
-	}
 	idx(state); // heal indexes if entries moved outside the machine
 
 	switch (cmd.type) {
@@ -794,10 +815,10 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const pinned: string[] = [];
 			for (const s of cmd.consumes ?? []) {
 				if (producer && producerPredicted.includes(s)) {
-					consumes[s] = producer.exports[s] ?? "";
+					Object.defineProperty(consumes, s, { value: Object.hasOwn(producer.exports, s) ? producer.exports[s] : "", enumerable: true, configurable: true, writable: true });
 					pinned.push(s);
 				} else {
-					consumes[s] = "";
+					Object.defineProperty(consumes, s, { value: "", enumerable: true, configurable: true, writable: true });
 				}
 			}
 			// (V2) `consumes` omitted on a produced entry => infer it from
@@ -887,14 +908,16 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			// A fresh base makes every pending judgment moot (generation moved).
 			clearJudging(state, e);
 			e.bodies = cmd.bodies ?? {};
+			state._internal.forkBaselines[e.id] = { exports: { ...cmd.exports }, bodies: { ...e.bodies } };
+			state._internal.changedSymbols[e.id] = [];
 			const newSigs = splitSigs(cmd.sigs);
 			// A stubbed producer's fork carries its pre-push base: keep the
 			// declared (predicted) hashes and signatures for predicted symbols
 			// until the first real push resolves them against reality.
 			if (e.predicted.length) {
-				const keep: SymbolHashes = {};
-				const keepSig: SymbolSignatures = {};
-				const keepFile: SymbolHashes = {};
+				const keep: SymbolHashes = Object.create(null);
+				const keepSig: SymbolSignatures = Object.create(null);
+				const keepFile: Record<string, string[]> = {};
 				const curSigs = state._internal.sigs[e.id] ?? {};
 				const curFiles = state._internal.files[e.id] ?? {};
 				for (const sym of e.predicted) {
@@ -914,7 +937,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			// hash, not the fork's (pre-push) content; unpinned ones fill in.
 			const pinned = new Set(state._internal.predConsumed[e.id] ?? []);
 			for (const sym of Object.keys(e.consumes)) {
-				if (!pinned.has(sym)) e.consumes[sym] = cmd.exports[sym] ?? e.consumes[sym];
+				if (!pinned.has(sym) && Object.hasOwn(cmd.exports, sym)) e.consumes[sym] = cmd.exports[sym];
 			}
 			const planned = state._internal.pending[e.id];
 			if (planned && planned !== cmd.repo) state._internal.repoAlias[planned] = cmd.repo;
@@ -934,7 +957,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const producer = e.producerId ? find(state, e.producerId) : undefined;
 			// (V2) Snapshot the producer's exports at (re-)fork time: the
 			// baseline every import-inferred consumes value is pinned to.
-			e.forkedExports = producer ? { ...producer.exports } : {};
+			e.forkedExports = { ...(producer?.exports ?? {}), ...cmd.exports };
 			if (
 				producer &&
 				live(producer) &&
@@ -945,7 +968,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			) {
 				const prodSigs = state._internal.sigs[producer.id] ?? {};
 				const eSigs = state._internal.sigs[e.id] ?? {};
-				const unpinned: SymbolHashes = {};
+				const unpinned: SymbolHashes = Object.create(null);
 				for (const sym of Object.keys(e.consumes)) if (!pinned.has(sym)) unpinned[sym] = e.consumes[sym];
 				const changed = consumedDiff(unpinned, producer.exports, eSigs, prodSigs);
 				if (changed.length) {
@@ -956,7 +979,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 						data: { producerId: producer.id, commit: producerCommit, changed, drift: true },
 					});
 					e.generation += 1;
-					e.status = "squashed";
+					markSquashed(effects, e);
 					e.diagnosis = { reason: "interface-changed", changed, producerCommit };
 					state.stats.squashes += 1;
 					const newRepo = forkEffect(state, effects, e, producer.repo, now);
@@ -1023,6 +1046,13 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			const oldBodies = { ...(target.bodies ?? {}) };
 			if (cmd.bodies) target.bodies = cmd.bodies;
 			const newBodies = target.bodies ?? {};
+			const baseline = state._internal.forkBaselines[target.id];
+			if (baseline) {
+				state._internal.changedSymbols[target.id] = Object.keys(target.exports).filter(s =>
+					(!Object.hasOwn(baseline.exports, s) || target.exports[s] !== baseline.exports[s]) ||
+					(Object.hasOwn(newBodies, s) && Object.hasOwn(baseline.bodies, s) && newBodies[s] !== baseline.bodies[s]),
+				);
+			}
 			if (predictedSyms.length) target.predicted = [];
 			target.diagnosis = null;
 			if (target.status === "squashed" || target.status === "failed" || target.status === "ready" || target.status === "checking") {
@@ -1047,18 +1077,23 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			if (cmd.imports && target.consumesInferred && pushProducer) {
 				const prodFiles = state._internal.files[pushProducer.id] ?? {};
 				const symsByFile = new Map<string, string[]>();
-				for (const [sym, f] of Object.entries(prodFiles)) {
-					const list = symsByFile.get(f) ?? [];
-					list.push(sym);
-					symsByFile.set(f, list);
+				for (const [sym, files] of Object.entries(prodFiles)) {
+					if (!Object.hasOwn(pushProducer.exports, sym)) continue;
+					for (const f of files) {
+						const list = symsByFile.get(f) ?? [];
+						list.push(sym);
+						symsByFile.set(f, list);
+					}
 				}
 				const inferred: SymbolHashes = {};
 				for (const imp of cmd.imports) {
 					const here = symsByFile.get(imp.from);
 					if (!here) continue;
 					for (const n of imp.names.includes("*") ? here : imp.names) {
-						if (!here.includes(n) || n in target.consumes) continue;
-						target.consumes[n] = inferred[n] = target.forkedExports[n] ?? "";
+						if (!here.includes(n) || Object.hasOwn(target.consumes, n)) continue;
+						const hash = Object.hasOwn(target.forkedExports, n) ? target.forkedExports[n] : "";
+						Object.defineProperty(target.consumes, n, { value: hash, enumerable: true, configurable: true, writable: true });
+						Object.defineProperty(inferred, n, { value: hash, enumerable: true, configurable: true, writable: true });
 					}
 				}
 				if (Object.keys(inferred).length) {
@@ -1089,28 +1124,34 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				for (const a of ancestors) {
 					for (const s of Object.keys(find(state, a)?.exports ?? {})) ancExports.add(s);
 				}
-				const fileOwner = new Map<string, { entryId: string; syms: string[] }>();
+				const fileOwners = new Map<string, Map<string, string[]>>();
 				for (const o of state.entries) {
 					if (o.id === target.id || !live(o) || ancestors.has(o.id)) continue;
-					for (const [sym, f] of Object.entries(state._internal.files[o.id] ?? {})) {
-						if (!f || ancExports.has(sym)) continue;
-						const rec = fileOwner.get(f) ?? { entryId: o.id, syms: [] };
-						rec.syms.push(sym);
-						fileOwner.set(f, rec);
+					for (const [sym, files] of Object.entries(state._internal.files[o.id] ?? {})) {
+						if (!Object.hasOwn(o.exports, sym) || !state._internal.changedSymbols[o.id]?.includes(sym) || ancExports.has(sym)) continue;
+						for (const f of files) {
+							const owners = fileOwners.get(f) ?? new Map<string, string[]>();
+							const symbols = owners.get(o.id) ?? [];
+							symbols.push(sym);
+							owners.set(o.id, symbols);
+							fileOwners.set(f, owners);
+						}
 					}
 				}
 				const reported = (state._internal.depsReported[target.id] ??= []);
 				const byOwner = new Map<string, { paths: Set<string>; symbols: Set<string> }>();
 				for (const imp of cmd.imports) {
-					const o = fileOwner.get(imp.from);
-					if (!o) continue;
-					const key = `${o.entryId}|${imp.from}`;
-					if (reported.includes(key)) continue;
-					reported.push(key);
-					const g = byOwner.get(o.entryId) ?? { paths: new Set<string>(), symbols: new Set<string>() };
-					for (const n of imp.names.includes("*") ? o.syms : imp.names) g.symbols.add(n);
-					g.paths.add(imp.from);
-					byOwner.set(o.entryId, g);
+					for (const [entryId, owned] of fileOwners.get(imp.from) ?? []) {
+						const names = imp.names.includes("*") ? owned : imp.names.filter(n => owned.includes(n));
+						if (!names.length) continue;
+						const key = `${entryId}|${imp.from}`;
+						if (reported.includes(key)) continue;
+						reported.push(key);
+						const g = byOwner.get(entryId) ?? { paths: new Set<string>(), symbols: new Set<string>() };
+						for (const n of names) g.symbols.add(n);
+						g.paths.add(imp.from);
+						byOwner.set(entryId, g);
+					}
 				}
 				for (const [fromEntryId, g] of byOwner) {
 					emit(state, effects, now, {
@@ -1128,7 +1169,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 					data: { producerId: pushProducer.id, commit: producerCommit, changed: inferredDrift },
 				});
 				target.generation += 1;
-				target.status = "squashed";
+				markSquashed(effects, target);
 				target.diagnosis = { reason: "interface-changed", changed: inferredDrift, producerCommit };
 				clearJudging(state, target);
 				state.stats.squashes += 1;
@@ -1159,7 +1200,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				if (pinned.length) {
 					const missed: Diagnosis["changed"] = [];
 					for (const sym of pinned) {
-						const actual = exports[sym] ?? "";
+						const actual = Object.hasOwn(exports, sym) ? exports[sym] : "";
 						if (c.consumes[sym] === actual) {
 							state.stats.predictionHits += 1;
 							emit(state, effects, now, {
@@ -1207,7 +1248,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 							continue;
 						}
 						c.generation += 1;
-						c.status = "squashed";
+						markSquashed(effects, c);
 						c.diagnosis = { reason: "prediction-miss", changed: diagChanged, producerCommit: cmd.commit };
 						clearJudging(state, c);
 						state.stats.squashes += 1;
@@ -1235,15 +1276,19 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 					// territory the interface diff cannot see: keep the cutoff,
 					// mark `judging`, and emit ONE judge effect per consumer.
 					// A newer push re-marks the symbol for a fresh judgment.
-					if (cmd.bodies && c.status !== "squashed") {
+					if ((cmd.bodies || c.judging.length) && c.status !== "squashed") {
 						c.judging ??= [];
-						const marks = (state._internal.judgeMarks[c.id] ??= {});
+						const marks = (state._internal.judgeMarks[c.id] ??= Object.create(null));
 						const pending: string[] = [];
-						for (const s of Object.keys(c.consumes)) {
-							const ob = oldBodies[s];
+						for (const s of new Set([...Object.keys(c.consumes), ...c.judging])) {
+							const ob = Object.hasOwn(marks, s) ? marks[s].oldBody : Object.hasOwn(oldBodies, s) ? oldBodies[s] : undefined;
 							// A first-recorded bodyHash is the baseline, not a
 							// change: only a known prior body can have changed.
-							if (ob === undefined || ob === newBodies[s]) continue;
+							if (ob === undefined || ob === newBodies[s]) {
+								delete marks[s];
+								c.judging = c.judging.filter(n => n !== s);
+								continue;
+							}
 							if (!c.judging.includes(s)) c.judging.push(s);
 							marks[s] = { at: now, commit: cmd.commit, producerId: target.id, oldBody: ob, newBody: newBodies[s] ?? "" };
 							pending.push(s);
@@ -1273,7 +1318,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 					continue;
 				}
 				c.generation += 1;
-				c.status = "squashed";
+				markSquashed(effects, c);
 				c.diagnosis = { reason: "interface-changed", changed, producerCommit: cmd.commit };
 				clearJudging(state, c);
 				state.stats.squashes += 1;
@@ -1295,9 +1340,9 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			// pointing at the judged commit: a newer push re-marked the symbol
 			// for a fresh judgment and must keep it gated.
 			const marks = state._internal.judgeMarks[c.id] ?? {};
-			const captured: Record<string, JudgeMark> = {};
+			const captured: Record<string, JudgeMark> = Object.create(null);
 			for (const v of cmd.verdicts) {
-				const m = marks[v.symbol];
+				const m = Object.hasOwn(marks, v.symbol) ? marks[v.symbol] : undefined;
 				if (m && m.commit === cmd.commit) {
 					captured[v.symbol] = m;
 					delete marks[v.symbol];
@@ -1305,6 +1350,14 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				}
 			}
 			const producer = find(state, cmd.producerId);
+			if (!producer || !live(producer) || producer.status === "squashed") {
+				clearJudging(state, c);
+				for (const v of cmd.verdicts) emit(state, effects, now, {
+					type: "jev.unavailable", entryId: c.id,
+					data: { producerId: cmd.producerId, symbol: v.symbol, reason: "producer-not-live" },
+				});
+				break;
+			}
 			// Stale verdict (contract): the producer's head moved past the
 			// judged commit, or the consumer re-forked (generation changed) —
 			// drop it.
@@ -1354,7 +1407,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				break;
 			}
 			c.generation += 1;
-			c.status = "squashed";
+			markSquashed(effects, c);
 			c.diagnosis = { reason: "behavior-changed", changed, producerCommit: cmd.commit, judgment: top };
 			clearJudging(state, c);
 			state.stats.squashes += 1;
@@ -1548,7 +1601,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			// consumed hashes, the normal push path squashes them.
 			const fromRepo = state.trunk.repo;
 			e.generation += 1;
-			e.status = "squashed";
+			markSquashed(effects, e);
 			e.diagnosis = { reason: "trunk-overlap", changed: [], producerCommit: state.trunk.commit ?? e.baseCommit };
 			clearJudging(state, e);
 			state.stats.squashes += 1;
@@ -1591,6 +1644,8 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 			delete state._internal.retireStrikes[e.id];
 			delete state._internal.retireStart[e.id];
 			e.status = "retired";
+			effects.push({ type: "source.delete", entryId: e.id });
+			if (e.producerId) effects.push({ type: "source.prune", entryId: e.producerId });
 			idx(state).active -= 1;
 			state.trunk.commit = cmd.commit;
 			state.trunk.retiredCount += 1;
@@ -1614,6 +1669,8 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 				return err(409, `entry ${e.id} is retiring; retry after the cycle lands`);
 			}
 			e.status = "vetoed";
+			effects.push({ type: "source.delete", entryId: e.id });
+			if (e.producerId) effects.push({ type: "source.prune", entryId: e.producerId });
 			clearJudging(state, e);
 			clearPending(state, e.id);
 			delete state._internal.forkFails[e.id];
@@ -1751,6 +1808,7 @@ export function apply(state: RobState, cmd: Cmd, now = Date.now()): ApplyResult 
 		}
 
 		case "reset": {
+			for (const e of state.entries) effects.push({ type: "source.delete", entryId: e.id });
 			const trunk = state.trunk;
 			const fresh = initialState();
 			state.entries = fresh.entries;

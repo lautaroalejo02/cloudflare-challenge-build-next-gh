@@ -88,7 +88,7 @@ export async function judgeBehavior(input: JudgeInput, opts: JevOptions): Promis
 					instructions: {
 						question: QUESTION,
 						producer: { symbol: p.symbol, before: p.before, after: p.after },
-						consumer: { usage: p.usage },
+						consumer: { usage: p.usage.map(u => u.file) },
 					},
 					criteria: { ...CRITERIA },
 				},
@@ -108,36 +108,32 @@ export async function judgeBehavior(input: JudgeInput, opts: JevOptions): Promis
 				body: JSON.stringify(body),
 				signal: ac.signal,
 			});
-		} catch (e) {
-			// Sanitized: fetch errors may embed request details.
-			lastReason = e instanceof DOMException && e.name === "AbortError" ? "timeout" : "fetch-error";
+			if (!res.ok) {
+				await res.body?.cancel();
+				if (!isRetryable(res.status)) return nullVerdicts(input, `http-${res.status}`);
+				lastReason = `http-${res.status}`;
+			} else {
+				let data: SystemOneResponse;
+				try {
+					data = (await res.json()) as SystemOneResponse;
+				} catch {
+					return nullVerdicts(input, ac.signal.aborted ? "timeout" : "bad-response");
+				}
+				if (!data?.answers || typeof data.answers !== "object") return nullVerdicts(input, "bad-response");
+				return input.producer.map((p, i) => {
+					const a = data.answers![`s${i}`];
+					const p2 = a && typeof a.noul === "number" && a.noul >= 0 && a.noul <= 1 ? a.noul : null;
+					return p2 === null
+						? { symbol: p.symbol, probability: null, reason: "missing-answer" }
+						: { symbol: p.symbol, probability: p2, model: data.model ?? JEV_MODEL };
+				});
+			}
+		} catch {
+			lastReason = ac.signal.aborted ? "timeout" : "fetch-error";
 		} finally {
 			clearTimeout(timer);
 		}
-		if (!res) {
-			if (attempt < 2) await sleep(attempt === 0 ? 500 : 1000);
-			continue;
-		}
-		if (!res.ok) {
-			if (!isRetryable(res.status)) return nullVerdicts(input, `http-${res.status}`);
-			lastReason = `http-${res.status}`;
-			if (attempt < 2) await sleep(attempt === 0 ? 500 : 1000);
-			continue;
-		}
-		let data: SystemOneResponse;
-		try {
-			data = (await res.json()) as SystemOneResponse;
-		} catch {
-			return nullVerdicts(input, "bad-response");
-		}
-		if (!data.answers || typeof data.answers !== "object") return nullVerdicts(input, "bad-response");
-		return input.producer.map((p, i) => {
-			const a = data.answers![`s${i}`];
-			const p2 = a && typeof a.noul === "number" && a.noul >= 0 && a.noul <= 1 ? a.noul : null;
-			return p2 === null
-				? { symbol: p.symbol, probability: null, reason: "missing-answer" }
-				: { symbol: p.symbol, probability: p2, model: data.model ?? JEV_MODEL };
-		});
+		if (attempt < 2) await sleep(attempt === 0 ? 500 : 1000);
 	}
 	return nullVerdicts(input, lastReason);
 }

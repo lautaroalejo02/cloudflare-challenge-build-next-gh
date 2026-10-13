@@ -9,7 +9,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
 	apply,
-	entryDefaults,
+	rebuildIndexes,
 	initialState,
 	publicState,
 	type ArbEvent,
@@ -69,10 +69,19 @@ function doSourceStore(ctx: DurableObjectState): SourceStorePort {
 	const key = (entryId: string) => `src/${entryId}`;
 	return {
 		get: async (entryId) => (await ctx.storage.get<Record<string, SourceRecord>>(key(entryId))) ?? {},
-		merge: async (entryId, map, commit) => {
+		merge: async (entryId, map, commit, baselines) => {
 			const k = key(entryId);
 			const cur = (await ctx.storage.get<Record<string, SourceRecord>>(k)) ?? {};
-			await ctx.storage.put(k, mergeSourceMap(cur, map, commit));
+			if (Object.keys(map).length) await ctx.storage.put(k, mergeSourceMap(cur, map, commit, baselines));
+			else await ctx.storage.delete(k);
+		},
+		delete: async entryId => { await ctx.storage.delete(key(entryId)); },
+		retain: async (entryId, symbols) => {
+			const k = key(entryId);
+			const current = (await ctx.storage.get<Record<string, SourceRecord>>(k)) ?? {};
+			const kept = Object.fromEntries(symbols.filter(s => Object.hasOwn(current, s)).map(s => [s, current[s]]));
+			if (symbols.length) await ctx.storage.put(k, kept);
+			else await ctx.storage.delete(k);
 		},
 	};
 }
@@ -110,10 +119,7 @@ export class ReorderBuffer extends DurableObject<Env> {
 		this.tokens = tokenCache((repo) => this.ports.artifacts.token(repo, TOKEN_TTL_S));
 		ctx.blockConcurrencyWhile(async () => {
 			this.state = (await ctx.storage.get<RobState>(STATE_KEY)) ?? initialState();
-			// Forward-fill internal fields added after the state was persisted.
-			this.state._internal = { ...initialState()._internal, ...(this.state._internal ?? {}) };
-			this.state.stats = { ...initialState().stats, ...(this.state.stats ?? {}) };
-			this.state.entries = (this.state.entries ?? []).map((e) => ({ ...entryDefaults(), ...e }));
+			rebuildIndexes(this.state);
 		});
 	}
 

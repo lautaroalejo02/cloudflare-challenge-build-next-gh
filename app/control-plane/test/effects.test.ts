@@ -239,7 +239,7 @@ test("V2 the judge effect reads the consumer tree, filters by the symbol's file,
 	const judged: JudgeInput[] = [];
 	const { h, applied } = host({
 		state: s,
-		artifacts: fakeArtifacts({ readTree: async () => files }),
+		artifacts: fakeArtifacts({ readTree: async (_repo, commit) => commit === "p1" ? {} : files }),
 		hasher: {
 			hashInterface: async () => ({ hash: "h", symbols: [] }),
 			extractImports: async () => [
