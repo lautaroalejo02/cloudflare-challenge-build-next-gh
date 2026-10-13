@@ -116,7 +116,9 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
     - the one-shot re-fork token;
     - out-of-order push handling;
     - ops: alarm pinning, `-xN` collisions.
-- [ ] T19 (D) Fix the R1 findings with regression tests; admin-key auth; deploy; live main / failing-check / multi x3. Dispatched to SWE-2 max with a rollback safety net to `demo-stable-3` (`odd/prompts/T19-review-fixes.md`).
+- [ ] T19 (D) Fix the R1 findings with regression tests; admin-key auth; deploy; live main / failing-check / multi x3.
+  - The SWE-2 max run hit the free-model rate limit again (reset 15:01 UTC) after partial edits to `rob.ts` + a new `auth.ts`. It did not deploy, so the live Worker is still `demo-stable-3`.
+  - Resumed with a Claude Opus subagent (same prompt + resume note). That run also adds `/api/events` to the mock (part of T20).
 - [ ] T10 (I) Final verification, feature-document update, morning hand-off.
 
 Route declaration: T2-T7 are delegated because each package is non-trivial and the six run in parallel in disjoint directories. That is the writer trigger plus the user's explicit request to use many Devin agents. T8 and T9 each go to one writer, because they touch multiple packages.
