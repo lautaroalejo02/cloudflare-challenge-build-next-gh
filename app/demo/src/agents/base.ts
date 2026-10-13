@@ -96,7 +96,12 @@ export function startAgent(opts: AgentOptions): AgentHandle {
         fs.rmSync(dir, { recursive: true, force: true });
         opts.log(`cloning ${e.repo} -> ${path.basename(dir)} (generation ${gen})`);
         await cloneRepo(e.remote, lastToken, dir);
-        if (e.diagnosis) {
+        if (e.diagnosis?.reason === "behavior-changed") {
+          const j = e.diagnosis.judgment;
+          for (const c of e.diagnosis.changed) {
+            opts.log(`squashed (behavior-changed): ${c.symbol} body ${c.oldHash} -> ${c.newHash}, signature unchanged${j ? ` (Jev ${j.model} p=${j.probability.toFixed(2)})` : ""}`);
+          }
+        } else if (e.diagnosis) {
           for (const c of e.diagnosis.changed) {
             opts.log(`squashed: ${c.symbol} ${c.oldSignature} -> ${c.newSignature}`);
           }

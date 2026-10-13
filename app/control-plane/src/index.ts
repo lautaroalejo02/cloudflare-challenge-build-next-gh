@@ -13,9 +13,9 @@
 // public for the dashboard.
 //
 // Durable Object layout:
-//   ArbRouter   "router-t19"      routing table, ws hub, create orchestration
-//   ArbTrunk    "trunk-t19"       serialized retirement onto arb-trunk
-//   ReorderBuffer "t19:comp-e<n>" one per connected producer/consumer component
+//   ArbRouter   "router-v2"      routing table, ws hub, create orchestration
+//   ArbTrunk    "trunk-v2"       serialized retirement onto arb-trunk
+//   ReorderBuffer "v2:comp-e<n>" one per connected producer/consumer component
 
 import { ReorderBuffer, type Env } from "./do.ts";
 import { ArbRouter, ROUTER_NAME } from "./router.ts";

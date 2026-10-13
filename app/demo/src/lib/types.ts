@@ -11,7 +11,8 @@ export type EntryStatus =
   | "vetoed";
 
 export interface Diagnosis {
-  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap" | "prediction-miss";
+  reason: "interface-changed" | "producer-vetoed" | "producer-squashed" | "trunk-overlap" | "prediction-miss"
+    | "behavior-changed"; // (V2)
   changed: Array<{
     symbol: string;
     oldHash: string;
@@ -20,6 +21,8 @@ export interface Diagnosis {
     newSignature: string;
   }>;
   producerCommit: string;
+  /** (V2) Present only for "behavior-changed". */
+  judgment?: { model: string; probability: number };
 }
 
 export interface CheckResult {
@@ -43,6 +46,14 @@ export interface Entry {
   headCommit: string | null;
   exports: SymbolHashes;
   consumes: SymbolHashes;
+  /** (V2) true when `consumes` was omitted at registration and is inferred. */
+  consumesInferred: boolean;
+  /** (V2) producer's exports snapshot at the latest (re-)fork. */
+  forkedExports: SymbolHashes;
+  /** (V2) exported symbol -> bodyHash at headCommit. */
+  bodies: SymbolHashes;
+  /** (V2) consumed symbols with a pending Jev judgment. */
+  judging: string[];
   predicted: string[];
   generation: number;
   diagnosis: Diagnosis | null;
@@ -70,6 +81,10 @@ export interface BufferState {
     pushesSeen: number;
     predictionHits: number;
     predictionMisses: number;
+    /** (V2) */
+    judgments: number;
+    semanticSquashes: number;
+    inferredDeps: number;
   };
 }
 

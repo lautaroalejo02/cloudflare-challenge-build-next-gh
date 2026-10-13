@@ -87,7 +87,12 @@ export async function startMockServer(
   let seq = 0;
   let robSize = 8;
   const trunk = { repo: "arb-trunk", commit: null as string | null, retiredCount: 0 };
-  const stats = { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0 };
+  // (V2) judgments/semanticSquashes/inferredDeps stay 0: the mock has no Jev
+  // and no import inference (registration without `consumes` = consumes none).
+  const stats = {
+    squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0,
+    judgments: 0, semanticSquashes: 0, inferredDeps: 0,
+  };
   // Bounded event log served at GET /api/events, same shape as the real
   // control plane's `{ events: ArbEvent[] }` (T19: `--scenario multi` reads it).
   const events: ArbEvent[] = [];
@@ -158,6 +163,8 @@ export async function startMockServer(
     c.diagnosis = { reason, changed, producerCommit: srcHead ?? "" };
     c.tokenPending = true;
     c.exports = exp.hashes;
+    c.forkedExports = { ...exp.hashes };
+    c.judging = [];
     sigsByEntry.set(c.id, exp.sigs);
     const cs = consumeSigs.get(c.id) ?? new Map<string, string>();
     for (const sym of Object.keys(c.consumes)) {
@@ -391,6 +398,10 @@ export async function startMockServer(
       headCommit: srcHead,
       exports: { ...exp.hashes, ...stubHashes },
       consumes,
+      consumesInferred: body.consumes === undefined && !!body.producerId,
+      forkedExports: producer ? { ...exp.hashes } : {},
+      bodies: {},
+      judging: [],
       predicted,
       generation: 0,
       diagnosis: null,
@@ -451,6 +462,9 @@ export async function startMockServer(
     stats.pushesSeen = 0;
     stats.predictionHits = 0;
     stats.predictionMisses = 0;
+    stats.judgments = 0;
+    stats.semanticSquashes = 0;
+    stats.inferredDeps = 0;
     sigsByEntry.clear();
     consumeSigs.clear();
     heads.clear();

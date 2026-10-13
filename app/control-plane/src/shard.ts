@@ -15,7 +15,7 @@ export function componentName(rootEntryId: string): string {
  * names restart at `comp-e1` with a fresh router — so the DO *instance* name
  * carries an epoch that is bumped on deploys that change persisted state or
  * RPC shape. The public `component` field stays `comp-<root>`. */
-export const COMPONENT_EPOCH = "t19";
+export const COMPONENT_EPOCH = "v2";
 
 /** idFromName() key for a component DO. */
 export function componentInstance(component: string): string {

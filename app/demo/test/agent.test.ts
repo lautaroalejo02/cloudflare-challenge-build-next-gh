@@ -6,8 +6,8 @@ import { pathToFileURL } from "node:url";
 import { startMockServer, type MockServer } from "../src/mock-server.ts";
 import { ApiClient } from "../src/lib/http.ts";
 import { authUrl, cloneRepo, commitAll, git, hasChanges, head, push } from "../src/lib/git.ts";
-import { detectCreateOrderVersion } from "../src/lib/signatures.ts";
-import { startApiAgent, ORDER_STUB, ORDER_V2 } from "../src/agents/api.ts";
+import { detectCreateOrderVersion, detectVat } from "../src/lib/signatures.ts";
+import { startApiAgent, ORDER_STUB, ORDER_V2, ORDER_V1_1_REFACTORED, ORDER_V1_1_VAT, ORDER_V2_VAT } from "../src/agents/api.ts";
 import { startUiAgent } from "../src/agents/ui.ts";
 import { startTestsAgent } from "../src/agents/tests.ts";
 import { startPayApiAgent } from "../src/agents/payapi.ts";
@@ -155,6 +155,57 @@ test("prediction: stub consumers get hit/miss verdicts on the first real push", 
       mock.internals.squashes.some((x) => x.reason === "interface-changed"),
       "expected an interface-changed squash",
     );
+  } finally {
+    await mock.close();
+  }
+});
+
+test("V2 behavior beat: VAT change detected by sniffers; inferred ui registers without consumes", () => {
+  assert.equal(detectVat(ORDER_V1_1_VAT), true);
+  assert.equal(detectVat(ORDER_V2_VAT), true);
+  assert.equal(detectVat(ORDER_V1_1_REFACTORED), false);
+  assert.equal(detectVat(ORDER_V2), false);
+  // Same signatures as the refactor: only the body (behavior) differs.
+  assert.equal(detectCreateOrderVersion(ORDER_V1_1_VAT), "v1");
+  assert.equal(detectCreateOrderVersion(ORDER_V2_VAT), "v2");
+});
+
+test("V2 main scenario: behavior beat + inferred ui on the mock, consumers adapt to VAT", { timeout: 90_000 }, async () => {
+  const { api, mock, workRoot } = await boot("v2");
+  try {
+    await api.reset();
+    await pushFixture(api, workRoot);
+
+    const apiH = startApiAgent({
+      api, workRoot, log: noop, pollMs: 120,
+      firstPushDelayMs: 400, bodyOnlyDelayMs: 300, behaviorChangeDelayMs: 300, breakingChangeDelayMs: 1200,
+      stub: { "src/api/order.ts": ORDER_STUB },
+    });
+    const apiId = await apiH.entryId;
+    const uiH = startUiAgent({ api, workRoot, log: noop, producerId: apiId, pollMs: 120, infer: true });
+    const testsH = startTestsAgent({ api, workRoot, log: noop, producerId: apiId, pollMs: 120 });
+
+    const [a, u, t] = await Promise.all([apiH.done, uiH.done, testsH.done]);
+    for (const e of [a, u, t]) assert.equal(e.status, "retired", e.id);
+    // Registration without consumes: the mock treats it as none (no inference).
+    assert.equal(u.consumesInferred, true);
+    assert.deepEqual(u.consumes, {});
+    assert.equal(t.consumesInferred, false);
+
+    const s = await api.state();
+    assert.equal(s.trunk.retiredCount, 3);
+    assert.deepEqual([s.stats.judgments, s.stats.semanticSquashes, s.stats.inferredDeps], [0, 0, 0]);
+
+    // The tests consumer was re-forked by the breaking change and adapted to
+    // BOTH the v2 signature and the VAT behavior; its check passed on retire.
+    const trunkRepo = path.join(mock.rootDir, "repos", "arb-trunk.git");
+    const featureAtTrunk = await git(["-C", trunkRepo, "show", "main:tests/create-order.feature.test.ts"]);
+    assert.match(featureAtTrunk, /order\.totalCents === 1104/);
+    const orderTestAtTrunk = await git(["-C", trunkRepo, "show", "main:tests/order.test.ts"]);
+    assert.match(orderTestAtTrunk, /1560/);
+    const orderAtTrunk = await git(["-C", trunkRepo, "show", "main:src/api/order.ts"]);
+    assert.ok(detectVat(orderAtTrunk) && detectCreateOrderVersion(orderAtTrunk) === "v2");
+    assert.equal(t.checks?.failed, 0);
   } finally {
     await mock.close();
   }

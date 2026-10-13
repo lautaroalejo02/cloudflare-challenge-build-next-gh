@@ -579,6 +579,140 @@ config is the optional `TYPESAFE_API_KEY` Worker secret (setup above).
   declaration — inference is then exact by contract (producer exports from
   the imported file), but Jev usage matching follows the same path.
 
+## V2 integration (V4)
+
+V2 integrated end to end: the real hasher feeds inference and Jev, the demo
+has a behavior-change beat, and V2 is deployed and verified live.
+
+**Deployed version:** `9f105998-1985-432d-af28-df1908c3d014` (2026-10-13).
+DO instance names bumped so no alarmed object stays pinned to old code:
+`router-t19` → `router-v2`, `trunk-t19` → `trunk-v2`, `COMPONENT_EPOCH` `t19`
+→ `v2` (component instances `v2:comp-e<n>`).
+
+**Secrets:** `TYPESAFE_API_KEY` set from `.secret-typesafe-key` on stdin
+(`npx wrangler secret put TYPESAFE_API_KEY < .secret-typesafe-key`; the key
+file has no trailing newline). `npx wrangler secret list` shows only the names
+`ARB_ADMIN_KEY` and `TYPESAFE_API_KEY`. The value was never printed or passed
+as an argument. Jev is **configured** (model `jev-1.13.0` per `jev.judged`).
+
+### 1. Real wiring check
+
+`realHasher()` (`src/ports.ts`) passes the hasher module's `extractImports`.
+`pushCommand` (`src/effects.ts`) reads `SymbolSignature.file` / `bodyHash` /
+`source` through `interfaceToMaps`. Both are covered by the new
+`test/v4-real-hasher.test.ts`. It runs the REAL tree-sitter hasher on
+`app/demo/fixture/` (fork baseline) and on a pushed `checkout.ts`. Then it
+drives `pushCommand` → `rob.apply` and checks these results:
+- the edge `src/ui/checkout.ts` → `src/api/order.ts` names `createOrder`;
+- `consumes.createOrder` is pinned to the forked hash;
+- `deps.inferred` is emitted with `producerId: "e1"`;
+- `inferredDeps` ≥ 1, with no squash.
+
+The test passed on its first run. The wiring was already correct, so this is a
+coverage test, not a RED → GREEN fix.
+
+### 2. Demo beat: behavior change
+
+Main beat order:
+1. Stub/prediction.
+2. Body-only refactor. Jev judges `clear`.
+3. **VAT behavior change**: same signatures, but `createOrder` now returns
+   totals with 20% VAT (`Math.round(net * 1.2)`). Jev judges `squash`, and the
+   consumers are squashed with reason `behavior-changed`.
+4. Breaking `{ region, currency }` change. Consumers are squashed with reason
+   `interface-changed`.
+5. Retirement.
+
+The UI agent registers **without** `consumes` (`infer: true`). The tests agent
+keeps its declared `consumes: ["createOrder"]`.
+
+**Decisions**
+- The VAT math lives inside `createOrder`'s own declaration because Jev only
+  sees that declaration's `source`.
+- The API agent updates its own `tests/order.test.ts` in the same commit
+  (1300 → 1560), so its check stays green. Only the consumers' assumptions
+  break.
+- Consumers redo by sniffing the cloned `order.ts`:
+  - `detectVat` matches `* 1.2`;
+  - tests expect 1000 / 1200 for v1 and 920 / 1104 for v2+EUR;
+  - the UI labels totals as net or gross.
+
+  So the redo is correct whether Jev squashes, warns, clears or is
+  unavailable. The breaking change re-forks both consumers anyway, and they
+  re-detect then.
+- Delays: behavior 14 s after the refactor, breaking change 16 s after
+  the behavior change. This leaves room for a Jev round trip (live:
+  about 1–2 s) plus the semantic re-fork, before a newer push supersedes the
+  verdict. Multi has no behavior beat; its consumers stay declared.
+- The timeline prints `deps.inferred`, `jev.judged` (with p and verdict),
+  `jev.unavailable`, `deps.undeclared` and `behavior-changed` squashes, by
+  polling `/api/events` every 1.5 s. The final block prints `judgments`,
+  `semanticSquashes`, `inferredDeps`, every judgment, and the
+  semantically squashed entries.
+- Mock (`app/demo/src/mock-server.ts`): registration without `consumes` means
+  no consumes and no inference. Entries default `consumesInferred`,
+  `forkedExports`, `bodies: {}` and `judging: []`. Stats include the 3 V2
+  counters at 0.
+
+### Tests
+
+- `app/control-plane`: `npm test` **156/156** (155 + the V4 real-hasher test).
+  `npx tsc --noEmit` is clean.
+- `app/demo`: `npm test` **18/18 in 3 of 3 runs** (16 before, plus 2 V2
+  tests: the sniffers, and a full mock run with the behavior beat and the
+  inferred UI, where tests adapt to VAT+v2 = 1104 on trunk).
+
+### Live verification (`https://arb-control-plane.lautitomasalejo.workers.dev`, admin key from `.secret-admin-key`)
+
+| run | exit | wall | squashes | earlyCutoffs | retired | checksRun | pushesSeen | hits/miss | judgments | semanticSquashes | inferredDeps | behavior-changed squash |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| main #1 | 0 | 102 s | 4 | 5 | 3 | 4 | 10 | 1/0 | 5 | 2 | 3 | yes (e2, e3) |
+| main #2 | 0 | 92 s | 4 | 5 | 3 | 4 | 10 | 1/0 | 5 | 2 | 3 | yes (e5, e6) |
+| main #3 | 0 | 91 s | 4 | 5 | 3 | 4 | 10 | 1/0 | 5 | 2 | 3 | yes (e8, e9) |
+| failing-check | 0 | 97 s | 4 | 5 | 3 | 5 | 11 | 1/0 | 5 | 2 | 3 | yes (e11, e12) |
+| multi | 0 | 79 s | 4 | 3 | 5 | 8 | 12 | 2/1 | 1 | 0 | 0 | no (no beat in multi) |
+
+`jev.judged` (symbol `createOrder` in every row, model `jev-1.13.0`):
+
+| run | stub resolution (ui) | body-only refactor (ui / tests) | VAT behavior change (ui / tests) |
+|---|---|---|---|
+| main #1 | 0.23 clear | 0.02 clear / 0.02 clear | **0.95 squash / 0.97 squash** |
+| main #2 | 0.25 clear | 0.02 clear / 0.02 clear | **0.94 squash / 0.97 squash** |
+| main #3 | 0.25 clear | 0.02 clear / 0.02 clear | **0.94 squash / 0.97 squash** |
+| failing-check | 0.24 clear | 0.02 clear / 0.03 clear | **0.95 squash / 0.93 squash** |
+| multi | — | o-tests 0.03 clear | — (plus `jev.unavailable` p-ui `charge` `no-usage`) |
+
+So the refactor judged `clear` and the behavior change `squash` in **3 of 3**
+main runs (target: 2 of 3). The thresholds were not changed.
+
+Squashed consumers re-detected `v1 with VAT totals` (tests expect 1200), then
+`v2 with VAT totals` after the breaking change (tests expect 1104). All
+entries retired.
+
+Why `predictionHits=1 / predictionMisses=0` in main: the inferred UI entry has
+no stub pins. Only the tests entry pins `createOrder` (a hit). The UI no longer
+consumes `Order`, so the old prediction-miss beat does not happen there. Multi
+keeps the declared UI and still shows 2/1.
+
+**Auth and secrets**
+- `curl -X POST /api/reset` without a key returns **403**.
+- `GET /api/events` (67 events, after the multi run): **0** matches for
+  `art_v2_` and **0** for `Bearer`. `GET /api/state` also has 0.
+- The 5 run logs (`tmp/v4/*.log`) have 0 matches.
+
+**Known gaps / observations**
+- **Inference over-approximates on inherited files.** `extractImports` runs
+  on the entry's whole tree, so untouched trunk files also count.
+  `src/ui/paywall.ts` imports `charge`, which made the UI entry infer
+  `[createOrder, Cart, charge]` (`inferredDeps=3`). This is the literal
+  contract behavior (changelog line added). Restricting it to files the entry
+  changed would be more precise, but it is a semantic change and was left out.
+- The stub-resolution push also triggers a UI judgment (fixture body →
+  V1_1 body, p≈0.24, clear). The UI's inferred baseline is the forked body,
+  not a pinned stub.
+- Each main run now takes about 90–100 s (it was about 60 s), because of the
+  extra beat and its Jev gaps.
+
 ## Cloudflare resources created
 
 - Worker `arb-control-plane` (DOs `ReorderBuffer` + `ArbRouter` + `ArbTrunk`,

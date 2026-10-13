@@ -5,6 +5,7 @@ import { resolveAdminKey } from "./lib/admin-key.ts";
 import { authUrl, cloneRepo, commitAll, git, hasChanges, head, push } from "./lib/git.ts";
 import { syncFixture } from "./lib/fixture.ts";
 import { createTimeline, scoped } from "./lib/timeline.ts";
+import type { ArbEvent, BufferState } from "./lib/types.ts";
 import { ORDER_STUB, startApiAgent } from "./agents/api.ts";
 import { startUiAgent } from "./agents/ui.ts";
 import { startTestsAgent } from "./agents/tests.ts";
@@ -61,11 +62,56 @@ async function pushFixture(remote: string, token: string, log: (m: string) => vo
   return head(dir);
 }
 
+// (V2) One-line timeline rendering of the V2 events (and semantic squashes);
+// null for events the timeline does not narrate.
+function describeV2Event(ev: ArbEvent): string | null {
+  const d = (ev.data ?? {}) as Record<string, any>;
+  switch (ev.type) {
+    case "deps.inferred":
+      return `deps.inferred ${ev.entryId} <- ${d.producerId}: [${Object.keys(d.symbols ?? {}).join(", ")}]`;
+    case "jev.judged":
+      return `jev.judged ${ev.entryId} ${d.symbol} p=${typeof d.probability === "number" ? d.probability.toFixed(2) : d.probability} verdict=${d.verdict} (${d.model ?? "?"}, commit ${String(d.commit ?? "").slice(0, 8)})`;
+    case "jev.unavailable":
+      return `jev.unavailable ${ev.entryId} ${d.symbol ?? ""} reason=${d.reason ?? "?"}`.replace(/\s+/g, " ");
+    case "deps.undeclared":
+      return `deps.undeclared ${ev.entryId} touches ${d.fromEntryId}'s [${(d.paths ?? []).join(", ")}]`;
+    case "squash":
+      return d.reason === "behavior-changed" ? `squash ${ev.entryId} behavior-changed -> generation ${d.generation}` : null;
+    default:
+      return null;
+  }
+}
+
+// (V2) Every jev.judged / behavior-changed squash seen during the run, for the
+// final summary.
+const v2Seen: ArbEvent[] = [];
+
 // Timeline watcher: logs entry status transitions and stats deltas while a
 // scenario runs. Returns a stop() that clears the interval.
 function startWatcher(api: ApiClient, tl: ReturnType<typeof createTimeline>): () => void {
   const lastStatus = new Map<string, string>();
-  const lastStats = { squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0 };
+  const lastStats = {
+    squashes: 0, earlyCutoffs: 0, retired: 0, checksRun: 0, pushesSeen: 0, predictionHits: 0, predictionMisses: 0,
+    judgments: 0, semanticSquashes: 0, inferredDeps: 0,
+  };
+  const seenEvents = new Set<string>();
+  const eventsWatcher = setInterval(() => {
+    api
+      .events()
+      .then(({ events }) => {
+        for (const ev of events) {
+          const line = describeV2Event(ev);
+          if (!line) continue;
+          const key = `${ev.ts}|${ev.type}|${ev.entryId ?? ""}|${JSON.stringify(ev.data ?? null)}`;
+          if (seenEvents.has(key)) continue;
+          seenEvents.add(key);
+          v2Seen.push(ev);
+          tl("v2", line);
+        }
+      })
+      .catch(() => {});
+  }, 1500);
+  eventsWatcher.unref();
   const watcher = setInterval(() => {
     api
       .state()
@@ -87,7 +133,32 @@ function startWatcher(api: ApiClient, tl: ReturnType<typeof createTimeline>): ()
       .catch(() => {});
   }, 800);
   watcher.unref();
-  return () => clearInterval(watcher);
+  return () => {
+    clearInterval(watcher);
+    clearInterval(eventsWatcher);
+  };
+}
+
+// (V2) Final event sweep (catches events after the last poll) + summary lines.
+async function printV2Summary(api: ApiClient, tl: ReturnType<typeof createTimeline>, s: BufferState): Promise<void> {
+  try {
+    const { events } = await api.events();
+    const keys = new Set(v2Seen.map((ev) => `${ev.ts}|${ev.type}|${ev.entryId ?? ""}|${JSON.stringify(ev.data ?? null)}`));
+    for (const ev of events) {
+      if (!describeV2Event(ev)) continue;
+      const key = `${ev.ts}|${ev.type}|${ev.entryId ?? ""}|${JSON.stringify(ev.data ?? null)}`;
+      if (!keys.has(key)) v2Seen.push(ev);
+    }
+  } catch {
+    // events are best-effort for the summary
+  }
+  const st = s.stats;
+  tl("final", `v2 stats: judgments=${st.judgments ?? 0} semanticSquashes=${st.semanticSquashes ?? 0} inferredDeps=${st.inferredDeps ?? 0}`);
+  for (const ev of v2Seen.filter((e) => e.type === "jev.judged" || e.type === "jev.unavailable")) {
+    tl("final", describeV2Event(ev)!);
+  }
+  const semantic = v2Seen.filter((e) => e.type === "squash");
+  tl("final", `behavior-changed squashes: ${semantic.length ? semantic.map((e) => e.entryId).join(", ") : "none"}`);
 }
 
 async function main(): Promise<void> {
@@ -122,19 +193,24 @@ async function main(): Promise<void> {
   // the consumers register immediately and forward against the declared
   // hashes. The producer's first push is delayed until both consumers exist —
   // verdicts (hit/miss) are resolved per live consumer at push-detection time.
+  // (V2) Beats: stub resolution -> body-only refactor (Jev: clear) -> VAT
+  // behavior change (Jev: squash `behavior-changed`) -> breaking signature
+  // change -> retirement. The gaps leave room for Jev (8 s timeout/attempt)
+  // and the semantic re-fork before the next push supersedes the verdict.
   const apiH = startApiAgent({
     api,
     workRoot: WORK_ROOT,
     log: scoped(tl, "api"),
     firstPushDelayMs: 9000,
     bodyOnlyDelayMs: 7000,
-    breakingChangeDelayMs: 10_000,
+    behaviorChangeDelayMs: 14_000,
+    breakingChangeDelayMs: 16_000,
     stub: { "src/api/order.ts": ORDER_STUB },
   });
   const apiId = await apiH.entryId;
-  tl("scenario", `api entry is ${apiId}; consumers register against the declared stub`);
+  tl("scenario", `api entry is ${apiId}; tests register against the declared stub, ui registers WITHOUT consumes (inferred from imports)`);
   await sleep(1500);
-  const uiH = startUiAgent({ api, workRoot: WORK_ROOT, log: scoped(tl, "ui"), producerId: apiId });
+  const uiH = startUiAgent({ api, workRoot: WORK_ROOT, log: scoped(tl, "ui"), producerId: apiId, infer: true });
   await sleep(1500);
   const testsH = startTestsAgent({
     api,
@@ -166,6 +242,7 @@ async function main(): Promise<void> {
     tl("final", `${e.id} ${e.lane.padEnd(6)} status=${e.status} gen=${e.generation} head=${(e.headCommit ?? "none").slice(0, 8)}`);
   }
   tl("final", `stats=${JSON.stringify(s.stats)} trunk=${(s.trunk.commit ?? "none").slice(0, 8)} retired=${s.trunk.retiredCount}`);
+  await printV2Summary(api, tl, s);
   const notRetired = s.entries.filter((e) => e.status !== "retired");
   if (notRetired.length > 0) {
     console.error(`FAIL: entries not retired: ${notRetired.map((e) => e.id).join(", ")}`);
@@ -242,6 +319,7 @@ async function runMulti(
     );
   }
   tl("final", `stats=${JSON.stringify(s.stats)} trunk=${(s.trunk.commit ?? "none").slice(0, 8)} retired=${s.trunk.retiredCount}`);
+  await printV2Summary(api, tl, s);
 
   const fail = async (msg: string): Promise<never> => {
     console.error(`FAIL: ${msg}`);

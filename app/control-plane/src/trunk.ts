@@ -35,7 +35,7 @@ import type { Env } from "./do.ts";
 // A fresh idFromName boots the new code; trunkInit re-derives head state.
 // Bumped again at T19 (review F10); from T19 on the alarm also stops when the
 // trunk is idle, so later deploys should not need a bump to escape pinning.
-export const TRUNK_NAME = "trunk-t19";
+export const TRUNK_NAME = "trunk-v2";
 
 /** Stop polling `arb-trunk` after this long without trunk activity
  * (init, retire, push event, observed head change) — review F10. Any later

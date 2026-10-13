@@ -36,7 +36,7 @@ import { TRUNK_NAME } from "./trunk.ts";
 
 // Name bump at T19 (review F10): fresh instance on the new code, and a
 // fresh routing table whose seq continues across resets from here on.
-export const ROUTER_NAME = "router-t19";
+export const ROUTER_NAME = "router-v2";
 const STATE_KEY = "router";
 const TRUNK_REPO = "arb-trunk";
 
