@@ -1,0 +1,12 @@
+{
+  "name": "arb-demo",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "ARB demo: fixture app, scripted agents, scenario runner and a local control-plane mock",
+  "scripts": {
+    "demo": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/scenario.ts",
+    "mock": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/mock-server.ts",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/agent.test.ts"
+  }
+}
