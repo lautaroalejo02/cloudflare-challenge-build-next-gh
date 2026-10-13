@@ -97,7 +97,11 @@ There is never a textual merge. Rationale: changes on disjoint paths commute (pa
   - Parent spot check: control-plane `npm test` 54/54; 2/2 live multi runs without a delay, exit 0 (retired 5, squashes 4).
   - Parent found a deploy-blocking issue: footage over 25 MiB inside the assets dir breaks `wrangler deploy` (confirmed by dry-run). Fixed with `app/dashboard/.assetsignore` (commit `ae8d957`): the dry-run fails without it and passes with it.
   - Tagged `demo-stable-3`.
-- [ ] T18 (D) Fresh clone from GitHub, following the README literally (no credentials); docs sync with T17. Dispatched.
+- [x] T18 (D) Fresh clone from GitHub, following the README literally; docs sync with T17. Commit `01d06d7`.
+  - The fresh clone works for tests and the mock demo.
+  - Fixed in docs: stale test counts, scenario flags, Git Bash note.
+  - Needs code: the mock lacks `GET /api/events`, so `--scenario multi` against the mock exits 1 (docs scope multi to the deployed plane). Playwright browsers need `npx playwright install` on a fresh machine.
+- [ ] T20 (D) After T19: docs sync for admin-key auth; add `/api/events` to the mock.
 - [x] R1 (D, read-only) Independent Opus review. 0 critical, 4 high, 5 medium, 3 low; `npm test` 54/54.
   - Core verified sound: checks always run on the exact landing commit; P/Q use the right base; never a textual merge; in-order within a component.
   - High:
