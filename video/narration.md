@@ -1,0 +1,73 @@
+# Narration script: Agent Reorder Buffer demo (6:00)
+
+Read at a calm pace, about 130-140 words per minute. Each block starts at the timestamp shown and fits its window, with room for a breath. Text in [brackets] is a direction, not to be read aloud.
+
+---
+
+**[00:00] Title**
+
+Hi, this is Agent Reorder Buffer: out-of-order execution for coding agents, built on Cloudflare.
+
+**[00:08] The problem**
+
+When several coding agents work on one codebase, they integrate at the very end. One 2026 study found that about forty percent of pull-request pairs from different agents conflict. Merge queues help, but they only speculate over finished work. I wanted coordination to happen while the work is still in flight.
+
+**[00:33] The idea**
+
+So I borrowed the trick a CPU uses to run instructions out of order. Every agent change is an entry in a reorder buffer, backed by its own Cloudflare Artifacts fork. A consumer doesn't wait for its producer: it forks the producer's unfinished work and starts right away. If the producer changes an interface the consumer depends on, the consumer is squashed, re-forked and told exactly what changed. If the signature stays the same but the behavior changes, an AI judge called Jev decides. And entries retire onto trunk strictly in order, with their tests run in Dynamic Workers. There is never a textual merge.
+
+**[01:18] Live run**
+
+This is the live dashboard, at normal speed. To be clear: the agents follow a script. Everything else is real: the forks, the interface hashing, the Jev calls, the tests and the retirement.
+
+**[01:36] Stub prediction**
+
+Watch the UI lane. It starts before the API even exists, against a declared stub of the API's interface. That's value prediction: speculate now, verify when the real code lands.
+
+**[01:57] Refactor, early cutoff**
+
+Now the API agent refactors a function body. The interface hash doesn't move, and Jev scores the change zero point zero two. Nobody downstream loses any work.
+
+**[02:13] Behavior change, semantic squash**
+
+This one is different. Same signature, but the totals now include VAT. Jev scores it zero point nine four and zero point nine seven, and both consumers are squashed.
+
+**[02:28] Signature change**
+
+Now the signature itself changes. The consumers are squashed again and re-forked from the new head, with the old and new signatures in the diagnosis.
+
+**[02:43] Retired**
+
+And all three entries retire, in order.
+
+**[02:48] Failing check, 1.5x**
+
+Second scenario, at one and a half speed. Checks are not a formality here. Each entry's tests run in a fresh Dynamic Worker, on the exact commit that would become trunk. When a test fails, that entry cannot retire, and nothing behind it in its chain can jump the line. The control plane never edits code itself. It reports the failure, and the agent has to fix it.
+
+**[03:39] The check fails**
+
+There's the failure. The agent fixes its assertion, and the checks run again.
+
+**[03:46] Two chains, 1.5x**
+
+Third scenario: two independent features, orders and payments, share one trunk. Each connected group of entries gets its own Durable Object, so one chain never blocks the other. Only the final landing onto trunk is serialized.
+
+**[04:24] No head-of-line blocking**
+
+Payments retire while orders are still working. No waiting for someone else's head of line.
+
+**[04:42] MCP: any agent can join**
+
+This is the piece that makes it usable beyond a demo. The buffer ships with an MCP server. Here a scripted client drives the real server: register creates a real fork and a local workspace, push sends a real commit, and ready runs real checks before the entry retires. The same server plugs into Claude Code, Codex or Devin with a single command, and git credentials never leave the server.
+
+**[05:22] Numbers**
+
+A few measured numbers. Earlier runs re-forked a squashed entry in two to four and a half seconds. Retirement took about half a second by fast-forward, or about a second by splice. And Jev consistently separates a refactor, at zero point zero two, from a real behavior change, at around zero point nine five.
+
+**[05:52] Closing**
+
+Everything's open source: code, evidence and rebuild steps. Thanks for watching.
+
+---
+
+Word count: about 690 words over 6:00, which leaves room for pauses. If you run long, drop the last sentence of the [00:33] and [04:42] blocks first.
