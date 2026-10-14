@@ -51,7 +51,7 @@ Route legend: D = delegated writer, I = inline (orchestrator), A = audit (Sonnet
   - Parent re-ran the control-plane tests: 161/161.
 - [ ] V9 (D, Codex gpt-6.1-sol) Silent 1080p demo video (5:30-6:30) recorded from live scenarios, with burned-in captions and a cue sheet so the user narrates. The user asked for this on 2026-10-13. Prompt `odd/prompts/V9-video.md`. Output in `video/out/` (gitignored).
 - [ ] V6 (A) Sonnet audit per landed unit (V1, V2, V3, V4).
-- [ ] V7 (D) Docs: README, `docs/architecture.md`, `docs/demo-script.md`.
+- [x] V7 (D, SWE-2 high) Docs: README, `docs/architecture.md`, `docs/demo-script.md`, `bench/RESULTS.md` v2 section. The agent finished its result, then the process hung and hit the 2 h background limit; nothing was lost. Parent checks: every 2.7 µs mention is labeled v1-era, the secret grep is clean, and the scratch `app/demo/tmp-mock` was moved to `tmp/`.
 - [ ] S1 (stretch) Jev producer routing from `task` text.
 
 Route declaration: V1, V2, V3 and V5 are delegated because each one is a non-trivial multi-file package and they run in parallel in disjoint directories (writer trigger + user's explicit request for parallel SWE-2/Sol agents).

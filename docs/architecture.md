@@ -14,11 +14,14 @@ types live in `app/CONTRACTS.md`; this document explains how the pieces move.
 | Trunk DO | `app/control-plane/src/trunk.ts` | `ArbTrunk` (`trunk-t19`): serializes every trunk mutation on `arb-trunk` through an in-memory promise queue (DO handlers interleave on `await`). Each retirement runs as one atomic `retireAtomic` slot spanning head-read → ff/splice/overlap → candidate build → candidate check → `main` move, with bounded in-slot rebuilds (`src/atomic.ts`, `MAX_ATOMIC_ATTEMPTS=3`); the legacy `retire`/`moveBranch` RPCs remain but are unused. Owns trunk init + the sole trunk alarm poll + the authoritative `trunk.commit`. |
 | Shard helpers | `app/control-plane/src/shard.ts` | Pure: `componentName(rootId)`, `repoToEntryId(repo)`, `mergeStates`, `mergeEvents`. |
 | Worker | `app/control-plane/src/index.ts` + `src/auth.ts` | Admin-key gate first (`x-arb-key`, see "Robustness mechanisms"), then `POST /api/trunk/init` → `ArbTrunk` (+ router inform); other `/api/*` → `ArbRouter`; queue consumer → repo-routed `onPush`; everything else → static assets. |
-| Hasher | `app/hasher/` | `hashInterface(files)` — web-tree-sitter + TypeScript grammar WASM, normalizes signatures so formatting/comments/bodies/reordering never move a hash. |
+| Hasher | `app/hasher/` | `hashInterface(files)` — web-tree-sitter + TypeScript grammar WASM, normalizes signatures so formatting/comments/bodies/reordering never move a hash. V2 adds `extractImports(files)` and per-symbol `file`/`bodyHash`/`source` (see "Dependency inference and semantic squashes (V2)"). |
 | Checker | `app/checker/` | `runChecks(env, repo, commit)` — walks the commit tree, strips TS (sucrase), loads a Dynamic Worker via the Worker Loader, calls each `tests/**/*.test.ts` module's `run()`. |
 | Retirer | `app/control-plane/src/retire.ts` + pure `src/splice.ts` (grown out of `app/retirer-spike`) | isomorphic-git on `MemFs` inside the DO: fast-forward when the trunk head is an ancestor of the entry head; otherwise the path-disjoint splice — candidate commit pushed to `refs/heads/arb-candidate` on the trunk repo, checked, then `main` moved via `moveBranch` — all inside the single `ArbTrunk` atomic slot. `P ∩ Q ≠ ∅` → `trunk-overlap` squash. |
 | Dashboard | `app/dashboard/` | Static UI; folds `ArbEvent`s into a `BufferState`-shaped model (`state.js`, DOM-free, Node-testable). |
 | Demo | `app/demo/` | Fixture repo, five scripted agents across two chains (`api`/`ui`/`tests` + `pay-api`/`pay-ui`), `scenario.ts` runner (`main`, `failing-check`, `multi`), and `mock-server.ts` (local control-plane stand-in for offline tests). |
+| Jev judge | `app/control-plane/src/jev.ts` | TypeSafe System One client (`judgeBehavior`): one request per consumer, one Noul question per body-changed consumed symbol; bounded retries/timeout; a missing `TYPESAFE_API_KEY` returns `no-api-key` null verdicts (v1 behavior). |
+| Source store | `SourceStorePort` in `src/ports.ts` | Persists `{file, bodyHash, source}` for live-consumed symbols plus the previous differing declaration — the before/after input for Jev. Keyed `src/<entryId>` in DO storage outside `BufferState`; pruned on retire/veto/reset and when a producer loses its last live consumer. |
+| MCP adapter | `app/mcp/` | Local stdio MCP server over the same HTTP API: six `arb_*` tools turn any MCP-capable agent into a buffer entry (register → managed workspace → push → squash instructions → sync → ready). Owns tokens and remotes so the agent needs no git/ARB plumbing. |
 
 The push path, end to end:
 
@@ -27,7 +30,9 @@ agent git push → Artifacts repo.pushed → Queue arb-push-events
   → Worker consumer → ArbRouter.routeRepo(repo)
   → arb-trunk → ArbTrunk.onPush | arb-e<seq>-* → owning ReorderBuffer DO
   → readTree(new commit) → hashInterface(files)
-  → apply(state, push cmd) → effects {squash+refork | nothing (early cutoff)}
+    (V2: + extractImports, per-symbol file/bodyHash/source, baseCommit diff)
+  → apply(state, push cmd) → effects {squash+refork | judge → Jev verdict
+                                     | nothing (early cutoff)}
   → ArbEvent → ArbRouter → dashboards on /api/ws
 ```
 
@@ -111,6 +116,80 @@ producer has pushed anything.
   stats-bar `stub predictions: X hit / Y miss` counter
   (`app/control-plane/NOTES.md`).
 
+## Dependency inference and semantic squashes (V2)
+
+V2 layers two mechanisms on the v1 hash-squash flow — dependency inference,
+so agents never declare `consumes`, and semantic squashes, so body-only
+behavior changes are caught — plus an agent-facing MCP adapter. Contracts:
+`app/CONTRACTS.md` (V2 sections); implementation notes:
+`app/control-plane/NOTES.md` ("V2 (inference + Jev)", "V3b audit fixes",
+"V8 inference scope"), `app/hasher/NOTES.md` ("V2", "V1b"),
+`app/mcp/NOTES.md`.
+
+**Hasher additions** (`app/hasher`, additive — every v1 hash value is
+unchanged): `SymbolSignature` gains `file` (repo-relative declaring path),
+`bodyHash` (sha256 over the normalized *full* declaration — same
+normalization as the interface hash, but bodies/initializers count) and
+`source` (raw declaration text, 4000-char cap, the Jev input).
+`extractImports(files)` returns `ImportRef[]`, one ref per import or
+re-export statement, with relative specifiers resolved to repo-relative
+paths.
+
+**The v2 push path:**
+
+```
+push → readTree(head) → hashInterface (hash + bodyHash + file + source)
+     → extractImports → diff vs baseCommit (changed paths, blob OIDs)
+     → rob.ts push cmd
+        ├─ inference (consumesInferred entries only): imports in files
+        │   the entry changed → consumes[name] = forkedExports[name]
+        │   → deps.inferred · drift → interface-changed squash
+        │   · sibling-entry files → deps.undeclared (reported only)
+        └─ judge effect (per live consumer): a consumed symbol's
+            interface hash unchanged BUT bodyHash changed
+            → mark entry.judging, one Jev request per consumer
+            → judge.done applies only if producer headCommit still equals
+              the judged commit AND consumer generation is unchanged
+              → p ≥ 0.7 squash (behavior-changed) · 0.4–0.7 warn · < 0.4 clear
+              → unavailable (no key/timeout/error) → jev.unavailable = clear
+```
+
+Interface-diff behavior is untouched: the push still emits
+`hash.unchanged` and counts the early cutoff; a later `squash` verdict
+overrides it. `entry.judging` blocks check+retire while non-empty, and the
+alarm sweep clears marks older than 60 s as `jev.unavailable`
+(reason `stale`).
+
+Details:
+
+- **Inference scope (V8).** Only imports in files the entry added or
+  modified since `baseCommit` count; the diff compares blob OIDs from the
+  tree walks, so no base blobs are fetched. Live cost: median 134 ms /
+  max 166 ms per push (`app/control-plane/NOTES.md` "V8 inference scope").
+  A diff failure skips inference for that push and emits a sanitized
+  `recover` event (`inference-diff-failed`) — never a whole-tree fallback.
+- **`forkedExports`** snapshots the producer's exports (plus the fork's own
+  base content) at each (re-)fork. Inferred consumes pin against it, so a
+  newly inferred name that already drifted squashes immediately as
+  `interface-changed`.
+- **Jev** (`src/jev.ts`): `POST api.typesafe.ai/v1/systemone`, model
+  `jev-latest`, one request per consumer and one Noul question per affected
+  symbol. State carries `{producer: {symbol, before, after}, consumer:
+  {agent, lane, usage}}` — `before`/`after` are the declaration `source`s
+  and `usage` is up to four consumer files (6000 chars each) that import
+  the symbol and changed vs the consumer's own base. Retry 429/529/5xx with
+  backoff (0.5 s, 1 s), 8 s timeout per attempt. Live (model `jev-1.13.0`):
+  refactor p = 0.02 → clear, VAT behavior change p = 0.93–0.97 → squash,
+  ~1–2 s per judgment (`app/control-plane/NOTES.md` "V2 integration (V4)",
+  "V8 inference scope").
+- **MCP adapter** (`app/mcp/`): local stdio MCP server over the same HTTP
+  API. Six tools — `arb_register`, `arb_status`, `arb_sync`, `arb_push`,
+  `arb_ready`, `arb_state` — turn any MCP-capable agent into a buffer
+  entry: the server clones the fork into `<ARB_WORKDIR>/<entryId>`, injects
+  per-push tokens via `http.extraHeader` (never argv, never `.git/config`),
+  and renders squash diagnoses as `arb_status` instructions. See
+  `app/mcp/README.md`.
+
 ## Events
 
 `ArbEvent` (`app/CONTRACTS.md`) is the single stream consumed by the
@@ -127,8 +206,12 @@ outside the contract's union (contract issue noted in
 | `push` | `repo.pushed` (queue or alarm poll) deduped and hashed | repo, commit |
 | `hash.unchanged` | push changed no exported-symbol hash | — (early cutoff) |
 | `hash.changed` | ≥1 exported-symbol hash moved | symbol, oldHash, newHash |
-| `squash` | a consumed symbol changed / producer vetoed / producer squashed / trunk overlap / prediction miss | entryId, diagnosis; `trunk-overlap` squashes also carry `overlap: string[]` (the intersecting paths); `prediction-miss` diagnoses carry predicted vs actual signatures |
+| `squash` | a consumed symbol changed / producer vetoed / producer squashed / trunk overlap / prediction miss / judged behavior change | entryId, diagnosis; `trunk-overlap` squashes also carry `overlap: string[]` (the intersecting paths); `prediction-miss` diagnoses carry predicted vs actual signatures; `behavior-changed` diagnoses carry `judgment {model, probability}` |
 | `prediction.hit` / `prediction.miss` | the producer's first push resolved a consumer's pinned symbol (hit: actual == declared; miss: diverged — the consumer is also squashed `prediction-miss`) | `entryId` = consumer, `data.producerId`, `symbol`, `hash` (hit) / `predictedHash`, `actualHash`, `predictedSignature`, `actualSignature`, `commit` (miss) |
+| `deps.inferred` | a consumer push mapped its changed-file imports onto producer exports | `entryId` = consumer, `data.producerId`, `symbols` (only the newly inferred names) |
+| `deps.undeclared` | a push imported files changed by a sibling non-ancestor entry | `data.fromEntryId`, `paths`, `symbols` — reported only, no re-fork |
+| `jev.judged` | a body-only change to a consumed symbol was judged | `entryId` = consumer, `data.producerId`, `symbol`, `probability`, `verdict: "squash"\|"warn"\|"clear"`, `commit`, `model` |
+| `jev.unavailable` | Jev could not answer (no key, timeout, HTTP error, stale mark swept) | `data.producerId`, `symbol`, `reason`; treated as `clear` |
 | `recover` | a stale in-flight marker was swept and its work re-issued, or an effect failed and was reported instead of wedging the component (T19) | `data.kind`: `refork` \| `recheck` \| `reretire` \| `fork-failed` \| `<effect>-failed` |
 | `refork` | new fork minted for a squashed entry | repo, generation |
 | `ready` | agent POSTs ready | commit |
@@ -305,6 +388,13 @@ pre-index revision; "indexed" is the same rerun after `byId`/`byRepo`/
   `v8.serialize` ~3.7 / 52 / 732 ms vs ~0.08 ms per 40-entry component
   state. Durable Object storage value limits were *not* verified — but at
   40-entry components the write is two orders of magnitude smaller.
+- **v2 cost, same machine.** The indexed medians above were recorded on
+  v1-era code in a quieter run — do not compare them directly to v2. A
+  same-machine re-benchmark on 2026-10-13 measured the current v2 machine
+  at N=100,000 single-buffer: 19.1 µs median / 79.7 µs p95 per event vs
+  v1 `a634b36` at 10.3 µs / 78.3 µs — about 1.9x the v1 median with p95
+  flat (`app/control-plane/bench/RESULTS.md`, "V2 (same machine
+  comparison)").
 
 ### Deployed topology and live verification
 

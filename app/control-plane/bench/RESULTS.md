@@ -121,3 +121,22 @@ serialize at N=100k. One DO per connected component bounds both the CPU and
 the persisted state by component size (40-entry shards serialize in <0.25 ms).
 Cross-component dependencies, routing overhead, and real Durable Object
 latency remain unmeasured — see the live-scenario numbers in NOTES.md.
+
+---
+
+# V2 (same machine comparison)
+
+Orchestrator's measurement on 2026-10-13, same machine and same harness,
+`BENCH_MODE=single` at N = 100,000 (`odd/tasks/arb-v2.md`, V3b entry):
+
+| build | median per event | p95 |
+|---|---|---|
+| v1 `a634b36` | 10.3 µs | 78.3 µs |
+| v2 (current) | 19.1 µs | 79.7 µs |
+
+About 1.9x the v1 median with p95 essentially flat — the cost of the V2
+fields and fork bookkeeping inside `apply()`.
+
+The 2.1–2.7 µs medians in the T14 rerun above came from an earlier, quieter
+run on v1-era code; they must not be compared directly to this table. Quote
+the same-machine comparison for v2, not 2.7 µs.

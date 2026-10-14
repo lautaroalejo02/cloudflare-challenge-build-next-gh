@@ -13,6 +13,33 @@ path-disjoint splices — never as a textual merge.
 
 **This project was built using Cloudflare Workers and Artifacts.**
 
+## What's new in v2
+
+- **Dependency inference.** Consumers no longer declare `consumes`: when an
+  entry registers with a `producerId` and omits it, the control plane
+  derives its consumed symbols from imports on every push — limited to
+  files the entry itself changed since its `baseCommit` (`app/CONTRACTS.md`
+  V2/V8).
+- **Semantic squash.** A body-only producer push that keeps the exported
+  signature but changes behavior no longer slips through: TypeSafe Jev
+  judges whether the change alters behavior the consumer relies on.
+  Probability ≥ 0.7 → `behavior-changed` squash, 0.4–0.7 → warn, < 0.4 →
+  clear. When Jev is unavailable (no key, timeout, HTTP error) the buffer
+  runs exact v1 behavior.
+- **MCP server.** `app/mcp` is a local stdio MCP server that lets any
+  MCP-capable coding agent (Claude Code, Codex, Devin) join the buffer as
+  an entry — no git or API plumbing in the agent.
+
+Measured live on the deployed plane (2026-10-13; Jev model `jev-1.13.0`,
+symbol `createOrder` in every judgment):
+
+| What | Measured | Source |
+|---|---|---|
+| Body-only refactor (same signature) | p = 0.02 → `clear`, both consumers, in every run | `app/control-plane/NOTES.md` "V2 integration (V4)", "V8 inference scope" |
+| VAT behavior change (same signature) | p = 0.93–0.97 → `squash` (`behavior-changed`), both consumers, in every run with the beat | same |
+| Jev round trip | ~1–2 s per judgment | `app/control-plane/NOTES.md` "V2 integration (V4)" |
+| Inference diff on the push path | median 134 ms / max 166 ms, live | `app/control-plane/NOTES.md` "V8 inference scope" |
+
 ## The problem
 
 "UI waits for the API PR" is the main serialization point between parallel
@@ -117,13 +144,16 @@ over *in-progress* work: dependents forward against live forks and are
 corrected by interface-hash squashes, never by text merges (`research/top10.md`
 Idea 3). Value prediction goes further than any merge-time tool can:
 dependents started against an interface the producer had only *declared*,
-before it wrote a line. And the verdict is a counter, not a claim — in the live
-run the stats read `predictionHits: 2, predictionMisses: 1` (per
-consumer-symbol verdicts): both consumers' pinned `createOrder` landed exactly
-as declared, while `Order` diverged and its consumer was squashed with a
-predicted-vs-actual diagnosis. The machinery caught reality differing
-from the declaration automatically (`app/control-plane/NOTES.md`, "Value
-prediction (T11)").
+before it wrote a line. And the verdict is a counter, not a claim — in the
+live multi-scenario run the stats read `predictionHits: 2,
+predictionMisses: 1` (per consumer-symbol verdicts): both declared
+consumers' pinned `createOrder` landed exactly as declared, while `Order`
+diverged and its consumer was squashed with a predicted-vs-actual
+diagnosis. The machinery caught reality differing from the declaration
+automatically (`app/control-plane/NOTES.md`, "Value prediction (T11)").
+(In the v2 main scenario the UI consumer's consumes are inferred rather
+than pinned, so that run's counter reads 1 hit / 0 misses —
+`app/control-plane/NOTES.md`, "V2 integration (V4)".)
 
 | `≈` predicted exports before the first push | hit/miss verdicts land on the first push | ordinary squash with diagnosis |
 |---|---|---|
@@ -144,21 +174,30 @@ on rejection (T17). Inside `rob.ts`, index maps (`byId`, `byRepo`, `childrenOf`,
 scans.
 
 In a synthetic, in-process benchmark of the pure state machine (no network, no
-Durable Object I/O), that removed the O(N) cost: median per-event time is now
-flat at ~2–3 µs from 1,000 to 100,000 entries, vs 16 ms at 100,000 before the
-indexes. An interface-changing push still squashes exactly the transitive
-dependents whose consumed hashes changed (3,803 pushes checked, 0 mismatches,
-none outside the dependency subtree). The residual single-DO cost is state
-serialization — ~80 MB / ~732 ms to persist at N=100,000 vs ~0.08 ms per
-40-entry component — which is what the per-component DO split addresses.
+Durable Object I/O), index maps removed the O(N) cost: median per-event time
+was flat in N in that v1-era run, vs 16 ms at 100,000 before the indexes. A
+same-machine re-benchmark on 2026-10-13 measured the current v2 machine at
+N=100,000 single-buffer: **19.1 µs median / 79.7 µs p95** per event vs v1
+`a634b36` at **10.3 µs / 78.3 µs** — about 1.9x the v1 median with p95 flat
+(`app/control-plane/bench/RESULTS.md` "V2 (same machine comparison)";
+`odd/tasks/arb-v2.md`, V3b). An interface-changing push still squashes
+exactly the transitive dependents whose consumed hashes changed (3,803
+pushes checked, 0 mismatches, none outside the dependency subtree). The
+residual single-DO cost is state serialization — ~80 MB / ~732 ms to
+persist at N=100,000 vs ~0.08 ms per 40-entry component — which is what the
+per-component DO split addresses.
 — `app/control-plane/bench/RESULTS.md` (reproduce in ~2 min:
 `cd app/control-plane && node --experimental-strip-types bench/run.ts`)
 
-| entries in the buffer | single buffer, median / p95 per event | after index maps, median / p95 | one buffer per 40-entry component |
+| entries in the buffer | single buffer before index maps, median / p95 per event | after index maps, median / p95 (v1-era run) | one buffer per 40-entry component (v1-era run) |
 |---|---|---|---|
 | 1,000 | 29.6 µs / 92.3 µs | 2.1 µs / 19.3 µs | 2.1 µs / 12.0 µs |
 | 10,000 | 393.6 µs / 1,462.6 µs | 2.4 µs / 18.8 µs | 3.4 µs / 51.0 µs |
 | 100,000 | 16.2 ms / 55.2 ms | 2.7 µs / 23.3 µs | 62.5 µs / 112.7 µs |
+
+The index-map and sharded columns were recorded on v1-era code in an earlier,
+quieter run — their 2.1–2.7 µs medians must not be compared directly to the
+v2 number above (`app/control-plane/bench/RESULTS.md`).
 
 **Live evidence.** `--scenario multi` runs two independent chains
 (orders `api→ui+tests`, payments `api→ui`) against the deployed plane:
@@ -253,6 +292,7 @@ app/
   demo/               fixture app, scripted agents, scenario runner, local mock
   dashboard/          static pipeline UI (no build step)
   retirer-spike/      fast-forward retirement proof + reusable module
+  mcp/                stdio MCP server — any agent joins via arb_* tools
 docs/                 architecture.md, demo-script.md
 research/             idea council: dossiers, scored idea pool, top10.md
 spikes/               8 platform feasibility spikes with measured numbers
@@ -326,6 +366,22 @@ library packages — `app/hasher` (`npm run deploy:test-worker`),
 `app/checker` and `app/retirer-spike` (`npx wrangler deploy`) — but none are
 required; hasher and checker are imported in-process by the control plane.
 
+### Jev key (optional — enables semantic squashes)
+
+The semantic squash calls the TypeSafe Jev API. Keep the value off the
+command line and out of git, same rule as the admin key: put it in the
+gitignored `app/control-plane/.secret-typesafe-key` file (covered by the
+root `.secret*` rule) and pipe it into the Worker secret:
+
+```sh
+cd app/control-plane
+npx wrangler secret put TYPESAFE_API_KEY < .secret-typesafe-key
+```
+
+Never pass the value as an argument. Unset, every judgment emits
+`jev.unavailable` (treated as `clear`) and the buffer runs exact v1
+behavior (`app/control-plane/NOTES.md`, "V2 (inference + Jev)").
+
 ### 2. Run the demo
 
 ```sh
@@ -335,10 +391,15 @@ npm run demo -- --base https://arb-control-plane.<your-subdomain>.workers.dev
 ```
 
 Three scripted agents (API/UI/Tests) run the organizers' scenario: the API
-agent registers with a declared stub, its first push resolves the predictions
-per consumer (hit → keep working; miss → `prediction-miss` squash), a body-only
-API refactor is an early cutoff, then a breaking `createOrder` signature change
-(two squashes, re-forks, diagnoses), then in-order retirement e1 → e2 → e3.
+agent registers with a declared stub; the UI agent registers *without*
+`consumes`, letting the control plane infer them from its imports
+(`deps.inferred`); the first push resolves the tests agent's pinned
+prediction; a body-only refactor is an early cutoff that Jev judges `clear`
+(p = 0.02); a same-signature VAT change is judged `squash` (p = 0.93–0.97)
+and re-forks both consumers with a `behavior-changed` diagnosis; a breaking
+`createOrder` signature change squashes them again `interface-changed`; then
+in-order retirement e1 → e2 → e3. Without `TYPESAFE_API_KEY` the Jev beats
+degrade to plain v1 behavior.
 Two more scenarios against the deployed plane: `--scenario failing-check`
 adds a failed check that blocks retirement until a scripted fix lands (the
 last entry then retires via splice), and `--scenario multi` runs two
@@ -356,23 +417,40 @@ npm run demo -- --base http://127.0.0.1:8899 --scenario failing-check
 
 The mock serves the `main` and `failing-check` scenarios; `multi` needs the
 deployed plane (the runner verifies component isolation via `GET
-/api/events`, which the mock does not implement).
+/api/events`, which the mock does not implement). The mock has no Jev key,
+so the semantic-squash beats degrade to v1 behavior there.
 
-Tests per package: `npm test` (control-plane 92 cases — state machine +
+### 3. Try it with your own agent (MCP)
+
+`app/mcp` is a local stdio MCP server: register it once and any MCP-capable
+agent (Claude Code, Codex, Devin) works as a buffer entry — `arb_register`
+clones its fork into a managed workspace, `arb_push` / `arb_sync` /
+`arb_ready` drive the lifecycle, and squash diagnoses arrive as
+`arb_status` instructions. Setup for all three clients:
+[`app/mcp/README.md`](app/mcp/README.md).
+
+```sh
+claude mcp add arb -e ARB_BASE_URL=https://arb-control-plane.<your-subdomain>.workers.dev -- node --experimental-strip-types --disable-warning=ExperimentalWarning <REPO>/app/mcp/src/index.ts
+```
+
+Tests per package: `npm test` (control-plane 161 cases — state machine +
 splice + git-level retire + declared-stub prediction + atomic retire +
-effects + auth; checker 17; demo 16 scenario/unit cases incl. a full-run
-prediction case asserting 2 hits / 1 miss; dashboard 31 event-folding and
-admin-key cases; hasher 25 hash checks; retirer-spike unit suite). Counts
-are from `app/control-plane/NOTES.md` ("Review fixes (T19)", control-plane
-was 54 before T19) and were re-run for this update.
+effects + auth + v2 inference/Jev; checker 17; demo 18 scenario/unit cases;
+dashboard 44 event-folding/admin-key/v2-rendering cases; hasher hash and
+import checks; mcp 25, incl. a stdio integration run; retirer-spike unit
+suite). Counts are from each package's `NOTES.md` and were re-run for this
+update.
 
 ## What is real vs mocked
 
 **Real:** every Cloudflare primitive above — Artifacts repos, fork-of-fork
 forwarding, write tokens, `repo.pushed` events through the queue, the DO
 state machine, WebSocket events to the dashboard, interface hashing in a
-Worker, declared-stub value prediction (live verdicts: 2 hits / 1 miss),
-checks in a Dynamic Worker, and fast-forward/splice retirement.
+Worker, declared-stub value prediction (live verdicts: 2 hits / 1 miss in
+`multi`, 1 / 0 in `main`), dependency inference from imports, checks in a
+Dynamic Worker, and fast-forward/splice retirement. The Jev judgments are
+real API calls too — TypeSafe System One is a third-party service gated by
+the `TYPESAFE_API_KEY` Worker secret.
 All ports in the deployed control plane are real (no stubs) — the full
 scenario ran end to end against `arb-control-plane`; see "Live E2E results"
 in `app/control-plane/NOTES.md`.
@@ -385,6 +463,14 @@ variants; the "fix" for a failing check is likewise pre-written. `app/demo`'s
 repos, poll-based push detection, regex hashing, `-X theirs` merge) and exists
 only to make agent state machines testable offline — it is not used against
 the real deployment.
+
+**Honest limits (v2).** Jev is a third-party API; without the
+`TYPESAFE_API_KEY` Worker secret every judgment reports `jev.unavailable`
+(treated as `clear`) and the buffer runs exact v1 behavior. The hasher
+parses **TypeScript only** — other languages are out of scope. Undeclared
+cross-entry dependencies — imports of files changed by a sibling entry
+that is not the producer — are reported via `deps.undeclared`, not
+re-forked (`app/CONTRACTS.md` V2).
 
 ## Measured numbers
 
@@ -411,8 +497,13 @@ Every figure was measured in a real run; source file per row.
 | Live failing-check with declared stubs (T11) | ~50 s wall — same 2/1 verdicts; failing check still blocked retirement (5 checks run) | `app/control-plane/NOTES.md` |
 | Live end-to-end, multi scenario under atomic retire (T17) | 63–77 s wall over 5 runs — 4 squashes, 5 retired, 8 checks run, 12 pushes seen, 2/1 verdicts, `retire.retry` 0 / `retire.failed` 0 | `app/control-plane/NOTES.md` |
 | Live end-to-end after the T19 review fixes | main 60 s, failing-check 66 s, multi 65–81 s over 3 runs, all exit 0 — multi: 4 squashes, 5 retired, 8–9 checks run, 12 pushes seen; `recover` 0 / `retire.failed` 0 in every run | `app/control-plane/NOTES.md` ("Review fixes (T19)") |
-| Reorder-buffer scale bench (state machine) | median per event 30 µs → 394 µs → 16 ms at N = 1k / 10k / 100k single buffer; flat 3–17 µs with per-component buffers; 3,803 pushes, 0 squash-oracle mismatches | `app/control-plane/bench/RESULTS.md` |
-| Full 3-agent scenario, local mock | 2 squashes, 4 early cutoffs, 3 retired in ~23 s | `app/demo/NOTES.md` |
+| Live end-to-end, main scenario (v2) | ~90–100 s wall over 5 runs — 4 squashes, 5 early cutoffs, 3 retired, 4 checks run, 10 pushes seen, predictionHits 1 / misses 0, judgments 5, semanticSquashes 2, inferredDeps 2–3 | `app/control-plane/NOTES.md` ("V2 integration (V4)", "V8 inference scope") |
+| Live end-to-end, failing-check scenario (v2) | 92.7–97 s wall — same shape, 5 checks run | `app/control-plane/NOTES.md` |
+| Live end-to-end, multi scenario (v2) | 77.5–79 s wall — 4 squashes, 5 retired, 8–9 checks run, 12 pushes seen, predictionHits 2 / misses 1, 1–2 judgments, no inference beat (declared consumers) | `app/control-plane/NOTES.md` |
+| Jev judgments, live | same-signature refactor p = 0.02 → `clear` vs VAT behavior change p = 0.93–0.97 → `squash`, consistent across every run with the beat; model `jev-1.13.0` | `app/control-plane/NOTES.md` ("V2 integration (V4)", "V8 inference scope") |
+| Jev latency / inference diff, live | ~1–2 s per judgment; inference diff median 134 ms / max 166 ms | `app/control-plane/NOTES.md` ("V8 inference scope") |
+| Reorder-buffer scale bench (state machine) | median per event 30 µs → 394 µs → 16 ms at N = 1k / 10k / 100k single buffer before index maps; flat ~2–3 µs medians after (v1-era run); same-machine re-run at 100k: v1 `a634b36` 10.3 µs / p95 78.3 µs vs v2 19.1 µs / 79.7 µs; 3,803 pushes, 0 squash-oracle mismatches | `app/control-plane/bench/RESULTS.md` |
+| Full 3-agent scenario, local mock | ~80 s main / ~68 s failing-check — 1 squash, 5–6 early cutoffs, 3 retired, 1 prediction hit / 0 misses; `judgments 0`, `inferredDeps 0` (the mock runs neither inference nor Jev) | re-run 2026-10-13 |
 
 ## Limitations and next steps
 
