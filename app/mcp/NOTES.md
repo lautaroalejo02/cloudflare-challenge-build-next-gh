@@ -132,3 +132,15 @@ None found. Notes/observations:
 - Unit tests stub `service.api`/`cloneInto` via `as any` casts; `ArbGit` itself
   takes an injected `exec` spy. The integration test covers the real path end
   to end.
+
+## Real-agent end-to-end check (2026-10-14)
+Two real coding agents joined the live buffer (`https://arb-control-plane.lautitomasalejo.workers.dev`) using only this MCP server's tools. Neither ran git itself nor called the HTTP API.
+
+| Agent | Model | MCP wiring | Entry | Work | Result |
+|---|---|---|---|---|---|
+| Codex CLI | gpt-6.1-sol | per-run `-c mcp_servers.arb.*` overrides | `e45` (lane `api`) | added `src/api/format.ts` + `tests/format.test.ts` | `retired`, 8/8 checks, commit `6246b9f2` |
+| OpenCode 1.18.35 | `opencode/big-pickle` (free) | project `opencode.json` `mcp.arb` (type `local`) | `e44` (lane `ui`) | added `src/ui/badge.ts` + `tests/badge.test.ts` | `retired`, 8/8 checks, commit `2c48ab6c` |
+
+- Tool sequence for both: `arb_state` → `arb_register` → (edit workspace) → `arb_push` → `arb_ready` → `arb_status`. Each retired on the first attempt; neither hit a squash or a failed check, so `arb_sync` was not exercised by a real agent.
+- Verified independently with public `GET /api/state`: both entries `retired`, trunk advanced to `461555c9`.
+- Secret check: both workspaces' `.git/config` hold credential-free URLs, there are 0 `art_v2_` hits across both workspaces, and 0 credential hits in either agent's logs.
