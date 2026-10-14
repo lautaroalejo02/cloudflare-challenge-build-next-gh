@@ -58,7 +58,7 @@ Payments retire while orders are still working. No waiting for someone else's he
 
 **[04:42] MCP: any agent can join**
 
-This is the piece that makes it usable beyond a demo. The buffer ships with an MCP server. Here a scripted client drives the real server: register creates a real fork and a local workspace, push sends a real commit, and ready runs real checks before the entry retires. The same server plugs into Claude Code, Codex or Devin with a single command, and git credentials never leave the server.
+This is the piece that makes it usable beyond a demo. The buffer ships with an MCP server. Here a scripted client drives the real server: register creates a real fork and a local workspace, push sends a real commit, and ready runs real checks before the entry retires. And it's not just scripts: Codex and OpenCode each joined this live buffer through it, wrote a feature with tests, and retired onto trunk. Git credentials never leave the server.
 
 **[05:22] Numbers**
 
