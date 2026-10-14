@@ -6,11 +6,11 @@ Read at a calm pace, about 130-140 words per minute. Each block starts at the ti
 
 **[00:00] Title**
 
-Hi, this is Agent Reorder Buffer: out-of-order execution for coding agents, built on Cloudflare.
+Hi, I'm Lautaro, and this is Agent Reorder Buffer: out-of-order execution for coding agents, built on Cloudflare.
 
 **[00:08] The problem**
 
-When several coding agents work on one codebase, they integrate at the very end. One 2026 study found that about forty percent of pull-request pairs from different agents conflict. Merge queues help, but they only speculate over finished work. I wanted coordination to happen while the work is still in flight.
+When several coding agents work on one codebase, they integrate at the very end. A 2026 study of pull requests from different coding agents found that 48 out of 115 pairs conflicted. Merge queues help, but they only speculate over finished work. I wanted coordination to happen while the work is still in flight.
 
 **[00:33] The idea**
 
@@ -18,7 +18,7 @@ So I borrowed the trick a CPU uses to run instructions out of order. Every agent
 
 **[01:18] Live run**
 
-This is the live dashboard, at normal speed. To be clear: the agents follow a script. Everything else is real: the forks, the interface hashing, the Jev calls, the tests and the retirement.
+This is the live dashboard, at normal speed. The agents in this run follow a script, and at the end you'll see real Codex and OpenCode agents join the same buffer. The forks, hashing, Jev calls, tests and retirement are all real.
 
 **[01:36] Stub prediction**
 
@@ -30,7 +30,7 @@ Now the API agent refactors a function body. The interface hash doesn't move, an
 
 **[02:13] Behavior change, semantic squash**
 
-This one is different. Same signature, but the totals now include VAT. Jev scores it zero point nine four and zero point nine seven, and both consumers are squashed.
+This one is different. Same signature, but the totals now include VAT. Jev scores it zero point nine four and zero point nine seven, one for each consumer, and both are squashed.
 
 **[02:28] Signature change**
 
@@ -62,7 +62,7 @@ This is the piece that makes it usable beyond a demo. The buffer ships with an M
 
 **[05:22] Numbers**
 
-A few measured numbers. Earlier runs re-forked a squashed entry in two to four and a half seconds. Retirement took about half a second by fast-forward, or about a second by splice. And Jev consistently separates a refactor, at zero point zero two, from a real behavior change, at around zero point nine five.
+Jev consistently separates a refactor, at zero point zero two, from a real behavior change, at around zero point nine five. And a squash only touches the entries that depend on the change. Across almost four thousand simulated pushes it never reached outside them, so its cost follows the dependents, not the size of the fleet. Landing on trunk is the one serialized step, and batching disjoint entries is what I'd build next.
 
 **[05:52] Closing**
 
@@ -70,4 +70,10 @@ Everything's open source: code, evidence and rebuild steps. Thanks for watching.
 
 ---
 
-Word count: about 690 words over 6:00, which leaves room for pauses. If you run long, drop the last sentence of the [00:33] and [04:42] blocks first.
+About 720 words over 6:00 (the hackathon allows 5-10 minutes), which leaves room for pauses. The tightest windows are [01:18] and [05:22]. If you run long there, drop "The forks, hashing... are all real." from [01:18] (the on-screen caption already says it), and drop the last sentence of [00:33] and [04:42].
+
+Sources for spoken numbers:
+- 48 of 115: arXiv 2607.04697, https://arxiv.org/html/2607.04697v2
+- Jev 0.02 vs 0.93-0.97: `app/control-plane/NOTES.md`
+- squash containment over 3,803 pushes: `app/control-plane/bench/RESULTS.md`
+- real Codex/OpenCode agents: `app/mcp/NOTES.md`
