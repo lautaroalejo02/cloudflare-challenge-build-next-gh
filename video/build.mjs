@@ -203,11 +203,12 @@ const cards = {
   problem: {
     title: "Integration starts too late",
     lines: [
+      "48 of 115 PR pairs from different coding agents conflicted (41.7%).",
       "Merge queues speculate CI over finished PRs.",
       "ARB forwards unfinished work at dispatch time.",
     ],
     footer:
-      "Sources: README.md · research/top10.md, Idea 3 · https://graphite.com/docs/graphite-merge-queue",
+      "Sources: arXiv 2607.04697 (https://arxiv.org/html/2607.04697v2) · https://graphite.com/docs/graphite-merge-queue",
   },
   mechanism: {
     title: "Four mechanisms. One buffer.",
@@ -220,24 +221,23 @@ const cards = {
     footer: "Implementation: README.md · app/CONTRACTS.md",
   },
   numbers: {
-    title: "Measured, not simulated",
+    title: "What I measured",
     lines: [
-      "Jev: 0.02 clear vs 0.93–0.97 squash",
-      "Live validation: main, failing-check and multi exit 0",
-      "Earlier live re-forks: 2.3 / 4.5 s (two parallel forks)",
-      "Earlier retirement: fast-forward 507 / 518 ms · splice 1085 ms",
-      "Same machine, N = 100,000: v1 10.3 µs vs v2 19.1 µs median",
-      "p95: 78.3 µs vs 79.7 µs · synthetic state machine, not network latency",
+      "Jev: refactor 0.02 (clear) · behavior change 0.93–0.97 (squash)",
+      "Squash containment: 3,803 pushes, 0 squashes outside the dependents (synthetic)",
+      "Live re-fork 2.3–4.5 s · retire 0.5 s fast-forward, 1.1 s splice",
+      "Live runs: main, failing-check and multi all exit 0",
+      "Real agents: Codex and OpenCode joined via MCP and retired, 8/8 checks",
     ],
     footer:
-      "Sources: README.md measured tables · odd/tasks/arb-v2.md (V3b, V4, V8)",
+      "Sources: README.md · app/control-plane/bench/RESULTS.md · app/mcp/NOTES.md",
   },
   closing: {
     title: "Agent Reorder Buffer",
     lines: [
       "https://github.com/lautaroalejo02/cloudflare-challenge-build-next-gh",
     ],
-    footer: "Scripted agents. Real Cloudflare execution. Your narration.",
+    footer: "Scripted demo agents · real Cloudflare execution · real agents via MCP",
   },
 };
 async function renderCard(browser, name, duration) {

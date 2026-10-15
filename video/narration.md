@@ -10,11 +10,11 @@ Hi, I'm Lautaro, and this is Agent Reorder Buffer: out-of-order execution for co
 
 **[00:08] The problem**
 
-When several coding agents work on one codebase, they integrate at the very end. A 2026 study of pull requests from different coding agents found that 48 out of 115 pairs conflicted. Merge queues help, but they only speculate over finished work. I wanted coordination to happen while the work is still in flight.
+When several coding agents work on one codebase, they integrate at the very end. A 2026 study of pull requests from different coding agents found that 48 out of 115 pairs conflicted. Merge queues help, but they only speculate over finished pull requests. I wanted coordination to happen while the work is still in flight.
 
 **[00:33] The idea**
 
-So I borrowed the trick a CPU uses to run instructions out of order. Every agent change is an entry in a reorder buffer, backed by its own Cloudflare Artifacts fork. A consumer doesn't wait for its producer: it forks the producer's unfinished work and starts right away. If the producer changes an interface the consumer depends on, the consumer is squashed, re-forked and told exactly what changed. If the signature stays the same but the behavior changes, an AI judge called Jev decides. And entries retire onto trunk strictly in order, with their tests run in Dynamic Workers. There is never a textual merge.
+So I borrowed the trick a CPU uses to run instructions out of order. Every agent change is an entry in a reorder buffer, on its own Cloudflare Artifacts fork, and four mechanisms do the work. One, forwarding: a consumer starts on its producer's unfinished fork instead of waiting. Two, if the producer changes an interface the consumer uses, the consumer is squashed and re-forked. Three, if the signature stays the same but the behavior changes, an AI judge called Jev decides whether to squash. Four, entries retire onto trunk in order, after their tests pass in Dynamic Workers, by fast-forward or a path-disjoint splice. Never a textual merge.
 
 **[01:18] Live run**
 
@@ -62,7 +62,7 @@ This is the piece that makes it usable beyond a demo. The buffer ships with an M
 
 **[05:22] Numbers**
 
-Jev consistently separates a refactor, at zero point zero two, from a real behavior change, at around zero point nine five. And a squash only touches the entries that depend on the change. Across almost four thousand simulated pushes it never reached outside them, so its cost follows the dependents, not the size of the fleet. Landing on trunk is the one serialized step, and batching disjoint entries is what I'd build next.
+Jev scored the refactor zero point zero two and the behavior change up to zero point nine seven. In a synthetic benchmark of almost four thousand pushes, a squash never reached past the entries that depend on the change, so its cost follows the dependents, not the fleet size. Landing on trunk is the one serialized step, and batching disjoint entries is what I'd build next.
 
 **[05:52] Closing**
 
